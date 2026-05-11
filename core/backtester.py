@@ -341,31 +341,36 @@ def run_backtest(
 
             elif roll_signal:
                 atm = vol_engine.calc_atm_iv_for_day(opt_by_date[date], spot)
-                cash, _ = opt_position.close_trade(
-                    date,
-                    cash,
-                    position,
-                    call_row,
-                    put_row,
-                    trades,
-                    trade_type="roll_close_straddle",
-                )
-                cash, position, option_value = opt_position.open_trade(
-                    date,
-                    cash,
-                    atm,
-                    call_qty,
-                    put_qty,
-                    trades,
-                    trade_type="roll_open_straddle",
-                )
-                greeks = strategy.calc_position_greeks(
-                    atm["call"],
-                    atm["put"],
-                    call_qty,
-                    put_qty,
-                )
-                hedge_to(greeks)
+                if atm is not None:
+                    cash, _ = opt_position.close_trade(
+                        date,
+                        cash,
+                        position,
+                        call_row,
+                        put_row,
+                        trades,
+                        trade_type="roll_close_straddle",
+                    )
+                    cash, position, option_value = opt_position.open_trade(
+                        date,
+                        cash,
+                        atm,
+                        call_qty,
+                        put_qty,
+                        trades,
+                        trade_type="roll_open_straddle",
+                    )
+                    greeks = strategy.calc_position_greeks(
+                        atm["call"],
+                        atm["put"],
+                        call_qty,
+                        put_qty,
+                    )
+                    hedge_to(greeks)
+                else:
+                    option_value = opt_position.value(position, call_row, put_row)
+                    position["last_option_value"] = option_value
+                    hedge_to(greeks)
 
             else:
                 option_value = opt_position.value(position, call_row, put_row)
@@ -374,22 +379,23 @@ def run_backtest(
 
         if position is None and feature_row["open_signal"]:
             atm = vol_engine.calc_atm_iv_for_day(opt_by_date[date], spot)
-            cash, position, option_value = opt_position.open_trade(
-                date,
-                cash,
-                atm,
-                call_qty,
-                put_qty,
-                trades,
-                trade_type="open_straddle",
-            )
-            greeks = strategy.calc_position_greeks(
-                atm["call"],
-                atm["put"],
-                call_qty,
-                put_qty,
-            )
-            hedge_to(greeks)
+            if atm is not None:
+                cash, position, option_value = opt_position.open_trade(
+                    date,
+                    cash,
+                    atm,
+                    call_qty,
+                    put_qty,
+                    trades,
+                    trade_type="open_straddle",
+                )
+                greeks = strategy.calc_position_greeks(
+                    atm["call"],
+                    atm["put"],
+                    call_qty,
+                    put_qty,
+                )
+                hedge_to(greeks)
 
         if position is not None:
             call_row, put_row = opt_position.find_rows(position, chain_df)

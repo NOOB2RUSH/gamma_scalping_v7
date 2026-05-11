@@ -202,6 +202,34 @@ def add_greeks_for_day(chain_df: pd.DataFrame, spot, r=None, annual_days=None):
     return chain_df
 
 
+def select_best_call_put_pair(pair_chain):
+    calls = pair_chain[pair_chain["option_type"] == "c"]
+    puts = pair_chain[pair_chain["option_type"] == "p"]
+    valid_pairs = []
+    for _, call_row in calls.iterrows():
+        for _, put_row in puts.iterrows():
+            if (
+                pd.notna(call_row["iv"])
+                and pd.notna(put_row["iv"])
+                and call_row["iv"] > 0
+                and put_row["iv"] > 0
+            ):
+                valid_pairs.append(
+                    (
+                        abs(call_row["iv"] - put_row["iv"]),
+                        -(call_row["volume"] + put_row["volume"]),
+                        call_row,
+                        put_row,
+                    )
+                )
+
+    if not valid_pairs:
+        return None, None
+
+    _, _, call_row, put_row = min(valid_pairs, key=lambda item: item[:2])
+    return call_row, put_row
+
+
 def calc_atm_iv_for_day(
     daily_opt_chain: pd.DataFrame,
     spot,
@@ -209,6 +237,9 @@ def calc_atm_iv_for_day(
     target_dte_min=None,
     target_dte_max=None,
     atm_moneyness_tol=None,
+    atm_moneyness_switch_tol=None,
+    preferred_strike=None,
+    preferred_expiry=None,
 ):
     """atm选约
 
@@ -228,6 +259,8 @@ def calc_atm_iv_for_day(
         target_dte_max = CONFIG.vol.atm_target_dte_max
     if atm_moneyness_tol is None:
         atm_moneyness_tol = CONFIG.vol.atm_moneyness_tol
+    if atm_moneyness_switch_tol is None:
+        atm_moneyness_switch_tol = CONFIG.vol.atm_moneyness_switch_tol
 
     chain_df = add_iv_for_day(daily_opt_chain, spot)
     chain_df = add_greeks_for_day(chain_df, spot)
@@ -248,9 +281,22 @@ def calc_atm_iv_for_day(
     )
 
     # 对每个strike，找到第一个call+put都有且到期日合适的
-    for strike in strike_order["strike_price"]:
+    strikes = list(strike_order["strike_price"])
+    ordered_strikes = []
+    if (
+        preferred_strike is not None
+        and preferred_strike in strikes
+        and abs(preferred_strike / spot - 1) <= atm_moneyness_switch_tol
+    ):
+        ordered_strikes.append(preferred_strike)
+    ordered_strikes.extend(
+        [strike for strike in strikes if strike not in ordered_strikes]
+    )
+
+    for strike in ordered_strikes:
         if abs(strike / spot - 1) > atm_moneyness_tol:
-            continue
+            if strike != preferred_strike:
+                continue
         strike_chain = chain_df[chain_df["strike_price"] == strike].copy()
         expiry_order = (
             strike_chain[["maturity_date", "dte"]]
@@ -258,16 +304,47 @@ def calc_atm_iv_for_day(
             .assign(dte_diff=lambda x: (x["dte"] - target_dte).abs())
             .sort_values("dte_diff")
         )
+        if preferred_expiry is not None:
+            preferred_expiry_ts = pd.Timestamp(preferred_expiry)
+            preferred_rows = expiry_order[
+                expiry_order["maturity_date"] == preferred_expiry_ts
+            ]
+            if not preferred_rows.empty:
+                expiry_order = pd.concat(
+                    [
+                        preferred_rows,
+                        expiry_order[
+                            expiry_order["maturity_date"] != preferred_expiry_ts
+                        ],
+                    ]
+                )
 
         # 按到期日遍历
         for _, expiry_row in expiry_order.iterrows():
             expiry = expiry_row["maturity_date"]
             pair_chain = strike_chain[strike_chain["maturity_date"] == expiry]
-            call = pair_chain[pair_chain["option_type"] == "c"]
-            put = pair_chain[pair_chain["option_type"] == "p"]
-            if not call.empty and not put.empty:
-                call_row = call.iloc[0]
-                put_row = put.iloc[0]
+            calls = pair_chain[pair_chain["option_type"] == "c"]
+            puts = pair_chain[pair_chain["option_type"] == "p"]
+            valid_pairs = []
+            for _, call_row in calls.iterrows():
+                for _, put_row in puts.iterrows():
+                    if (
+                        pd.notna(call_row["iv"])
+                        and pd.notna(put_row["iv"])
+                        and call_row["iv"] > 0
+                        and put_row["iv"] > 0
+                    ):
+                        valid_pairs.append(
+                            (
+                                abs(call_row["iv"] - put_row["iv"]),
+                                -(call_row["volume"] + put_row["volume"]),
+                                call_row,
+                                put_row,
+                            )
+                        )
+
+            if valid_pairs:
+                _, _, call_row, put_row = min(valid_pairs, key=lambda item: item[:2])
 
                 # iv 不能nan
                 if (
@@ -289,12 +366,111 @@ def calc_atm_iv_for_day(
                     }
 
 
+def calc_feature_atm_iv_for_day(
+    daily_opt_chain: pd.DataFrame,
+    spot,
+    previous_atm=None,
+):
+    chain_df = add_iv_for_day(daily_opt_chain, spot)
+    chain_df = add_greeks_for_day(chain_df, spot)
+    chain_df = chain_df[
+        (chain_df["contract_multiplier"] == CONFIG.vol.contract_multiplier)
+        & (chain_df["dte"] > 0)
+        & (chain_df["dte"] <= CONFIG.vol.atm_target_dte_max)
+    ]
+
+    if chain_df.empty:
+        return None
+
+    expiry = None
+    if previous_atm is not None:
+        previous_expiry = pd.Timestamp(previous_atm["expiry"])
+        previous_expiry_rows = chain_df[
+            chain_df["maturity_date"] == previous_expiry
+        ]
+        if (
+            not previous_expiry_rows.empty
+            and previous_expiry_rows["dte"].iloc[0] >= CONFIG.vol.atm_expiry_switch_dte
+        ):
+            expiry = previous_expiry
+
+    if expiry is None:
+        expiry_candidates = (
+            chain_df[
+                (chain_df["dte"] >= CONFIG.vol.atm_target_dte_min)
+                & (chain_df["dte"] <= CONFIG.vol.atm_target_dte_max)
+            ][["maturity_date", "dte"]]
+            .drop_duplicates()
+            .assign(dte_diff=lambda x: (x["dte"] - CONFIG.vol.atm_target_dte).abs())
+            .sort_values("dte_diff")
+        )
+        if expiry_candidates.empty:
+            return None
+        expiry = expiry_candidates.iloc[0]["maturity_date"]
+
+    expiry_chain = chain_df[chain_df["maturity_date"] == expiry]
+    strike_ivs = []
+    for strike in sorted(expiry_chain["strike_price"].drop_duplicates()):
+        if abs(strike / spot - 1) > CONFIG.vol.atm_moneyness_tol:
+            continue
+        pair_chain = expiry_chain[expiry_chain["strike_price"] == strike]
+        call_row, put_row = select_best_call_put_pair(pair_chain)
+        if call_row is None:
+            continue
+        strike_ivs.append(
+            {
+                "strike": strike,
+                "expiry": expiry,
+                "dte": int(call_row["dte"]),
+                "call_iv": call_row["iv"],
+                "put_iv": put_row["iv"],
+                "atm_iv": (call_row["iv"] + put_row["iv"]) / 2,
+                "call": call_row,
+                "put": put_row,
+            }
+        )
+
+    if not strike_ivs:
+        return None
+
+    below = [row for row in strike_ivs if row["strike"] <= spot]
+    above = [row for row in strike_ivs if row["strike"] >= spot]
+    lower = max(below, key=lambda row: row["strike"]) if below else None
+    upper = min(above, key=lambda row: row["strike"]) if above else None
+
+    if lower is None:
+        result = upper
+    elif upper is None:
+        result = lower
+    elif lower["strike"] == upper["strike"]:
+        result = lower
+    else:
+        weight = (spot - lower["strike"]) / (upper["strike"] - lower["strike"])
+        result = {
+            "strike": lower["strike"] if weight < 0.5 else upper["strike"],
+            "lower_strike": lower["strike"],
+            "upper_strike": upper["strike"],
+            "expiry": expiry,
+            "dte": lower["dte"],
+            "call_iv": lower["call_iv"] * (1 - weight) + upper["call_iv"] * weight,
+            "put_iv": lower["put_iv"] * (1 - weight) + upper["put_iv"] * weight,
+            "atm_iv": lower["atm_iv"] * (1 - weight) + upper["atm_iv"] * weight,
+            "call": lower["call"] if weight < 0.5 else upper["call"],
+            "put": lower["put"] if weight < 0.5 else upper["put"],
+        }
+
+    result.setdefault("lower_strike", result["strike"])
+    result.setdefault("upper_strike", result["strike"])
+    return result
+
+
 def build_vol_features(etf_by_date, opt_by_date):
     daily_etf_ohlc = build_daily_ohlc_df(etf_by_date)
 
     hv_df = calculate_yz_hv(daily_etf_ohlc)
 
     rows = []
+    previous_atm = None
 
     for date in hv_df.index:
         if date not in opt_by_date:
@@ -303,12 +479,23 @@ def build_vol_features(etf_by_date, opt_by_date):
         spot = hv_df.loc[date, "close"]
         chain = opt_by_date[date]
 
-        atm = calc_atm_iv_for_day(chain, spot)
+        atm = calc_feature_atm_iv_for_day(chain, spot, previous_atm=previous_atm)
 
         if atm is None:
             atm_iv = np.nan
+            atm_strike = np.nan
+            atm_lower_strike = np.nan
+            atm_upper_strike = np.nan
+            atm_expiry = pd.NaT
+            atm_dte = np.nan
         else:
             atm_iv = atm["atm_iv"]
+            atm_strike = atm["strike"]
+            atm_expiry = atm["expiry"]
+            atm_dte = atm["dte"]
+            atm_lower_strike = atm["lower_strike"]
+            atm_upper_strike = atm["upper_strike"]
+            previous_atm = atm
 
         rows.append(
             {
@@ -318,6 +505,11 @@ def build_vol_features(etf_by_date, opt_by_date):
                 # "yz_hv20": hv_df.loc[date, "yz_hv20"],
                 "yz_hv60": hv_df.loc[date, "yz_hv60"],
                 "atm_iv": atm_iv,
+                "atm_strike": atm_strike,
+                "atm_lower_strike": atm_lower_strike,
+                "atm_upper_strike": atm_upper_strike,
+                "atm_expiry": atm_expiry,
+                "atm_dte": atm_dte,
             }
         )
 

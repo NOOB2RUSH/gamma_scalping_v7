@@ -29,7 +29,9 @@ class VolConfig:
     atm_target_dte: int = 20
     atm_target_dte_min: int = 10
     atm_target_dte_max: int = 45
-    atm_moneyness_tol: float = 0.05
+    atm_moneyness_tol: float = 0.10
+    atm_moneyness_switch_tol: float = 0.15
+    atm_expiry_switch_dte: int = 7
     contract_multiplier: int = 10000
     risk_free_rate: float = 0.0
     dividend_yield: float = 0.0
