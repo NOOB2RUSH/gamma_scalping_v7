@@ -10,6 +10,7 @@ class BacktestConfig:
     call_qty: int = 25
     put_qty: int = 25
     etf_fee_rate: float = 0.00005
+    option_fee_per_contract: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -19,7 +20,8 @@ class StrategyConfig:
     min_exit_dte: int = 3
     roll_iv_threshold: float = 0.135
     roll_dte_threshold: int = 7
-    roll_moneyness_threshold: float = 0.05
+    roll_strike_mismatch_days: int = 3
+    roll_cooldown_days: int = 2
 
 
 @dataclass(frozen=True)
@@ -30,8 +32,6 @@ class VolConfig:
     atm_target_dte_min: int = 10
     atm_target_dte_max: int = 45
     atm_moneyness_tol: float = 0.10
-    atm_moneyness_switch_tol: float = 0.15
-    atm_expiry_switch_dte: int = 7
     contract_multiplier: int = 10000
     risk_free_rate: float = 0.0
     dividend_yield: float = 0.0

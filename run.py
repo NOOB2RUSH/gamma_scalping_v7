@@ -26,11 +26,163 @@ def build_daily_report(features, daily_pnl):
     return daily_pnl.join(features[feature_cols], how="left")
 
 
-def print_summary(daily_pnl):
-    print("\n=== backtest summary ===")
-    print(f"final nav: {daily_pnl['nav'].iloc[-1]}")
-    print(f"max hedge margin: {daily_pnl['hedge_margin'].max()}")
-    print(f"min cash: {daily_pnl['cash'].min()}")
+def format_money(value):
+    return f"{value:,.2f}"
+
+
+def format_pct(value):
+    if pd.isna(value):
+        return "NA"
+    return f"{value:.2%}"
+
+
+def calc_return_stats(daily_pnl):
+    initial_cash = CONFIG.backtest.initial_cash
+    final_nav = daily_pnl["nav"].iloc[-1]
+    total_return = final_nav / initial_cash - 1
+    trading_days = len(daily_pnl)
+    annual_return = (1 + total_return) ** (CONFIG.vol.annual_days / trading_days) - 1
+
+    return {
+        "initial_cash": initial_cash,
+        "final_nav": final_nav,
+        "total_pnl": final_nav - initial_cash,
+        "total_return": total_return,
+        "annual_return": annual_return,
+        "trading_days": trading_days,
+        "start_date": daily_pnl.index[0],
+        "end_date": daily_pnl.index[-1],
+    }
+
+
+def calc_summary_breakdown(daily_pnl, trades):
+    """汇总 Greeks 和手续费解释项；未解释项只作为差额展示，不当作校验依据。"""
+    total_pnl = daily_pnl["nav"].iloc[-1] - CONFIG.backtest.initial_cash
+    total_pnl_before_fee = daily_pnl["daily_nav_pnl_before_fee"].sum(skipna=True)
+    option_fee = 0.0
+    if not trades.empty and "fee" in trades.columns:
+        option_trade_mask = trades["type"].str.contains("straddle", na=False)
+        option_fee = trades.loc[option_trade_mask, "fee"].sum()
+
+    etf_fee = daily_pnl["etf_fee"].sum()
+    components = {
+        "total_before_fee": total_pnl_before_fee,
+        "delta": daily_pnl["delta_pnl"].sum(skipna=True),
+        "gamma": daily_pnl["gamma_pnl"].sum(skipna=True),
+        "vega": daily_pnl["vega_pnl"].sum(skipna=True),
+        "theta": daily_pnl["theta_pnl"].sum(skipna=True),
+        "theta_calendar": daily_pnl["theta_calendar_pnl"].sum(skipna=True),
+        "greeks_trading": daily_pnl["greeks_pnl"].sum(skipna=True),
+        "greeks_calendar": daily_pnl["greeks_calendar_pnl"].sum(skipna=True),
+        "unexplained_trading_before_fee": (
+            daily_pnl["greeks_unexplained_pnl_before_fee"].sum(skipna=True)
+        ),
+        "unexplained_calendar_before_fee": (
+            daily_pnl["greeks_calendar_unexplained_pnl_before_fee"].sum(skipna=True)
+        ),
+        "option_fee": -option_fee,
+        "etf_fee": -etf_fee,
+    }
+    components["explained_subtotal"] = sum(components.values())
+    components["unexplained"] = total_pnl - components["explained_subtotal"]
+    return components
+
+
+def calc_explain_ratio_stats(daily_pnl, ratio_col):
+    explainable = daily_pnl["greeks_explainable_day"] == True
+    ratios = daily_pnl.loc[explainable, ratio_col].dropna()
+    if ratios.empty:
+        return {"days": 0, "mean": pd.NA, "median": pd.NA}
+
+    return {
+        "days": len(ratios),
+        "mean": ratios.mean(),
+        "median": ratios.median(),
+    }
+
+
+def print_breakdown_item(name, value, total_pnl):
+    share = value / total_pnl if total_pnl != 0 else pd.NA
+    share_text = "NA" if pd.isna(share) else format_pct(share)
+    print(f"{name}: {format_money(value)} ({share_text})")
+
+
+def print_summary(daily_pnl, trades):
+    stats = calc_return_stats(daily_pnl)
+    breakdown = calc_summary_breakdown(daily_pnl, trades)
+    explain_stats = calc_explain_ratio_stats(
+        daily_pnl,
+        "greeks_explain_ratio_before_fee",
+    )
+    calendar_explain_stats = calc_explain_ratio_stats(
+        daily_pnl,
+        "greeks_calendar_explain_ratio_before_fee",
+    )
+
+    print("\n=== 回测概要 ===")
+    print(f"区间: {stats['start_date'].date()} -> {stats['end_date'].date()}")
+    print(f"交易日数: {stats['trading_days']}")
+    print(f"初始资金: {format_money(stats['initial_cash'])}")
+    print(f"期末净值: {format_money(stats['final_nav'])}")
+    print(f"总损益: {format_money(stats['total_pnl'])}")
+    print(f"总收益率: {format_pct(stats['total_return'])}")
+    print(f"年化收益率: {format_pct(stats['annual_return'])}")
+    print(f"最大 ETF 保证金: {format_money(daily_pnl['hedge_margin'].max())}")
+    print(f"最低现金: {format_money(daily_pnl['cash'].min())}")
+
+    print("\n=== 损益分解（交易日 Theta 口径） ===")
+    total_pnl = stats["total_pnl"]
+    total_before_fee = breakdown["total_before_fee"]
+    print_breakdown_item("Delta PnL", breakdown["delta"], total_before_fee)
+    print_breakdown_item("Gamma PnL", breakdown["gamma"], total_before_fee)
+    print_breakdown_item("Vega PnL", breakdown["vega"], total_before_fee)
+    print_breakdown_item("Theta PnL（交易日）", breakdown["theta"], total_before_fee)
+    print_breakdown_item("Greeks PnL（交易日）", breakdown["greeks_trading"], total_before_fee)
+    print_breakdown_item(
+        "未解释 PnL（手续费前）",
+        breakdown["unexplained_trading_before_fee"],
+        total_before_fee,
+    )
+
+    print("\n=== 损益分解（日历日 Theta 口径） ===")
+    print_breakdown_item("Delta PnL", breakdown["delta"], total_before_fee)
+    print_breakdown_item("Gamma PnL", breakdown["gamma"], total_before_fee)
+    print_breakdown_item("Vega PnL", breakdown["vega"], total_before_fee)
+    print_breakdown_item(
+        "Theta PnL（日历日）",
+        breakdown["theta_calendar"],
+        total_before_fee,
+    )
+    print_breakdown_item(
+        "Greeks PnL（日历日）",
+        breakdown["greeks_calendar"],
+        total_before_fee,
+    )
+    print_breakdown_item(
+        "未解释 PnL（手续费前）",
+        breakdown["unexplained_calendar_before_fee"],
+        total_before_fee,
+    )
+
+    print("\n=== 手续费 ===")
+    print_breakdown_item("期权手续费", breakdown["option_fee"], total_pnl)
+    print_breakdown_item("ETF 手续费", breakdown["etf_fee"], total_pnl)
+    print(f"手续费前实际 PnL: {format_money(total_before_fee)}")
+    print(f"手续费后实际 PnL: {format_money(total_pnl)}")
+
+    print("\n=== Greeks 解释力（手续费前） ===")
+    print(
+        "交易日 Theta: "
+        f"days={explain_stats['days']}, "
+        f"mean={format_pct(explain_stats['mean'])}, "
+        f"median={format_pct(explain_stats['median'])}"
+    )
+    print(
+        "日历日 Theta: "
+        f"days={calendar_explain_stats['days']}, "
+        f"mean={format_pct(calendar_explain_stats['mean'])}, "
+        f"median={format_pct(calendar_explain_stats['median'])}"
+    )
 
 
 def make_output_dir():
@@ -152,7 +304,7 @@ def smoke_test_greeks():
 def main():
     etf_by_date, opt_by_date = load_data()
     features = core.vol_engine.build_vol_features(etf_by_date, opt_by_date)
-    signals = core.strategy.build_signal_df(features)
+    signals = core.strategy.build_signals(features)
     daily_pnl, trades = core.backtester.run_backtest(etf_by_date, opt_by_date, signals)
 
     output_dir = make_output_dir()
@@ -172,8 +324,13 @@ def main():
         output_path=output_dir / "cumulative_greeks_pnl.png",
         show=False,
     )
+    core.analytics.plot_cumulative_actual_vs_greeks_pnl(
+        daily_pnl,
+        output_path=output_dir / "cumulative_actual_vs_greeks_pnl.png",
+        show=False,
+    )
 
-    print_summary(daily_pnl)
+    print_summary(daily_pnl, trades)
     print(f"output dir: {output_dir}")
 
 

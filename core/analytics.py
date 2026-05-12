@@ -153,3 +153,86 @@ def plot_cumulative_greeks_pnl(backtest_df, output_path=None, show=True):
     else:
         plt.close(fig)
     return fig
+
+
+def plot_cumulative_actual_vs_greeks_pnl(backtest_df, output_path=None, show=True):
+    """对比手续费前真实累计 PnL 和 Greeks 解释累计 PnL。"""
+    pnl_cols = [
+        "daily_nav_pnl",
+        "daily_nav_pnl_before_fee",
+        "greeks_pnl",
+        "greeks_calendar_pnl",
+        "greeks_unexplained_pnl_before_fee",
+    ]
+    missing = set(pnl_cols) - set(backtest_df.columns)
+    if missing:
+        raise ValueError(f"backtest_df missing columns:{missing}")
+
+    cum_actual_pnl = backtest_df["daily_nav_pnl_before_fee"].fillna(0.0).cumsum()
+    cum_actual_after_fee_pnl = backtest_df["daily_nav_pnl"].fillna(0.0).cumsum()
+    cum_greeks_pnl = backtest_df["greeks_pnl"].fillna(0.0).cumsum()
+    cum_greeks_calendar_pnl = (
+        backtest_df["greeks_calendar_pnl"].fillna(0.0).cumsum()
+    )
+    cum_unexplained_pnl = (
+        backtest_df["greeks_unexplained_pnl_before_fee"].fillna(0.0).cumsum()
+    )
+
+    fig, ax = plt.subplots(figsize=(28, 14))
+    ax.plot(
+        cum_actual_pnl.index,
+        cum_actual_pnl,
+        label="Actual Cumulative PnL Before Fees",
+        color="black",
+        linewidth=1.8,
+    )
+    ax.plot(
+        cum_actual_after_fee_pnl.index,
+        cum_actual_after_fee_pnl,
+        label="Actual Cumulative PnL After Fees",
+        color="gray",
+        linewidth=1.0,
+        linestyle=":",
+    )
+    ax.plot(
+        cum_greeks_pnl.index,
+        cum_greeks_pnl,
+        label="Greeks Cumulative PnL",
+        color="tab:blue",
+        linewidth=1.5,
+    )
+    ax.plot(
+        cum_greeks_calendar_pnl.index,
+        cum_greeks_calendar_pnl,
+        label="Greeks Cumulative PnL Calendar Theta",
+        color="tab:green",
+        linewidth=1.3,
+        linestyle="-.",
+    )
+    ax.plot(
+        cum_unexplained_pnl.index,
+        cum_unexplained_pnl,
+        label="Unexplained Cumulative PnL",
+        color="tab:red",
+        linewidth=1.2,
+        linestyle="--",
+    )
+
+    ax.axhline(0, color="gray", linewidth=1, linestyle="--")
+    ax.set_title("Cumulative Actual PnL Before Fees vs Greeks PnL")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("PnL")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=300, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+    return fig

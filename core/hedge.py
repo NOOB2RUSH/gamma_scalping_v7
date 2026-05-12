@@ -1,4 +1,5 @@
 def calc_unrealized_pnl(etf_qty, entry_price, current_price):
+    """计算当前 ETF 对冲仓位的未实现盈亏。"""
     if etf_qty > 0:
         return etf_qty * (current_price - entry_price)
     if etf_qty < 0:
@@ -7,11 +8,13 @@ def calc_unrealized_pnl(etf_qty, entry_price, current_price):
 
 
 def close_etf_hedge(cash, etf_qty, entry_price, margin, price):
+    """平掉 ETF 对冲仓位，释放保证金并结算盈亏。"""
     pnl = calc_unrealized_pnl(etf_qty, entry_price, price)
     return cash + margin + pnl, pnl
 
 
 def rebalance_etf_hedge(cash, current_qty, entry_price, margin, target_qty, price):
+    """把 ETF 对冲仓位从 current_qty 调整到 target_qty。"""
     realized_pnl = 0.0
 
     if current_qty == target_qty:
@@ -25,14 +28,22 @@ def rebalance_etf_hedge(cash, current_qty, entry_price, margin, target_qty, pric
     # 目标为 0：全平 ETF 仓位，释放保证金并结算盈亏。
     if target_qty == 0:
         cash, realized_pnl = close_etf_hedge(
-            cash, current_qty, entry_price, margin, price
+            cash,
+            current_qty,
+            entry_price,
+            margin,
+            price,
         )
         return cash, 0.0, 0.0, 0.0, realized_pnl
 
-    # 目标方向反转：先全平旧方向，再开新方向。
+    # 方向反转：先全平旧方向，再开新方向。
     if current_qty * target_qty < 0:
         cash, realized_pnl = close_etf_hedge(
-            cash, current_qty, entry_price, margin, price
+            cash,
+            current_qty,
+            entry_price,
+            margin,
+            price,
         )
         new_margin = abs(target_qty) * price
         return cash - new_margin, target_qty, price, new_margin, realized_pnl
@@ -52,7 +63,7 @@ def rebalance_etf_hedge(cash, current_qty, entry_price, margin, target_qty, pric
             realized_pnl,
         )
 
-    # 同方向减仓：只释放减掉部分的保证金，并结算这部分盈亏。
+    # 同方向减仓：释放减掉部分的保证金，并结算这部分盈亏。
     close_qty = abs(current_qty) - abs(target_qty)
     close_ratio = close_qty / abs(current_qty)
     released_margin = margin * close_ratio
