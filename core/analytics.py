@@ -161,7 +161,6 @@ def plot_cumulative_actual_vs_greeks_pnl(backtest_df, output_path=None, show=Tru
         "daily_nav_pnl",
         "daily_nav_pnl_before_fee",
         "greeks_pnl",
-        "greeks_calendar_pnl",
         "greeks_unexplained_pnl_before_fee",
     ]
     missing = set(pnl_cols) - set(backtest_df.columns)
@@ -171,9 +170,6 @@ def plot_cumulative_actual_vs_greeks_pnl(backtest_df, output_path=None, show=Tru
     cum_actual_pnl = backtest_df["daily_nav_pnl_before_fee"].fillna(0.0).cumsum()
     cum_actual_after_fee_pnl = backtest_df["daily_nav_pnl"].fillna(0.0).cumsum()
     cum_greeks_pnl = backtest_df["greeks_pnl"].fillna(0.0).cumsum()
-    cum_greeks_calendar_pnl = (
-        backtest_df["greeks_calendar_pnl"].fillna(0.0).cumsum()
-    )
     cum_unexplained_pnl = (
         backtest_df["greeks_unexplained_pnl_before_fee"].fillna(0.0).cumsum()
     )
@@ -200,14 +196,6 @@ def plot_cumulative_actual_vs_greeks_pnl(backtest_df, output_path=None, show=Tru
         label="Greeks Cumulative PnL",
         color="tab:blue",
         linewidth=1.5,
-    )
-    ax.plot(
-        cum_greeks_calendar_pnl.index,
-        cum_greeks_calendar_pnl,
-        label="Greeks Cumulative PnL Calendar Theta",
-        color="tab:green",
-        linewidth=1.3,
-        linestyle="-.",
     )
     ax.plot(
         cum_unexplained_pnl.index,

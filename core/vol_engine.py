@@ -85,7 +85,35 @@ def calculate_yz_hv(
     return result
 
 
-def add_iv_for_day(chain_df: pd.DataFrame, spot, r=None, q=None, annual_days=None):
+def _count_trading_dte(date, maturity_date, trading_calendar=None):
+    """计算从当前交易日收盘后到到期日之间的剩余交易日数。"""
+    date = pd.Timestamp(date).normalize()
+    maturity_date = pd.Timestamp(maturity_date).normalize()
+
+    if maturity_date <= date:
+        return 0
+
+    if trading_calendar is not None:
+        calendar = (
+            pd.DatetimeIndex(trading_calendar)
+            .normalize()
+            .drop_duplicates()
+            .sort_values()
+        )
+        if len(calendar) > 0 and maturity_date <= calendar.max():
+            return int(((calendar > date) & (calendar <= maturity_date)).sum())
+
+    return len(pd.bdate_range(date + pd.offsets.BDay(1), maturity_date))
+
+
+def add_iv_for_day(
+    chain_df: pd.DataFrame,
+    spot,
+    r=None,
+    q=None,
+    annual_days=None,
+    trading_calendar=None,
+):
     """为单日期权链计算 mid、DTE、TTM 和隐含波动率。"""
     if r is None:
         r = CONFIG.vol.risk_free_rate
@@ -97,7 +125,10 @@ def add_iv_for_day(chain_df: pd.DataFrame, spot, r=None, q=None, annual_days=Non
     chain_df = chain_df.copy()
     chain_df["date"] = pd.to_datetime(chain_df["date"])
     chain_df["maturity_date"] = pd.to_datetime(chain_df["maturity_date"])
-    chain_df["dte"] = (chain_df["maturity_date"] - chain_df["date"]).dt.days
+    chain_df["dte"] = [
+        _count_trading_dte(date, maturity_date, trading_calendar)
+        for date, maturity_date in zip(chain_df["date"], chain_df["maturity_date"])
+    ]
     chain_df["ttm"] = chain_df["dte"] / annual_days
     chain_df["mid"] = (chain_df["bid"] + chain_df["ask"]) / 2
     chain_df["option_type"] = chain_df["option_type"].str.lower()
@@ -299,15 +330,15 @@ def _select_nearest_atm(
     return None
 
 
-def calc_atm_iv_for_day(
-    daily_opt_chain: pd.DataFrame,
+def select_atm_from_chain(
+    chain_df: pd.DataFrame,
     spot,
     target_dte=None,
     target_dte_min=None,
     target_dte_max=None,
     atm_moneyness_tol=None,
 ):
-    """按策略交易口径选择当日 ATM 跨式合约并返回 IV 与 Greeks。"""
+    """从已计算 IV/Greeks 的期权链中选择策略使用的 ATM 跨式合约。"""
     if target_dte is None:
         target_dte = CONFIG.vol.atm_target_dte
     if target_dte_min is None:
@@ -317,8 +348,6 @@ def calc_atm_iv_for_day(
     if atm_moneyness_tol is None:
         atm_moneyness_tol = CONFIG.vol.atm_moneyness_tol
 
-    chain_df = add_iv_for_day(daily_opt_chain, spot)
-    chain_df = add_greeks_for_day(chain_df, spot)
     chain_df = chain_df[
         chain_df["contract_multiplier"] == CONFIG.vol.contract_multiplier
     ]
@@ -337,10 +366,35 @@ def calc_atm_iv_for_day(
     )
 
 
-def calc_feature_atm_iv_for_day(daily_opt_chain: pd.DataFrame, spot):
-    """按特征计算口径获取真实 ATM 合约 IV；找不到有效合约时返回 None。"""
-    chain_df = add_iv_for_day(daily_opt_chain, spot)
+def calc_atm_iv_for_day(
+    daily_opt_chain: pd.DataFrame,
+    spot,
+    target_dte=None,
+    target_dte_min=None,
+    target_dte_max=None,
+    atm_moneyness_tol=None,
+    trading_calendar=None,
+):
+    """按策略交易口径选择当日 ATM 跨式合约并返回 IV 与 Greeks。"""
+    chain_df = add_iv_for_day(daily_opt_chain, spot, trading_calendar=trading_calendar)
     chain_df = add_greeks_for_day(chain_df, spot)
+    return select_atm_from_chain(
+        chain_df,
+        spot,
+        target_dte=target_dte,
+        target_dte_min=target_dte_min,
+        target_dte_max=target_dte_max,
+        atm_moneyness_tol=atm_moneyness_tol,
+    )
+
+
+def calc_feature_atm_iv_for_day(
+    daily_opt_chain: pd.DataFrame,
+    spot,
+    trading_calendar=None,
+):
+    """按特征计算口径获取真实 ATM 合约 IV；找不到有效合约时返回 None。"""
+    chain_df = add_iv_for_day(daily_opt_chain, spot, trading_calendar=trading_calendar)
     chain_df = chain_df[
         (chain_df["contract_multiplier"] == CONFIG.vol.contract_multiplier)
         & (chain_df["dte"] >= CONFIG.vol.atm_target_dte_min)
@@ -353,9 +407,39 @@ def calc_feature_atm_iv_for_day(daily_opt_chain: pd.DataFrame, spot):
     return _select_nearest_atm(chain_df, spot)
 
 
-def build_vol_features(etf_by_date, opt_by_date):
+def build_enriched_option_chains(etf_by_date, opt_by_date, trading_calendar=None):
+    """预先计算每日全链 IV 和 Greeks，供特征生成和回测主流程复用。"""
+    daily_etf_ohlc = build_daily_ohlc_df(etf_by_date)
+    if trading_calendar is None:
+        trading_calendar = daily_etf_ohlc.index
+
+    enriched_by_date = {}
+    for date in daily_etf_ohlc.index:
+        if date not in opt_by_date:
+            continue
+
+        spot = daily_etf_ohlc.loc[date, "close"]
+        chain_df = add_iv_for_day(
+            opt_by_date[date],
+            spot,
+            trading_calendar=trading_calendar,
+        )
+        enriched_by_date[date] = add_greeks_for_day(chain_df, spot)
+
+    return enriched_by_date
+
+
+def build_vol_features(
+    etf_by_date,
+    opt_by_date,
+    trading_calendar=None,
+    enriched_opt_by_date=None,
+):
     """生成策略信号需要的波动率特征表。"""
     daily_etf_ohlc = build_daily_ohlc_df(etf_by_date)
+    if trading_calendar is None:
+        trading_calendar = daily_etf_ohlc.index
+
     hv_df = calculate_yz_hv(daily_etf_ohlc)
     rows = []
 
@@ -364,8 +448,15 @@ def build_vol_features(etf_by_date, opt_by_date):
             continue
 
         spot = hv_df.loc[date, "close"]
-        chain = opt_by_date[date]
-        atm = calc_feature_atm_iv_for_day(chain, spot)
+        if enriched_opt_by_date is not None and date in enriched_opt_by_date:
+            atm = select_atm_from_chain(enriched_opt_by_date[date], spot)
+        else:
+            chain = opt_by_date[date]
+            atm = calc_feature_atm_iv_for_day(
+                chain,
+                spot,
+                trading_calendar=trading_calendar,
+            )
 
         if atm is None:
             atm_iv = np.nan

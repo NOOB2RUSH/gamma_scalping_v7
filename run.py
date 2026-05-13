@@ -20,10 +20,23 @@ def load_data():
 
 
 def build_daily_report(features, daily_pnl):
+    """生成对外日报：只展示收盘后持仓口径，隐藏内部 PnL 归因用的旧仓明细。"""
     feature_cols = [
         col for col in CONFIG.report.daily_feature_cols if col in features.columns
     ]
-    return daily_pnl.join(features[feature_cols], how="left")
+    report = daily_pnl.join(features[feature_cols], how="left")
+
+    # pnl_* 是内部用来解释“昨日持仓到今日收盘”损益的旧仓 Greeks，
+    # 对外输出时只保留收盘后仓位，避免和当前持仓口径混淆。
+    internal_pnl_cols = [col for col in report.columns if col.startswith("pnl_")]
+    report = report.drop(columns=internal_pnl_cols)
+
+    eod_rename = {
+        col: col.removeprefix("eod_")
+        for col in report.columns
+        if col.startswith("eod_")
+    }
+    return report.rename(columns=eod_rename)
 
 
 def format_money(value):
@@ -71,14 +84,9 @@ def calc_summary_breakdown(daily_pnl, trades):
         "gamma": daily_pnl["gamma_pnl"].sum(skipna=True),
         "vega": daily_pnl["vega_pnl"].sum(skipna=True),
         "theta": daily_pnl["theta_pnl"].sum(skipna=True),
-        "theta_calendar": daily_pnl["theta_calendar_pnl"].sum(skipna=True),
         "greeks_trading": daily_pnl["greeks_pnl"].sum(skipna=True),
-        "greeks_calendar": daily_pnl["greeks_calendar_pnl"].sum(skipna=True),
         "unexplained_trading_before_fee": (
             daily_pnl["greeks_unexplained_pnl_before_fee"].sum(skipna=True)
-        ),
-        "unexplained_calendar_before_fee": (
-            daily_pnl["greeks_calendar_unexplained_pnl_before_fee"].sum(skipna=True)
         ),
         "option_fee": -option_fee,
         "etf_fee": -etf_fee,
@@ -89,14 +97,22 @@ def calc_summary_breakdown(daily_pnl, trades):
 
 
 def calc_explain_ratio_stats(daily_pnl, ratio_col):
+    """汇总解释力；算术均值容易被实际 PnL 接近 0 的单日放大，改用绝对 PnL 加权口径。"""
     explainable = daily_pnl["greeks_explainable_day"] == True
     ratios = daily_pnl.loc[explainable, ratio_col].dropna()
     if ratios.empty:
-        return {"days": 0, "mean": pd.NA, "median": pd.NA}
+        return {"days": 0, "weighted_mean": pd.NA, "median": pd.NA}
+
+    actual_abs = daily_pnl.loc[ratios.index, "daily_nav_pnl_before_fee"].abs()
+    residual_abs = daily_pnl.loc[
+        ratios.index,
+        "greeks_unexplained_pnl_before_fee",
+    ].abs()
+    weighted_mean = 1 - residual_abs.sum() / actual_abs.sum()
 
     return {
         "days": len(ratios),
-        "mean": ratios.mean(),
+        "weighted_mean": weighted_mean,
         "median": ratios.median(),
     }
 
@@ -114,10 +130,6 @@ def print_summary(daily_pnl, trades):
         daily_pnl,
         "greeks_explain_ratio_before_fee",
     )
-    calendar_explain_stats = calc_explain_ratio_stats(
-        daily_pnl,
-        "greeks_calendar_explain_ratio_before_fee",
-    )
 
     print("\n=== 回测概要 ===")
     print(f"区间: {stats['start_date'].date()} -> {stats['end_date'].date()}")
@@ -130,37 +142,17 @@ def print_summary(daily_pnl, trades):
     print(f"最大 ETF 保证金: {format_money(daily_pnl['hedge_margin'].max())}")
     print(f"最低现金: {format_money(daily_pnl['cash'].min())}")
 
-    print("\n=== 损益分解（交易日 Theta 口径） ===")
+    print("\n=== 损益分解 ===")
     total_pnl = stats["total_pnl"]
     total_before_fee = breakdown["total_before_fee"]
     print_breakdown_item("Delta PnL", breakdown["delta"], total_before_fee)
     print_breakdown_item("Gamma PnL", breakdown["gamma"], total_before_fee)
     print_breakdown_item("Vega PnL", breakdown["vega"], total_before_fee)
-    print_breakdown_item("Theta PnL（交易日）", breakdown["theta"], total_before_fee)
-    print_breakdown_item("Greeks PnL（交易日）", breakdown["greeks_trading"], total_before_fee)
+    print_breakdown_item("Theta PnL", breakdown["theta"], total_before_fee)
+    print_breakdown_item("Greeks PnL", breakdown["greeks_trading"], total_before_fee)
     print_breakdown_item(
         "未解释 PnL（手续费前）",
         breakdown["unexplained_trading_before_fee"],
-        total_before_fee,
-    )
-
-    print("\n=== 损益分解（日历日 Theta 口径） ===")
-    print_breakdown_item("Delta PnL", breakdown["delta"], total_before_fee)
-    print_breakdown_item("Gamma PnL", breakdown["gamma"], total_before_fee)
-    print_breakdown_item("Vega PnL", breakdown["vega"], total_before_fee)
-    print_breakdown_item(
-        "Theta PnL（日历日）",
-        breakdown["theta_calendar"],
-        total_before_fee,
-    )
-    print_breakdown_item(
-        "Greeks PnL（日历日）",
-        breakdown["greeks_calendar"],
-        total_before_fee,
-    )
-    print_breakdown_item(
-        "未解释 PnL（手续费前）",
-        breakdown["unexplained_calendar_before_fee"],
         total_before_fee,
     )
 
@@ -172,16 +164,9 @@ def print_summary(daily_pnl, trades):
 
     print("\n=== Greeks 解释力（手续费前） ===")
     print(
-        "交易日 Theta: "
         f"days={explain_stats['days']}, "
-        f"mean={format_pct(explain_stats['mean'])}, "
+        f"abs加权mean={format_pct(explain_stats['weighted_mean'])}, "
         f"median={format_pct(explain_stats['median'])}"
-    )
-    print(
-        "日历日 Theta: "
-        f"days={calendar_explain_stats['days']}, "
-        f"mean={format_pct(calendar_explain_stats['mean'])}, "
-        f"median={format_pct(calendar_explain_stats['median'])}"
     )
 
 
@@ -232,6 +217,7 @@ def smoke_test_atm_iv(daily_ohlc, opt_by_date):
     test_date = pd.Timestamp(CONFIG.backtest.test_date)
     spot = daily_ohlc.loc[test_date, "close"]
     chain = opt_by_date[test_date]
+    trading_calendar = core.data_loader.load_etf_trading_calendar()
 
     atm = core.vol_engine.calc_atm_iv_for_day(
         daily_opt_chain=chain,
@@ -240,6 +226,7 @@ def smoke_test_atm_iv(daily_ohlc, opt_by_date):
         target_dte_min=CONFIG.vol.atm_target_dte_min,
         target_dte_max=CONFIG.vol.atm_target_dte_max,
         atm_moneyness_tol=CONFIG.vol.atm_moneyness_tol,
+        trading_calendar=trading_calendar,
     )
 
     print("\n=== atm iv ===")
@@ -270,9 +257,14 @@ def smoke_test_greeks():
     smoke_date = date.strftime("%Y%m%d")
     etf_by_date = core.data_loader.load_etf_series(smoke_date, smoke_date)
     opt_by_date = core.data_loader.load_opt_series(smoke_date, smoke_date)
+    trading_calendar = core.data_loader.load_etf_trading_calendar()
 
     spot = etf_by_date[date].iloc[0]["close"]
-    atm = core.vol_engine.calc_atm_iv_for_day(opt_by_date[date], spot)
+    atm = core.vol_engine.calc_atm_iv_for_day(
+        opt_by_date[date],
+        spot,
+        trading_calendar=trading_calendar,
+    )
 
     print("\n=== greeks smoke test ===")
     print(f"date: {date.date()}")
@@ -303,9 +295,26 @@ def smoke_test_greeks():
 
 def main():
     etf_by_date, opt_by_date = load_data()
-    features = core.vol_engine.build_vol_features(etf_by_date, opt_by_date)
+    trading_calendar = core.data_loader.load_etf_trading_calendar()
+    enriched_opt_by_date = core.vol_engine.build_enriched_option_chains(
+        etf_by_date,
+        opt_by_date,
+        trading_calendar=trading_calendar,
+    )
+    features = core.vol_engine.build_vol_features(
+        etf_by_date,
+        opt_by_date,
+        trading_calendar=trading_calendar,
+        enriched_opt_by_date=enriched_opt_by_date,
+    )
     signals = core.strategy.build_signals(features)
-    daily_pnl, trades = core.backtester.run_backtest(etf_by_date, opt_by_date, signals)
+    daily_pnl, trades = core.backtester.run_backtest(
+        etf_by_date,
+        opt_by_date,
+        signals,
+        trading_calendar=trading_calendar,
+        enriched_opt_by_date=enriched_opt_by_date,
+    )
 
     output_dir = make_output_dir()
 

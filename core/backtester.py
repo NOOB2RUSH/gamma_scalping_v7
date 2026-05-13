@@ -115,12 +115,10 @@ def build_daily_record(
     pnl_call_iv,
     pnl_put_iv,
     pnl_greeks,
+    eod_position_dte,
 ):
     """生成单日账户快照，字段名保持为报表输出口径。"""
     eod_has_position = position is not None
-    eod_position_dte = (
-        int((position["expiry"] - date).days) if eod_has_position else None
-    )
     account_delta = greeks["delta"] + hedge_etf_qty
 
     return {
@@ -190,7 +188,6 @@ def add_greeks_pnl(daily_df):
     position_changed = prev_has_position & ~same_position
 
     spot_chg = df["spot"].diff()
-    calendar_days = df.index.to_series().diff().dt.days
     call_iv_chg = df["pnl_call_iv"] - df["eod_call_iv"].shift(1)
     put_iv_chg = df["pnl_put_iv"] - df["eod_put_iv"].shift(1)
     avg_call_gamma = (
@@ -213,7 +210,6 @@ def add_greeks_pnl(daily_df):
     ) / 2
 
     # Delta 使用昨日 EOD 账户 delta；Gamma/Vega/Theta 使用同一旧仓的昨日和今日平均值。
-    # theta_pnl 保持交易日口径；自然日口径单独输出 theta_calendar_pnl。
     df["delta_pnl"] = (
         df["eod_call_delta"].shift(1)
         + df["eod_put_delta"].shift(1)
@@ -225,17 +221,10 @@ def add_greeks_pnl(daily_df):
         + avg_put_vega * put_iv_chg * 100
     )
     df["theta_pnl"] = avg_call_theta + avg_put_theta
-    df["theta_calendar_pnl"] = df["theta_pnl"] * calendar_days
 
     pnl_cols = ["delta_pnl", "gamma_pnl", "vega_pnl", "theta_pnl"]
-    calendar_pnl_cols = ["delta_pnl", "gamma_pnl", "vega_pnl", "theta_calendar_pnl"]
     df.loc[~explainable_day, pnl_cols] = 0.0
-    df.loc[~explainable_day, "theta_calendar_pnl"] = 0.0
     df["greeks_pnl"] = df[pnl_cols].sum(axis=1, min_count=len(pnl_cols))
-    df["greeks_calendar_pnl"] = df[calendar_pnl_cols].sum(
-        axis=1,
-        min_count=len(calendar_pnl_cols),
-    )
 
     df["daily_nav_pnl"] = df["nav"].diff()
     df["daily_fee"] = df["etf_fee"].fillna(0.0) + df["option_fee"].fillna(0.0)
@@ -244,9 +233,6 @@ def add_greeks_pnl(daily_df):
     df["greeks_unexplained_pnl_before_fee"] = (
         df["daily_nav_pnl_before_fee"] - df["greeks_pnl"]
     )
-    df["greeks_calendar_unexplained_pnl_before_fee"] = (
-        df["daily_nav_pnl_before_fee"] - df["greeks_calendar_pnl"]
-    )
     df["greeks_explainable_day"] = explainable_day
     df["greeks_position_changed_day"] = position_changed
 
@@ -254,34 +240,36 @@ def add_greeks_pnl(daily_df):
     residual_abs = df["greeks_unexplained_pnl"].abs()
     actual_before_fee_abs = df["daily_nav_pnl_before_fee"].abs()
     residual_before_fee_abs = df["greeks_unexplained_pnl_before_fee"].abs()
-    calendar_residual_before_fee_abs = (
-        df["greeks_calendar_unexplained_pnl_before_fee"].abs()
-    )
     df["greeks_explain_ratio"] = 1 - residual_abs / actual_abs
     df["greeks_explain_ratio_before_fee"] = (
         1 - residual_before_fee_abs / actual_before_fee_abs
     )
-    df["greeks_calendar_explain_ratio_before_fee"] = (
-        1 - calendar_residual_before_fee_abs / actual_before_fee_abs
-    )
     df.loc[actual_abs == 0, "greeks_explain_ratio"] = pd.NA
     df.loc[actual_before_fee_abs == 0, "greeks_explain_ratio_before_fee"] = pd.NA
-    df.loc[
-        actual_before_fee_abs == 0,
-        "greeks_calendar_explain_ratio_before_fee",
-    ] = pd.NA
     return df
 
 
 class BacktestEngine:
     """按交易日推进回测，集中管理状态，减少主流程里的隐式变量传递。"""
 
-    def __init__(self, etf_by_date, opt_by_date, signals_df, config):
+    def __init__(
+        self,
+        etf_by_date,
+        opt_by_date,
+        signals_df,
+        config,
+        trading_calendar=None,
+        enriched_opt_by_date=None,
+    ):
         self.etf_by_date = etf_by_date
         self.opt_by_date = opt_by_date
+        self.enriched_opt_by_date = enriched_opt_by_date
         self.signals_df = signals_df
         self.config = config
         self.daily_ohlc = vol_engine.build_daily_ohlc_df(etf_by_date)
+        if trading_calendar is None:
+            trading_calendar = self.daily_ohlc.index
+        self.trading_calendar = pd.DatetimeIndex(trading_calendar)
 
     def run(self):
         state = BacktestState(cash=self.config["initial_cash"])
@@ -297,8 +285,19 @@ class BacktestEngine:
                 self._handle_missing_option_day(date, spot, feature_row, state)
                 continue
 
-            chain_df = vol_engine.add_iv_for_day(self.opt_by_date[date], spot)
-            chain_df = vol_engine.add_greeks_for_day(chain_df, spot)
+            has_cached_chain = (
+                self.enriched_opt_by_date is not None
+                and date in self.enriched_opt_by_date
+            )
+            if has_cached_chain:
+                chain_df = self.enriched_opt_by_date[date]
+            else:
+                chain_df = vol_engine.add_iv_for_day(
+                    self.opt_by_date[date],
+                    spot,
+                    trading_calendar=self.trading_calendar,
+                )
+                chain_df = vol_engine.add_greeks_for_day(chain_df, spot)
 
             day = {
                 "date": date,
@@ -311,6 +310,7 @@ class BacktestEngine:
                 "pnl_call_iv": None,
                 "pnl_put_iv": None,
                 "pnl_greeks": empty_greeks(),
+                "eod_position_dte": None,
                 "daily_etf_fee": 0.0,
                 "daily_option_fee": 0.0,
             }
@@ -361,6 +361,7 @@ class BacktestEngine:
             "pnl_call_iv": None,
             "pnl_put_iv": None,
             "pnl_greeks": empty_greeks(),
+            "eod_position_dte": None,
             "daily_etf_fee": 0.0,
             "daily_option_fee": 0.0,
         }
@@ -432,6 +433,7 @@ class BacktestEngine:
         day["pnl_call_iv"] = day["greeks"]["call_iv"]
         day["pnl_put_iv"] = day["greeks"]["put_iv"]
         day["pnl_greeks"] = day["greeks"].copy()
+        day["eod_position_dte"] = position_dte
 
         if pd.isna(day["greeks"]["position_iv"]):
             trade_count = len(state.trades)
@@ -458,6 +460,7 @@ class BacktestEngine:
             self._reset_roll_state(state)
             day["option_value"] = 0.0
             day["greeks"] = empty_greeks()
+            day["eod_position_dte"] = None
             self._record_day(day, state)
             day["stop_after_record"] = True
             return
@@ -503,6 +506,7 @@ class BacktestEngine:
             self._reset_roll_state(state)
             day["option_value"] = 0.0
             day["greeks"] = empty_greeks()
+            day["eod_position_dte"] = None
             return
 
         if roll_signal:
@@ -523,7 +527,10 @@ class BacktestEngine:
     ):
         date = day["date"]
         spot = day["spot"]
-        atm = vol_engine.calc_atm_iv_for_day(self.opt_by_date[date], spot)
+        atm = vol_engine.select_atm_from_chain(
+            day["chain_df"],
+            spot,
+        )
 
         if atm is None:
             day["option_value"] = opt_position.value(state.position, call_row, put_row)
@@ -558,6 +565,7 @@ class BacktestEngine:
             self.config["call_qty"],
             self.config["put_qty"],
         )
+        day["eod_position_dte"] = atm["dte"]
         self._hedge_to(date, spot, state, day, day["greeks"])
         state.strike_mismatch_days = 0
         state.roll_cooldown_left = CONFIG.strategy.roll_cooldown_days
@@ -565,7 +573,10 @@ class BacktestEngine:
     def _open_new_position(self, day, state, trade_type):
         date = day["date"]
         spot = day["spot"]
-        atm = vol_engine.calc_atm_iv_for_day(self.opt_by_date[date], spot)
+        atm = vol_engine.select_atm_from_chain(
+            day["chain_df"],
+            spot,
+        )
         if atm is None:
             return
 
@@ -586,6 +597,7 @@ class BacktestEngine:
             self.config["call_qty"],
             self.config["put_qty"],
         )
+        day["eod_position_dte"] = atm["dte"]
         self._hedge_to(date, spot, state, day, day["greeks"])
         self._reset_roll_state(state)
 
@@ -691,6 +703,7 @@ class BacktestEngine:
                 day["pnl_call_iv"],
                 day["pnl_put_iv"],
                 day["pnl_greeks"],
+                day["eod_position_dte"],
             )
         )
 
@@ -703,6 +716,8 @@ def run_backtest(
     call_qty=None,
     put_qty=None,
     etf_fee_rate=None,
+    trading_calendar=None,
+    enriched_opt_by_date=None,
 ):
     if initial_cash is None:
         initial_cash = CONFIG.backtest.initial_cash
@@ -723,5 +738,7 @@ def run_backtest(
             "put_qty": put_qty,
             "etf_fee_rate": etf_fee_rate,
         },
+        trading_calendar=trading_calendar,
+        enriched_opt_by_date=enriched_opt_by_date,
     )
     return engine.run()

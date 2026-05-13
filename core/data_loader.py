@@ -26,6 +26,19 @@ def load_etf_series(start, end):
     return etf_by_date
 
 
+def load_etf_trading_calendar():
+    """从 ETF 日线文件名提取完整交易日历，用于按真实交易日计算 DTE。"""
+    data_dir = SCRIPT_DIR.parent / "data" / "etf"
+    dates = [
+        _parse_date_from_file(file_path, "_price")
+        for file_path in sorted(data_dir.glob("*price.parquet"))
+    ]
+    if not dates:
+        raise ValueError("ETF 交易日历为空")
+
+    return pd.DatetimeIndex(dates).sort_values()
+
+
 def load_opt_series(start, end):
     """加载指定日期区间内的期权链数据，返回 {date: DataFrame}。"""
     opt_by_date = {}
