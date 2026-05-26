@@ -1,21 +1,32 @@
-import os
-from pathlib import Path
-
-NUMBA_CACHE_DIR = Path(r"C:\tmp\numba_cache")
-NUMBA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("NUMBA_CACHE_DIR", str(NUMBA_CACHE_DIR))
-
 import numpy as np
 import pandas as pd
-from py_vollib_vectorized import (
-    vectorized_delta,
-    vectorized_gamma,
-    vectorized_implied_volatility,
-    vectorized_theta,
-    vectorized_vega,
-)
 
 from .config import CONFIG
+
+
+_VOLLIB_FUNCS = None
+
+
+def _load_vollib_funcs():
+    """懒加载 py_vollib_vectorized，缓存命中时避免启动阶段触发 numba。"""
+    global _VOLLIB_FUNCS
+    if _VOLLIB_FUNCS is None:
+        from py_vollib_vectorized import (
+            vectorized_delta,
+            vectorized_gamma,
+            vectorized_implied_volatility,
+            vectorized_theta,
+            vectorized_vega,
+        )
+
+        _VOLLIB_FUNCS = {
+            "delta": vectorized_delta,
+            "gamma": vectorized_gamma,
+            "implied_volatility": vectorized_implied_volatility,
+            "theta": vectorized_theta,
+            "vega": vectorized_vega,
+        }
+    return _VOLLIB_FUNCS
 
 
 def build_daily_ohlc_df(etf_by_date: dict[str, pd.DataFrame]):
@@ -142,7 +153,8 @@ def add_iv_for_day(
     )
 
     chain_df["iv"] = np.nan
-    iv_values = vectorized_implied_volatility(
+    vollib = _load_vollib_funcs()
+    iv_values = vollib["implied_volatility"](
         price=chain_df.loc[valid, "mid"],
         S=spot,
         t=chain_df.loc[valid, "ttm"],
@@ -167,7 +179,8 @@ def add_greeks_for_day(chain_df: pd.DataFrame, spot, r=None, annual_days=None):
         annual_days = CONFIG.vol.annual_days
 
     chain_df = chain_df.copy()
-    chain_df["delta"] = vectorized_delta(
+    vollib = _load_vollib_funcs()
+    chain_df["delta"] = vollib["delta"](
         flag=chain_df["option_type"],
         S=spot,
         K=chain_df["strike_price"],
@@ -177,7 +190,7 @@ def add_greeks_for_day(chain_df: pd.DataFrame, spot, r=None, annual_days=None):
         sigma=chain_df["iv"],
         return_as="series",
     ).to_numpy()
-    chain_df["gamma"] = vectorized_gamma(
+    chain_df["gamma"] = vollib["gamma"](
         flag=chain_df["option_type"],
         S=spot,
         K=chain_df["strike_price"],
@@ -188,7 +201,7 @@ def add_greeks_for_day(chain_df: pd.DataFrame, spot, r=None, annual_days=None):
         return_as="series",
     ).to_numpy()
 
-    theta_365 = vectorized_theta(
+    theta_365 = vollib["theta"](
         flag=chain_df["option_type"],
         S=spot,
         K=chain_df["strike_price"],
@@ -201,7 +214,7 @@ def add_greeks_for_day(chain_df: pd.DataFrame, spot, r=None, annual_days=None):
     # py_vollib 返回的是自然日 theta，这里换算为交易日口径。
     chain_df["theta"] = theta_365 * (365 / annual_days)
 
-    chain_df["vega"] = vectorized_vega(
+    chain_df["vega"] = vollib["vega"](
         flag=chain_df["option_type"],
         S=spot,
         K=chain_df["strike_price"],
@@ -309,7 +322,7 @@ def _select_nearest_atm(
     )
 
     for strike in strike_order["strike_price"]:
-        if abs(strike / spot - 1) > atm_moneyness_tol:
+        if abs(strike - spot) > atm_moneyness_tol:
             continue
 
         strike_chain = chain_df[chain_df["strike_price"] == strike]
@@ -364,6 +377,64 @@ def select_atm_from_chain(
         target_dte_max=target_dte_max,
         atm_moneyness_tol=atm_moneyness_tol,
     )
+
+
+def calc_atm_pool_volume(
+    chain_df,
+    spot,
+    target_dte_min=None,
+    target_dte_max=None,
+    atm_moneyness_tol=None,
+):
+    """汇总 ATM 附近合约池成交量，用于观察真实流动性而非单一合约跳变。"""
+    if target_dte_min is None:
+        target_dte_min = CONFIG.vol.atm_target_dte_min
+    if target_dte_max is None:
+        target_dte_max = CONFIG.vol.atm_target_dte_max
+    if atm_moneyness_tol is None:
+        atm_moneyness_tol = CONFIG.vol.atm_moneyness_tol
+
+    pool = chain_df[
+        (chain_df["contract_multiplier"] == CONFIG.vol.contract_multiplier)
+        & (chain_df["dte"] >= target_dte_min)
+        & (chain_df["dte"] <= target_dte_max)
+        & ((chain_df["strike_price"] - spot).abs() <= atm_moneyness_tol)
+    ]
+    if pool.empty:
+        return {
+            "atm_pool_call_volume": np.nan,
+            "atm_pool_put_volume": np.nan,
+            "atm_pool_total_volume": np.nan,
+            "atm_pool_min_leg_volume": np.nan,
+        }
+
+    call_volume = pool.loc[pool["option_type"] == "c", "volume"].sum()
+    put_volume = pool.loc[pool["option_type"] == "p", "volume"].sum()
+    return {
+        "atm_pool_call_volume": call_volume,
+        "atm_pool_put_volume": put_volume,
+        "atm_pool_total_volume": call_volume + put_volume,
+        "atm_pool_min_leg_volume": min(call_volume, put_volume),
+    }
+
+
+def _calc_atm_iv_percentile(atm_iv_series, window):
+    """计算当日 ATM IV 在过去固定交易日窗口中的历史百分位。"""
+    if window is None or window <= 0:
+        return pd.Series(np.nan, index=atm_iv_series.index)
+
+    def percentile(values):
+        current = values[-1]
+        return (values <= current).mean()
+
+    # ATM IV 偶尔会因为合约筛选缺口缺失；百分位用最近 window 个有效样本计算，
+    # 避免单个缺失日把后续 252 天的百分位全部打成 NaN。
+    valid_atm_iv = atm_iv_series.dropna()
+    percentile_series = valid_atm_iv.rolling(window, min_periods=window).apply(
+        percentile,
+        raw=True,
+    )
+    return percentile_series.reindex(atm_iv_series.index)
 
 
 def calc_atm_iv_for_day(
@@ -449,25 +520,31 @@ def build_vol_features(
 
         spot = hv_df.loc[date, "close"]
         if enriched_opt_by_date is not None and date in enriched_opt_by_date:
-            atm = select_atm_from_chain(enriched_opt_by_date[date], spot)
+            chain_df = enriched_opt_by_date[date]
+            atm = select_atm_from_chain(chain_df, spot)
         else:
-            chain = opt_by_date[date]
-            atm = calc_feature_atm_iv_for_day(
-                chain,
+            chain_df = add_iv_for_day(
+                opt_by_date[date],
                 spot,
                 trading_calendar=trading_calendar,
             )
+            atm = select_atm_from_chain(chain_df, spot)
+        atm_pool_volume = calc_atm_pool_volume(chain_df, spot)
 
         if atm is None:
             atm_iv = np.nan
             atm_strike = np.nan
             atm_expiry = pd.NaT
             atm_dte = np.nan
+            atm_call_volume = np.nan
+            atm_put_volume = np.nan
         else:
             atm_iv = atm["atm_iv"]
             atm_strike = atm["strike"]
             atm_expiry = atm["expiry"]
             atm_dte = atm["dte"]
+            atm_call_volume = atm["call"].get("volume", np.nan)
+            atm_put_volume = atm["put"].get("volume", np.nan)
 
         rows.append(
             {
@@ -478,7 +555,16 @@ def build_vol_features(
                 "atm_strike": atm_strike,
                 "atm_expiry": atm_expiry,
                 "atm_dte": atm_dte,
+                "atm_call_volume": atm_call_volume,
+                "atm_put_volume": atm_put_volume,
+                "atm_total_volume": atm_call_volume + atm_put_volume,
+                **atm_pool_volume,
             }
         )
 
-    return pd.DataFrame(rows).set_index("date").sort_index()
+    features_df = pd.DataFrame(rows).set_index("date").sort_index()
+    features_df["atm_iv_percentile"] = _calc_atm_iv_percentile(
+        features_df["atm_iv"],
+        CONFIG.vol.atm_iv_percentile_window,
+    )
+    return features_df

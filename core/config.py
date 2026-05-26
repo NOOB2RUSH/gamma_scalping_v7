@@ -1,54 +1,40 @@
-from dataclasses import dataclass, field
+"""配置入口。
+
+默认仍然指向 50ETF，保证旧命令 `python run.py` 行为不变。
+需要切换品种时，使用 `load_config(product)` 读取对应的独立配置。
+"""
+
+from importlib import import_module
+
+from .config_50etf import CONFIG
+from .config_schema import (
+    AppConfig,
+    BacktestConfig,
+    DataConfig,
+    ReferenceCurveConfig,
+    ReportConfig,
+    StrategyConfig,
+    VolConfig,
+)
 
 
-@dataclass(frozen=True)
-class BacktestConfig:
-    start: str = "20180102"
-    end: str = "20260101"
-    test_date: str = "20180202"
-    initial_cash: float = 1_000_000
-    call_qty: int = 25
-    put_qty: int = 25
-    etf_fee_rate: float = 0.00005
-    option_fee_per_contract: float = 2.0
+PRODUCT_CONFIG_MODULES = {
+    "50etf": "core.config_50etf",
+    "zz1000": "core.config_zz1000",
+}
 
 
-@dataclass(frozen=True)
-class StrategyConfig:
-    open_iv_threshold: float = 0.15
-    close_iv_threshold: float = 0.3
-    min_exit_dte: int = 3
-    roll_iv_threshold: float = 0.155
-    roll_dte_threshold: int = 7
-    roll_strike_mismatch_days: int = 2
-    roll_cooldown_days: int = 1
+def available_products():
+    return tuple(PRODUCT_CONFIG_MODULES)
 
 
-@dataclass(frozen=True)
-class VolConfig:
-    annual_days: int = 252
-    hv_windows: tuple[int, ...] = (60,)
-    atm_target_dte: int = 20
-    atm_target_dte_min: int = 7
-    atm_target_dte_max: int = 30
-    atm_moneyness_tol: float = 0.10
-    contract_multiplier: int = 10000
-    risk_free_rate: float = 0.0
-    dividend_yield: float = 0.0
+def load_config(product):
+    """按品种名称读取独立配置。"""
+    product_key = str(product).lower()
+    if product_key not in PRODUCT_CONFIG_MODULES:
+        raise ValueError(
+            f"未知交易品种: {product}，可选品种: {', '.join(available_products())}"
+        )
 
-
-@dataclass(frozen=True)
-class ReportConfig:
-    output_root: str = "output"
-    daily_feature_cols: tuple[str, ...] = ("yz_hv60",)
-
-
-@dataclass(frozen=True)
-class AppConfig:
-    backtest: BacktestConfig = field(default_factory=BacktestConfig)
-    strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    vol: VolConfig = field(default_factory=VolConfig)
-    report: ReportConfig = field(default_factory=ReportConfig)
-
-
-CONFIG = AppConfig()
+    module = import_module(PRODUCT_CONFIG_MODULES[product_key])
+    return module.CONFIG

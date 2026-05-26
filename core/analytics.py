@@ -3,25 +3,60 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import pandas as pd
+
+from .config import CONFIG
 
 
-def plot_vol_features(features_df, backtest_df=None, output_path=None, show=True):
+def plot_vol_features(
+    features_df,
+    backtest_df=None,
+    benchmark_df=None,
+    experiment_backtest_df=None,
+    absolute_backtest_df=None,
+    percentile_backtest_df=None,
+    no_delta_hedge_df=None,
+    strategy_label=None,
+    output_path=None,
+    show=True,
+):
 
     required_cols = {"close", "atm_iv"}
     missing = required_cols - set(features_df.columns)
     if missing:
         raise ValueError(f"features_df missing columns:{missing}")
 
-    if backtest_df is None:
-        fig, ax_price = plt.subplots(figsize=(28, 14))
-    else:
-        fig, (ax_price, ax_nav) = plt.subplots(
+    has_atm_pool_volume = "atm_pool_total_volume" in features_df.columns
+    has_atm_volume = has_atm_pool_volume or "atm_total_volume" in features_df.columns
+    ax_nav = None
+    ax_drawdown = None
+    ax_volume = None
+    if backtest_df is not None and has_atm_volume:
+        fig, (ax_price, ax_nav, ax_drawdown, ax_volume) = plt.subplots(
+            4,
+            1,
+            figsize=(28, 26),
+            sharex=True,
+            gridspec_kw={"height_ratios": [2, 1, 1, 1]},
+        )
+    elif backtest_df is not None:
+        fig, (ax_price, ax_nav, ax_drawdown) = plt.subplots(
+            3,
+            1,
+            figsize=(28, 22),
+            sharex=True,
+            gridspec_kw={"height_ratios": [2, 1, 1]},
+        )
+    elif has_atm_volume:
+        fig, (ax_price, ax_volume) = plt.subplots(
             2,
             1,
             figsize=(28, 18),
             sharex=True,
             gridspec_kw={"height_ratios": [2, 1]},
         )
+    else:
+        fig, ax_price = plt.subplots(figsize=(28, 14))
 
     ax_price.plot(
         features_df.index,
@@ -31,11 +66,12 @@ def plot_vol_features(features_df, backtest_df=None, output_path=None, show=True
         linewidth=1.5,
     )
     ax_price.set_ylabel(("ETF Price"))
-    if backtest_df is None:
+    if backtest_df is None and ax_volume is None:
         ax_price.set_xlabel("Date")
 
     ax_price.grid(True, alpha=0.25)
     ax_vol = ax_price.twinx()
+    ax_percentile = None
 
     ax_vol.plot(
         features_df.index,
@@ -44,6 +80,86 @@ def plot_vol_features(features_df, backtest_df=None, output_path=None, show=True
         color="tab:red",
         linewidth=1.5,
     )
+    if CONFIG.strategy.enable_long_straddle:
+        ax_vol.axhline(
+            CONFIG.strategy.long_open_iv_threshold,
+            label=f"Long Open IV Threshold {CONFIG.strategy.long_open_iv_threshold:.2%}",
+            color="tab:green",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.75,
+        )
+        ax_vol.axhline(
+            CONFIG.strategy.long_close_iv_threshold,
+            label=f"Long Close IV Threshold {CONFIG.strategy.long_close_iv_threshold:.2%}",
+            color="tab:orange",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.75,
+        )
+    short_mode = getattr(CONFIG.strategy, "short_signal_mode", "absolute")
+    if CONFIG.strategy.enable_short_straddle and short_mode == "absolute":
+        ax_vol.axhline(
+            CONFIG.strategy.short_open_iv_threshold,
+            label=(
+                "Short Open IV Threshold "
+                f"{CONFIG.strategy.short_open_iv_threshold:.2%}"
+            ),
+            color="tab:purple",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.75,
+        )
+        ax_vol.axhline(
+            CONFIG.strategy.short_close_iv_threshold,
+            label=(
+                "Short Close IV Threshold "
+                f"{CONFIG.strategy.short_close_iv_threshold:.2%}"
+            ),
+            color="tab:brown",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.75,
+        )
+    if (
+        CONFIG.strategy.enable_short_straddle
+        and short_mode == "percentile"
+        and "atm_iv_percentile" in features_df.columns
+    ):
+        ax_percentile = ax_price.twinx()
+        ax_percentile.spines["right"].set_position(("axes", 1.06))
+        ax_percentile.plot(
+            features_df.index,
+            features_df["atm_iv_percentile"],
+            label="ATM IV Percentile",
+            color="tab:purple",
+            linewidth=1.1,
+            alpha=0.8,
+        )
+        ax_percentile.axhline(
+            CONFIG.strategy.short_open_iv_percentile_threshold,
+            label=(
+                "Short Open IV Percentile "
+                f"{CONFIG.strategy.short_open_iv_percentile_threshold:.0%}"
+            ),
+            color="tab:purple",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.75,
+        )
+        ax_percentile.axhline(
+            CONFIG.strategy.short_close_iv_percentile_threshold,
+            label=(
+                "Short Close IV Percentile "
+                f"{CONFIG.strategy.short_close_iv_percentile_threshold:.0%}"
+            ),
+            color="tab:brown",
+            linewidth=1.0,
+            linestyle="--",
+            alpha=0.75,
+        )
+        ax_percentile.set_ylabel("ATM IV Percentile")
+        ax_percentile.set_ylim(-0.02, 1.02)
 
     if "yz_hv20" in features_df.columns:
         ax_vol.plot(
@@ -79,19 +195,84 @@ def plot_vol_features(features_df, backtest_df=None, output_path=None, show=True
 
     lines_1, labels_1 = ax_price.get_legend_handles_labels()
     lines_2, labels_2 = ax_vol.get_legend_handles_labels()
+    lines_3, labels_3 = (
+        ax_percentile.get_legend_handles_labels()
+        if ax_percentile is not None
+        else ([], [])
+    )
 
-    ax_price.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right")
+    ax_price.legend(
+        lines_1 + lines_2 + lines_3,
+        labels_1 + labels_2 + labels_3,
+        loc="upper right",
+    )
 
     fig.suptitle(("ETF Price, ATM IV and HV"))
 
     if backtest_df is not None:
+        if strategy_label is None:
+            strategy_label = "Baseline NAV"
+            if (
+                getattr(CONFIG.strategy, "short_signal_mode", None) == "absolute"
+                and not getattr(CONFIG.strategy, "enable_delta_hedge", True)
+            ):
+                strategy_label = "Baseline NAV (Absolute Naked)"
         ax_nav.plot(
             backtest_df.index,
             backtest_df["nav"],
-            label="NAV",
+            label=strategy_label,
             color="black",
             linewidth=1.5,
         )
+        if benchmark_df is not None and "nav" in benchmark_df.columns:
+            ax_nav.plot(
+                benchmark_df.index,
+                benchmark_df["nav"],
+                label="Always ATM Benchmark NAV",
+                color="tab:blue",
+                linewidth=1.4,
+                linestyle="--",
+            )
+        if experiment_backtest_df is not None and "nav" in experiment_backtest_df.columns:
+            ax_nav.plot(
+                experiment_backtest_df.index,
+                experiment_backtest_df["nav"],
+                label="Low IV Short Experiment NAV",
+                color="tab:green",
+                linewidth=1.4,
+                linestyle="-.",
+            )
+        if absolute_backtest_df is not None and "nav" in absolute_backtest_df.columns:
+            ax_nav.plot(
+                absolute_backtest_df.index,
+                absolute_backtest_df["nav"],
+                label="Absolute Signal NAV",
+                color="tab:orange",
+                linewidth=1.3,
+                linestyle="-.",
+            )
+        if percentile_backtest_df is not None and "nav" in percentile_backtest_df.columns:
+            ax_nav.plot(
+                percentile_backtest_df.index,
+                percentile_backtest_df["nav"],
+                label=(
+                    "Percentile Signal NAV "
+                    f"({CONFIG.strategy.short_open_iv_percentile_threshold:.0%}/"
+                    f"{CONFIG.strategy.short_close_iv_percentile_threshold:.0%} Naked)"
+                ),
+                color="tab:green",
+                linewidth=1.3,
+                linestyle=":",
+            )
+        if no_delta_hedge_df is not None and "nav" in no_delta_hedge_df.columns:
+            ax_nav.plot(
+                no_delta_hedge_df.index,
+                no_delta_hedge_df["nav"],
+                label="Absolute Naked Vega Short NAV",
+                color="tab:gray",
+                linewidth=1.3,
+                linestyle=(0, (3, 1, 1, 1)),
+            )
 
         ax_nav.axhline(
             backtest_df["nav"].iloc[0],
@@ -102,9 +283,63 @@ def plot_vol_features(features_df, backtest_df=None, output_path=None, show=True
         )
 
         ax_nav.set_ylabel("NAV")
-        ax_nav.set_xlabel("Date")
+        if ax_drawdown is None and ax_volume is None:
+            ax_nav.set_xlabel("Date")
         ax_nav.grid(True, alpha=0.3)
         ax_nav.legend()
+
+    if ax_drawdown is not None:
+        drawdown = backtest_df["nav"] / backtest_df["nav"].cummax() - 1
+        ax_drawdown.plot(
+            backtest_df.index,
+            drawdown,
+            label="Drawdown",
+            color="tab:red",
+            linewidth=1.2,
+        )
+        ax_drawdown.axhline(0, color="gray", linestyle="--", linewidth=1)
+        ax_drawdown.set_ylabel("Drawdown")
+        if ax_volume is None:
+            ax_drawdown.set_xlabel("Date")
+        ax_drawdown.grid(True, alpha=0.3)
+        ax_drawdown.legend(loc="lower left")
+
+    if ax_volume is not None:
+        if has_atm_pool_volume:
+            volume_col = "atm_pool_total_volume"
+            volume_label = "ATM Nearby Pool Call+Put Volume"
+        else:
+            volume_col = "atm_total_volume"
+            volume_label = "ATM Call+Put Volume"
+        ax_volume.plot(
+            features_df.index,
+            features_df[volume_col],
+            label=volume_label,
+            color="tab:blue",
+            linewidth=0.8,
+            alpha=0.35,
+        )
+        rolling_volume = features_df[volume_col].rolling(10, min_periods=3).mean()
+        ax_volume.plot(
+            features_df.index,
+            rolling_volume,
+            label=f"{volume_label} 10D MA",
+            color="tab:blue",
+            linewidth=1.8,
+        )
+        if "atm_pool_min_leg_volume" in features_df.columns:
+            ax_volume.plot(
+                features_df.index,
+                features_df["atm_pool_min_leg_volume"],
+                label="ATM Nearby Pool Weaker Leg Volume",
+                color="tab:orange",
+                linewidth=1.0,
+                alpha=0.85,
+            )
+        ax_volume.set_ylabel("ATM Option Volume")
+        ax_volume.set_xlabel("Date")
+        ax_volume.grid(True, alpha=0.3)
+        ax_volume.legend(loc="upper right")
 
     fig.tight_layout()
 
@@ -167,11 +402,25 @@ def plot_cumulative_actual_vs_greeks_pnl(backtest_df, output_path=None, show=Tru
     if missing:
         raise ValueError(f"backtest_df missing columns:{missing}")
 
-    cum_actual_pnl = backtest_df["daily_nav_pnl_before_fee"].fillna(0.0).cumsum()
-    cum_actual_after_fee_pnl = backtest_df["daily_nav_pnl"].fillna(0.0).cumsum()
-    cum_greeks_pnl = backtest_df["greeks_pnl"].fillna(0.0).cumsum()
+    cum_actual_pnl = (
+        pd.to_numeric(backtest_df["daily_nav_pnl_before_fee"], errors="coerce")
+        .fillna(0.0)
+        .cumsum()
+    )
+    cum_actual_after_fee_pnl = (
+        pd.to_numeric(backtest_df["daily_nav_pnl"], errors="coerce")
+        .fillna(0.0)
+        .cumsum()
+    )
+    cum_greeks_pnl = (
+        pd.to_numeric(backtest_df["greeks_pnl"], errors="coerce").fillna(0.0).cumsum()
+    )
     cum_unexplained_pnl = (
-        backtest_df["greeks_unexplained_pnl_before_fee"].fillna(0.0).cumsum()
+        pd.to_numeric(
+            backtest_df["greeks_unexplained_pnl_before_fee"], errors="coerce"
+        )
+        .fillna(0.0)
+        .cumsum()
     )
 
     fig, ax = plt.subplots(figsize=(28, 14))

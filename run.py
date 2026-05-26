@@ -1,3 +1,6 @@
+import argparse
+import json
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pandas as pd
@@ -5,6 +8,145 @@ import pandas as pd
 import core
 
 CONFIG = core.config.CONFIG
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="运行期权策略回测。")
+    parser.add_argument(
+        "--product",
+        choices=core.config.available_products(),
+        default=CONFIG.data.product,
+        help="交易品种配置，默认使用 50ETF。",
+    )
+    parser.add_argument(
+        "--start",
+        default=None,
+        help="回测开始日期，默认使用所选品种配置文件中的 start。",
+    )
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="回测结束日期，默认使用所选品种配置文件中的 end。",
+    )
+    parser.add_argument(
+        "--test-date",
+        default=None,
+        help="烟雾测试日期，默认使用所选品种配置文件中的 test_date。",
+    )
+    return parser.parse_args()
+
+
+def sync_config(config):
+    """把临时配置同步到各模块；调对比账户时需要切换信号口径。"""
+    global CONFIG
+    CONFIG = config
+    core.config.CONFIG = config
+    core.vol_engine.CONFIG = config
+    core.strategy.CONFIG = config
+    core.backtester.CONFIG = config
+    core.position.CONFIG = config
+    core.hedge.CONFIG = config
+    core.analytics.CONFIG = config
+
+
+def select_runtime_config(args):
+    """读取品种配置，并应用命令行日期覆盖。"""
+    selected_config = core.config.load_config(args.product)
+    backtest_updates = {
+        key: value
+        for key, value in {
+            "start": args.start,
+            "end": args.end,
+            "test_date": args.test_date,
+        }.items()
+        if value is not None
+    }
+    if backtest_updates:
+        selected_config = replace(
+            selected_config,
+            backtest=replace(selected_config.backtest, **backtest_updates),
+        )
+    return selected_config
+
+
+def run_backtest_with_strategy_mode(
+    mode,
+    features,
+    etf_by_date,
+    opt_by_date,
+    trading_calendar,
+    enriched_opt_by_date,
+    enable_delta_hedge=None,
+    strategy_overrides=None,
+    backtest_overrides=None,
+):
+    """用指定 short 信号口径跑一份独立对比账户，运行后恢复主配置。"""
+    original_config = core.config.CONFIG
+    strategy_updates = {"short_signal_mode": mode}
+    if enable_delta_hedge is not None:
+        strategy_updates["enable_delta_hedge"] = enable_delta_hedge
+    if strategy_overrides:
+        strategy_updates.update(strategy_overrides)
+    backtest_updates = {
+        key: value
+        for key, value in (backtest_overrides or {}).items()
+        if value is not None
+    }
+
+    new_backtest = (
+        replace(original_config.backtest, **backtest_updates)
+        if backtest_updates
+        else original_config.backtest
+    )
+    temp_config = replace(
+        original_config,
+        strategy=replace(original_config.strategy, **strategy_updates),
+        backtest=new_backtest,
+    )
+    sync_config(temp_config)
+    try:
+        signals = core.strategy.build_signals(features)
+        return core.backtester.run_backtest(
+            etf_by_date,
+            opt_by_date,
+            signals,
+            trading_calendar=trading_calendar,
+            enriched_opt_by_date=enriched_opt_by_date,
+        )
+    finally:
+        sync_config(original_config)
+
+
+def run_no_delta_hedge_with_strategy_mode(
+    mode,
+    features,
+    etf_by_date,
+    opt_by_date,
+    trading_calendar,
+    enriched_opt_by_date,
+):
+    """用指定 short 信号口径跑一份不做 delta hedge 的对比账户。"""
+    original_config = core.config.CONFIG
+    temp_config = replace(
+        original_config,
+        strategy=replace(
+            original_config.strategy,
+            short_signal_mode=mode,
+            enable_delta_hedge=False,
+        ),
+    )
+    sync_config(temp_config)
+    try:
+        signals = core.strategy.build_signals(features)
+        return core.backtester.run_no_delta_hedge_backtest(
+            etf_by_date,
+            opt_by_date,
+            signals,
+            trading_calendar=trading_calendar,
+            enriched_opt_by_date=enriched_opt_by_date,
+        )
+    finally:
+        sync_config(original_config)
 
 
 def load_data():
@@ -49,12 +191,34 @@ def format_pct(value):
     return f"{value:.2%}"
 
 
+def format_number(value):
+    if pd.isna(value):
+        return "NA"
+    return f"{value:.2f}"
+
+
 def calc_return_stats(daily_pnl):
     initial_cash = CONFIG.backtest.initial_cash
     final_nav = daily_pnl["nav"].iloc[-1]
     total_return = final_nav / initial_cash - 1
     trading_days = len(daily_pnl)
     annual_return = (1 + total_return) ** (CONFIG.vol.annual_days / trading_days) - 1
+    daily_return = daily_pnl["nav"].pct_change().dropna()
+    daily_return_std = daily_return.std()
+    sharpe_ratio = (
+        daily_return.mean() / daily_return_std * (CONFIG.vol.annual_days ** 0.5)
+        if len(daily_return) > 1 and daily_return_std != 0
+        else pd.NA
+    )
+    drawdown = daily_pnl["nav"] / daily_pnl["nav"].cummax() - 1
+    max_drawdown = drawdown.min()
+    max_drawdown_end = drawdown.idxmin()
+    max_drawdown_start = daily_pnl.loc[:max_drawdown_end, "nav"].idxmax()
+    cash_negative_days = (
+        int(daily_pnl["cash_negative_warning"].sum())
+        if "cash_negative_warning" in daily_pnl.columns
+        else int((daily_pnl["cash"] < 0).sum())
+    )
 
     return {
         "initial_cash": initial_cash,
@@ -62,9 +226,15 @@ def calc_return_stats(daily_pnl):
         "total_pnl": final_nav - initial_cash,
         "total_return": total_return,
         "annual_return": annual_return,
+        "sharpe_ratio": sharpe_ratio,
+        "max_drawdown": max_drawdown,
+        "max_drawdown_start": max_drawdown_start,
+        "max_drawdown_end": max_drawdown_end,
         "trading_days": trading_days,
         "start_date": daily_pnl.index[0],
         "end_date": daily_pnl.index[-1],
+        "min_cash": daily_pnl["cash"].min(),
+        "cash_negative_days": cash_negative_days,
     }
 
 
@@ -73,9 +243,35 @@ def calc_summary_breakdown(daily_pnl, trades):
     total_pnl = daily_pnl["nav"].iloc[-1] - CONFIG.backtest.initial_cash
     total_pnl_before_fee = daily_pnl["daily_nav_pnl_before_fee"].sum(skipna=True)
     option_fee = 0.0
+    option_fee_by_side = {"long": 0.0, "short": 0.0}
     if not trades.empty and "fee" in trades.columns:
         option_trade_mask = trades["type"].str.contains("straddle", na=False)
         option_fee = trades.loc[option_trade_mask, "fee"].sum()
+        if "side" in trades.columns:
+            for side in option_fee_by_side:
+                side_mask = option_trade_mask & trades["side"].eq(side)
+                option_fee_by_side[side] = trades.loc[side_mask, "fee"].sum()
+    liquidity_warnings = {
+        "warning_trades": 0,
+        "warning_legs": 0,
+        "missing_volume_trades": 0,
+    }
+    if not trades.empty and "liquidity_warning" in trades.columns:
+        option_trade_mask = trades["type"].str.contains("straddle", na=False)
+        warning_mask = trades["liquidity_warning"].eq(True)
+        liquidity_warnings["warning_trades"] = int(
+            (option_trade_mask & warning_mask).sum()
+        )
+        for leg_col in ["call_liquidity_warning", "put_liquidity_warning"]:
+            if leg_col in trades.columns:
+                liquidity_warnings["warning_legs"] += int(
+                    trades.loc[option_trade_mask, leg_col].eq(True).sum()
+                )
+        if "liquidity_volume_missing_legs" in trades.columns:
+            missing_mask = trades["liquidity_volume_missing_legs"].fillna("").ne("")
+            liquidity_warnings["missing_volume_trades"] = int(
+                (option_trade_mask & missing_mask).sum()
+            )
 
     etf_fee = daily_pnl["etf_fee"].sum()
     components = {
@@ -91,7 +287,22 @@ def calc_summary_breakdown(daily_pnl, trades):
         "option_fee": -option_fee,
         "etf_fee": -etf_fee,
     }
-    components["explained_subtotal"] = sum(components.values())
+    components["by_side"] = {}
+    for side in ["long", "short"]:
+        prefix = f"{side}_"
+        components["by_side"][side] = {
+            "delta": daily_pnl[f"{prefix}delta_pnl"].sum(skipna=True),
+            "gamma": daily_pnl[f"{prefix}gamma_pnl"].sum(skipna=True),
+            "vega": daily_pnl[f"{prefix}vega_pnl"].sum(skipna=True),
+            "theta": daily_pnl[f"{prefix}theta_pnl"].sum(skipna=True),
+            "greeks_trading": daily_pnl[f"{prefix}greeks_pnl"].sum(skipna=True),
+            "option_fee": -option_fee_by_side[side],
+            "days": int(daily_pnl[f"{prefix}greeks_explainable_day"].sum()),
+        }
+    components["liquidity_warnings"] = liquidity_warnings
+    components["explained_subtotal"] = sum(
+        value for value in components.values() if isinstance(value, (int, float))
+    )
     components["unexplained"] = total_pnl - components["explained_subtotal"]
     return components
 
@@ -123,6 +334,18 @@ def print_breakdown_item(name, value, total_pnl):
     print(f"{name}: {format_money(value)} ({share_text})")
 
 
+def print_side_breakdown(side_name, side_breakdown):
+    total_greeks = side_breakdown["greeks_trading"]
+    print(f"\n--- {side_name} Greeks 分解 ---")
+    print(f"可解释交易日: {side_breakdown['days']}")
+    print_breakdown_item("Delta PnL（仅期权腿）", side_breakdown["delta"], total_greeks)
+    print_breakdown_item("Gamma PnL", side_breakdown["gamma"], total_greeks)
+    print_breakdown_item("Vega PnL", side_breakdown["vega"], total_greeks)
+    print_breakdown_item("Theta PnL", side_breakdown["theta"], total_greeks)
+    print_breakdown_item("Greeks PnL", total_greeks, total_greeks)
+    print_breakdown_item("期权手续费", side_breakdown["option_fee"], total_greeks)
+
+
 def print_summary(daily_pnl, trades):
     stats = calc_return_stats(daily_pnl)
     breakdown = calc_summary_breakdown(daily_pnl, trades)
@@ -139,8 +362,16 @@ def print_summary(daily_pnl, trades):
     print(f"总损益: {format_money(stats['total_pnl'])}")
     print(f"总收益率: {format_pct(stats['total_return'])}")
     print(f"年化收益率: {format_pct(stats['annual_return'])}")
+    print(f"夏普比率: {format_number(stats['sharpe_ratio'])}")
+    print(
+        "最大回撤: "
+        f"{format_pct(stats['max_drawdown'])} "
+        f"({stats['max_drawdown_start'].date()} -> {stats['max_drawdown_end'].date()})"
+    )
+    print(f"最大期权保证金: {format_money(daily_pnl['option_margin'].max())}")
     print(f"最大 ETF 保证金: {format_money(daily_pnl['hedge_margin'].max())}")
-    print(f"最低现金: {format_money(daily_pnl['cash'].min())}")
+    print(f"最低现金: {format_money(stats['min_cash'])}")
+    print(f"爆仓预警天数（现金<0）: {stats['cash_negative_days']}")
 
     print("\n=== 损益分解 ===")
     total_pnl = stats["total_pnl"]
@@ -155,6 +386,8 @@ def print_summary(daily_pnl, trades):
         breakdown["unexplained_trading_before_fee"],
         total_before_fee,
     )
+    print_side_breakdown("Long", breakdown["by_side"]["long"])
+    print_side_breakdown("Short", breakdown["by_side"]["short"])
 
     print("\n=== 手续费 ===")
     print_breakdown_item("期权手续费", breakdown["option_fee"], total_pnl)
@@ -170,11 +403,217 @@ def print_summary(daily_pnl, trades):
     )
 
 
+def calc_liquidity_warning_stats(trades):
+    stats = {
+        "warning_trades": 0,
+        "warning_legs": 0,
+        "missing_volume_trades": 0,
+        "worst_warning": None,
+    }
+    if trades.empty or "liquidity_warning" not in trades.columns:
+        return stats
+
+    option_trade_mask = trades["type"].str.contains("straddle", na=False)
+    warning_mask = trades["liquidity_warning"].eq(True)
+    stats["warning_trades"] = int((option_trade_mask & warning_mask).sum())
+    warning_legs = []
+    option_trades = trades.loc[option_trade_mask]
+    for leg in ["call", "put"]:
+        leg_col = f"{leg}_liquidity_warning"
+        if leg_col in trades.columns:
+            stats["warning_legs"] += int(option_trades[leg_col].eq(True).sum())
+            for _, trade in option_trades.iterrows():
+                leg_warning = trade.get(leg_col, False)
+                if not (leg_warning is True or str(leg_warning).lower() == "true"):
+                    continue
+                volume = trade.get(f"{leg}_volume")
+                qty = abs(float(trade.get(f"trade_{leg}_qty", 0) or 0))
+                if pd.isna(volume) or float(volume) <= 0:
+                    continue
+                volume = float(volume)
+                warning_legs.append(
+                    {
+                        "date": trade.get("date"),
+                        "type": trade.get("type"),
+                        "side": trade.get("side"),
+                        "leg": leg,
+                        "code": trade.get(f"{leg}_code"),
+                        "qty": qty,
+                        "volume": volume,
+                        "ratio": qty / volume,
+                    }
+                )
+    if warning_legs:
+        stats["worst_warning"] = max(warning_legs, key=lambda item: item["ratio"])
+    if "liquidity_volume_missing_legs" in trades.columns:
+        missing_mask = trades["liquidity_volume_missing_legs"].fillna("").ne("")
+        stats["missing_volume_trades"] = int((option_trade_mask & missing_mask).sum())
+    return stats
+
+
+def print_liquidity_warning_summary(trades):
+    stats = calc_liquidity_warning_stats(trades)
+    print("\n=== 成交量预警 ===")
+    print(f"触发预警交易次数: {stats['warning_trades']}（腿次数: {stats['warning_legs']}）")
+    print(f"成交量缺失交易次数: {stats['missing_volume_trades']}")
+    worst_warning = stats["worst_warning"]
+    if worst_warning is not None:
+        print(
+            "最严重预警: "
+            f"{worst_warning['date']} {worst_warning['type']} "
+            f"{worst_warning['side']} {worst_warning['leg']} "
+            f"{worst_warning['code']}, "
+            f"交易张数={worst_warning['qty']:.0f}, "
+            f"成交量={worst_warning['volume']:.0f}, "
+            f"占比={worst_warning['ratio']:.2%}"
+        )
+
+
+def _summary_value_for_csv(value):
+    if isinstance(value, pd.Timestamp):
+        return value.date().isoformat()
+    if pd.isna(value):
+        return None
+    return value
+
+
+def save_summary_files(output_dir, daily_pnl, trades):
+    """把回测概要同时保存为人读 txt 和机器读 csv。"""
+    stats = calc_return_stats(daily_pnl)
+    breakdown = calc_summary_breakdown(daily_pnl, trades)
+    explain_stats = calc_explain_ratio_stats(
+        daily_pnl,
+        "greeks_explain_ratio_before_fee",
+    )
+    liquidity_stats = calc_liquidity_warning_stats(trades)
+    total_pnl = stats["total_pnl"]
+    total_before_fee = breakdown["total_before_fee"]
+
+    lines = [
+        "=== 回测概要 ===",
+        f"区间: {stats['start_date'].date()} -> {stats['end_date'].date()}",
+        f"交易日数: {stats['trading_days']}",
+        f"初始资金: {format_money(stats['initial_cash'])}",
+        f"期末净值: {format_money(stats['final_nav'])}",
+        f"总损益: {format_money(stats['total_pnl'])}",
+        f"总收益率: {format_pct(stats['total_return'])}",
+        f"年化收益率: {format_pct(stats['annual_return'])}",
+        f"夏普比率: {format_number(stats['sharpe_ratio'])}",
+        (
+            "最大回撤: "
+            f"{format_pct(stats['max_drawdown'])} "
+            f"({stats['max_drawdown_start'].date()} -> "
+            f"{stats['max_drawdown_end'].date()})"
+        ),
+        f"最大期权保证金: {format_money(daily_pnl['option_margin'].max())}",
+        f"最大 ETF 保证金: {format_money(daily_pnl['hedge_margin'].max())}",
+        f"最低现金: {format_money(stats['min_cash'])}",
+        f"爆仓预警天数（现金<0）: {stats['cash_negative_days']}",
+        "",
+        "=== 损益分解 ===",
+        f"Delta PnL: {format_money(breakdown['delta'])}",
+        f"Gamma PnL: {format_money(breakdown['gamma'])}",
+        f"Vega PnL: {format_money(breakdown['vega'])}",
+        f"Theta PnL: {format_money(breakdown['theta'])}",
+        f"Greeks PnL: {format_money(breakdown['greeks_trading'])}",
+        (
+            "未解释 PnL（手续费前）: "
+            f"{format_money(breakdown['unexplained_trading_before_fee'])}"
+        ),
+        "",
+        "=== 手续费 ===",
+        f"期权手续费: {format_money(breakdown['option_fee'])}",
+        f"ETF 手续费: {format_money(breakdown['etf_fee'])}",
+        f"手续费前实际 PnL: {format_money(total_before_fee)}",
+        f"手续费后实际 PnL: {format_money(total_pnl)}",
+        "",
+        "=== Greeks 解释力（手续费前） ===",
+        (
+            f"days={explain_stats['days']}, "
+            f"abs加权mean={format_pct(explain_stats['weighted_mean'])}, "
+            f"median={format_pct(explain_stats['median'])}"
+        ),
+        "",
+        "=== 成交量预警 ===",
+        (
+            f"触发预警交易次数: {liquidity_stats['warning_trades']} "
+            f"（腿次数: {liquidity_stats['warning_legs']}）"
+        ),
+        f"成交量缺失交易次数: {liquidity_stats['missing_volume_trades']}",
+    ]
+
+    worst_warning = liquidity_stats["worst_warning"]
+    if worst_warning is not None:
+        lines.append(
+            "最严重预警: "
+            f"{worst_warning['date']} {worst_warning['type']} "
+            f"{worst_warning['side']} {worst_warning['leg']} "
+            f"{worst_warning['code']}, "
+            f"交易张数={worst_warning['qty']:.0f}, "
+            f"成交量={worst_warning['volume']:.0f}, "
+            f"占比={worst_warning['ratio']:.2%}"
+        )
+
+    (output_dir / "backtest_summary.txt").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8-sig",
+    )
+
+    rows = [
+        ("initial_cash", stats["initial_cash"]),
+        ("final_nav", stats["final_nav"]),
+        ("total_pnl", stats["total_pnl"]),
+        ("total_return", stats["total_return"]),
+        ("annual_return", stats["annual_return"]),
+        ("sharpe_ratio", stats["sharpe_ratio"]),
+        ("max_drawdown", stats["max_drawdown"]),
+        ("max_drawdown_start", stats["max_drawdown_start"]),
+        ("max_drawdown_end", stats["max_drawdown_end"]),
+        ("trading_days", stats["trading_days"]),
+        ("start_date", stats["start_date"]),
+        ("end_date", stats["end_date"]),
+        ("max_option_margin", daily_pnl["option_margin"].max()),
+        ("max_etf_margin", daily_pnl["hedge_margin"].max()),
+        ("min_cash", stats["min_cash"]),
+        ("cash_negative_days", stats["cash_negative_days"]),
+        ("delta_pnl", breakdown["delta"]),
+        ("gamma_pnl", breakdown["gamma"]),
+        ("vega_pnl", breakdown["vega"]),
+        ("theta_pnl", breakdown["theta"]),
+        ("greeks_pnl", breakdown["greeks_trading"]),
+        (
+            "unexplained_pnl_before_fee",
+            breakdown["unexplained_trading_before_fee"],
+        ),
+        ("option_fee", breakdown["option_fee"]),
+        ("etf_fee", breakdown["etf_fee"]),
+        ("actual_pnl_before_fee", total_before_fee),
+        ("actual_pnl_after_fee", total_pnl),
+        ("greeks_explainable_days", explain_stats["days"]),
+        ("greeks_explain_ratio_weighted_mean", explain_stats["weighted_mean"]),
+        ("greeks_explain_ratio_median", explain_stats["median"]),
+        ("liquidity_warning_trades", liquidity_stats["warning_trades"]),
+        ("liquidity_warning_legs", liquidity_stats["warning_legs"]),
+        ("liquidity_missing_volume_trades", liquidity_stats["missing_volume_trades"]),
+    ]
+    pd.DataFrame(
+        [{"metric": key, "value": _summary_value_for_csv(value)} for key, value in rows]
+    ).to_csv(output_dir / "backtest_summary.csv", index=False, encoding="utf-8-sig")
+
+
 def make_output_dir():
     timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(CONFIG.report.output_root) / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def save_runtime_config(output_dir):
+    """保存本次运行实际使用的配置，方便回看结果时确认参数是否生效。"""
+    (output_dir / "runtime_config.json").write_text(
+        json.dumps(asdict(CONFIG), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def smoke_test_data_load():
@@ -294,18 +733,31 @@ def smoke_test_greeks():
 
 
 def main():
+    args = parse_args()
+    sync_config(select_runtime_config(args))
+    print(
+        "运行品种: "
+        f"{CONFIG.data.product}, "
+        f"数据区间: {CONFIG.backtest.start} - {CONFIG.backtest.end}",
+        flush=True,
+    )
+
     etf_by_date, opt_by_date = load_data()
     trading_calendar = core.data_loader.load_etf_trading_calendar()
-    enriched_opt_by_date = core.vol_engine.build_enriched_option_chains(
+    enriched_opt_by_date = core.cache.get_enriched_option_chains(
         etf_by_date,
         opt_by_date,
-        trading_calendar=trading_calendar,
+        trading_calendar,
+        CONFIG.backtest.start,
+        CONFIG.backtest.end,
     )
-    features = core.vol_engine.build_vol_features(
+    features = core.cache.get_vol_features(
         etf_by_date,
         opt_by_date,
-        trading_calendar=trading_calendar,
-        enriched_opt_by_date=enriched_opt_by_date,
+        trading_calendar,
+        enriched_opt_by_date,
+        CONFIG.backtest.start,
+        CONFIG.backtest.end,
     )
     signals = core.strategy.build_signals(features)
     daily_pnl, trades = core.backtester.run_backtest(
@@ -315,16 +767,103 @@ def main():
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
     )
+    reference_config = CONFIG.reference
+    benchmark_pnl = None
+    benchmark_trades = None
+    if reference_config.enable_always_atm:
+        benchmark_pnl, benchmark_trades = core.backtester.run_always_atm_benchmark(
+            etf_by_date,
+            opt_by_date,
+            signals,
+            benchmark_side=reference_config.always_atm_side,
+            always_atm_qty=reference_config.always_atm_qty,
+            enable_delta_hedge=reference_config.always_atm_enable_delta_hedge,
+            trading_calendar=trading_calendar,
+            enriched_opt_by_date=enriched_opt_by_date,
+        )
+
+    experiment_pnl = None
+    experiment_trades = None
+    if reference_config.enable_experiment:
+        experiment_strategy_overrides = {
+            "enable_long_straddle": (
+                reference_config.experiment_enable_long_straddle
+            ),
+            "enable_short_straddle": (
+                reference_config.experiment_enable_short_straddle
+            ),
+            "short_stop_loss_enabled": (
+                reference_config.experiment_short_stop_loss_enabled
+            ),
+            "short_volume_spike_exit_enabled": (
+                reference_config.experiment_short_volume_spike_exit_enabled
+            ),
+            "short_cooldown_after_long_iv_high_exit_days": (
+                reference_config.experiment_short_cooldown_after_long_iv_high_exit_days
+            ),
+        }
+        for config_field, strategy_field in {
+            "experiment_short_low_iv_open_threshold": "short_low_iv_open_threshold",
+            "experiment_short_low_iv_close_threshold": "short_low_iv_close_threshold",
+            "experiment_short_low_iv_hv_spread_threshold": (
+                "short_low_iv_hv_spread_threshold"
+            ),
+            "experiment_short_low_iv_close_spread_threshold": (
+                "short_low_iv_close_spread_threshold"
+            ),
+        }.items():
+            value = getattr(reference_config, config_field)
+            if value is not None:
+                experiment_strategy_overrides[strategy_field] = value
+
+        experiment_pnl, experiment_trades = run_backtest_with_strategy_mode(
+            reference_config.experiment_short_signal_mode,
+            features,
+            etf_by_date,
+            opt_by_date,
+            trading_calendar,
+            enriched_opt_by_date,
+            enable_delta_hedge=reference_config.experiment_enable_delta_hedge,
+            strategy_overrides=experiment_strategy_overrides,
+            backtest_overrides={
+                "long_qty": reference_config.experiment_long_qty,
+                "short_qty": reference_config.experiment_short_qty,
+            },
+        )
 
     output_dir = make_output_dir()
+    save_runtime_config(output_dir)
 
     daily_report = build_daily_report(features, daily_pnl)
     daily_report.to_csv(output_dir / "daily_feature_position.csv", encoding="utf-8-sig")
     trades.to_csv(output_dir / "trades.csv", index=False, encoding="utf-8-sig")
-
+    if benchmark_pnl is not None:
+        benchmark_pnl.to_csv(
+            output_dir / "always_atm_benchmark.csv",
+            encoding="utf-8-sig",
+        )
+    if benchmark_trades is not None:
+        benchmark_trades.to_csv(
+            output_dir / "always_atm_benchmark_trades.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
+    if experiment_pnl is not None:
+        experiment_pnl.to_csv(
+            output_dir / "experiment_backtest.csv",
+            encoding="utf-8-sig",
+        )
+    if experiment_trades is not None:
+        experiment_trades.to_csv(
+            output_dir / "experiment_trades.csv",
+            index=False,
+            encoding="utf-8-sig",
+        )
     core.analytics.plot_vol_features(
         features,
         backtest_df=daily_pnl,
+        benchmark_df=benchmark_pnl,
+        experiment_backtest_df=experiment_pnl,
         output_path=output_dir / "vol_features.png",
         show=False,
     )
@@ -339,7 +878,9 @@ def main():
         show=False,
     )
 
+    save_summary_files(output_dir, daily_pnl, trades)
     print_summary(daily_pnl, trades)
+    print_liquidity_warning_summary(trades)
     print(f"output dir: {output_dir}")
 
 
