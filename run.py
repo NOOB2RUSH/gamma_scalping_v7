@@ -117,38 +117,6 @@ def run_backtest_with_strategy_mode(
         sync_config(original_config)
 
 
-def run_no_delta_hedge_with_strategy_mode(
-    mode,
-    features,
-    etf_by_date,
-    opt_by_date,
-    trading_calendar,
-    enriched_opt_by_date,
-):
-    """用指定 short 信号口径跑一份不做 delta hedge 的对比账户。"""
-    original_config = core.config.CONFIG
-    temp_config = replace(
-        original_config,
-        strategy=replace(
-            original_config.strategy,
-            short_signal_mode=mode,
-            enable_delta_hedge=False,
-        ),
-    )
-    sync_config(temp_config)
-    try:
-        signals = core.strategy.build_signals(features)
-        return core.backtester.run_no_delta_hedge_backtest(
-            etf_by_date,
-            opt_by_date,
-            signals,
-            trading_calendar=trading_calendar,
-            enriched_opt_by_date=enriched_opt_by_date,
-        )
-    finally:
-        sync_config(original_config)
-
-
 def load_data():
     etf_by_date = core.data_loader.load_etf_series(
         CONFIG.backtest.start,
@@ -338,12 +306,19 @@ def print_side_breakdown(side_name, side_breakdown):
     total_greeks = side_breakdown["greeks_trading"]
     print(f"\n--- {side_name} Greeks 分解 ---")
     print(f"可解释交易日: {side_breakdown['days']}")
-    print_breakdown_item("Delta PnL（仅期权腿）", side_breakdown["delta"], total_greeks)
+    print("Delta PnL: 仅在账户总口径展示，分方向不展示期权腿 delta。")
     print_breakdown_item("Gamma PnL", side_breakdown["gamma"], total_greeks)
     print_breakdown_item("Vega PnL", side_breakdown["vega"], total_greeks)
     print_breakdown_item("Theta PnL", side_breakdown["theta"], total_greeks)
-    print_breakdown_item("Greeks PnL", total_greeks, total_greeks)
-    print_breakdown_item("期权手续费", side_breakdown["option_fee"], total_greeks)
+    option_leg_greeks = (
+        side_breakdown["gamma"] + side_breakdown["vega"] + side_breakdown["theta"]
+    )
+    print_breakdown_item(
+        "Greeks PnL（不含期权腿 delta）",
+        option_leg_greeks,
+        option_leg_greeks,
+    )
+    print_breakdown_item("期权手续费", side_breakdown["option_fee"], option_leg_greeks)
 
 
 def print_summary(daily_pnl, trades):
@@ -614,122 +589,6 @@ def save_runtime_config(output_dir):
         json.dumps(asdict(CONFIG), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
-
-def smoke_test_data_load():
-    test_date = pd.Timestamp(CONFIG.backtest.test_date)
-    etf_by_date = core.data_loader.load_etf_series(
-        CONFIG.backtest.start,
-        CONFIG.backtest.end,
-    )
-    opt_by_date = core.data_loader.load_opt_series(
-        CONFIG.backtest.start,
-        CONFIG.backtest.end,
-    )
-
-    print("=== data load ===")
-    print(f"etf days: {len(etf_by_date)}")
-    print(f"option days: {len(opt_by_date)}")
-    print(f"first etf date: {min(etf_by_date)}")
-    print(f"last etf date: {max(etf_by_date)}")
-    print(f"test date exists in etf: {test_date in etf_by_date}")
-    print(f"test date exists in option: {test_date in opt_by_date}")
-
-    return etf_by_date, opt_by_date
-
-
-def smoke_test_hv(etf_by_date):
-    daily_ohlc = core.vol_engine.build_daily_ohlc_df(etf_by_date)
-    hv_df = core.vol_engine.calculate_yz_hv(
-        daily_ohlc,
-        rolling_windows=(5, 20),
-        annual_days=CONFIG.vol.annual_days,
-    )
-
-    print("\n=== realized vol ===")
-    print(hv_df[["close", "yz_hv5", "yz_hv20"]].tail(10))
-
-    return daily_ohlc, hv_df
-
-
-def smoke_test_atm_iv(daily_ohlc, opt_by_date):
-    test_date = pd.Timestamp(CONFIG.backtest.test_date)
-    spot = daily_ohlc.loc[test_date, "close"]
-    chain = opt_by_date[test_date]
-    trading_calendar = core.data_loader.load_etf_trading_calendar()
-
-    atm = core.vol_engine.calc_atm_iv_for_day(
-        daily_opt_chain=chain,
-        spot=spot,
-        target_dte=CONFIG.vol.atm_target_dte,
-        target_dte_min=CONFIG.vol.atm_target_dte_min,
-        target_dte_max=CONFIG.vol.atm_target_dte_max,
-        atm_moneyness_tol=CONFIG.vol.atm_moneyness_tol,
-        trading_calendar=trading_calendar,
-    )
-
-    print("\n=== atm iv ===")
-    print(f"date: {test_date.date()}")
-    print(f"spot: {spot}")
-
-    if atm is None:
-        print("no valid atm call+put pair found")
-        return None
-
-    print(f"strike: {atm['strike']}")
-    print(f"expiry: {atm['expiry'].date()}")
-    print(f"dte: {atm['dte']}")
-    print(f"call code: {atm['call']['order_book_id']}")
-    print(f"put code: {atm['put']['order_book_id']}")
-    print(f"call mid: {atm['call']['mid']}")
-    print(f"put mid: {atm['put']['mid']}")
-    print(f"call iv: {atm['call_iv']}")
-    print(f"put iv: {atm['put_iv']}")
-    print(f"atm iv: {atm['atm_iv']}")
-
-    return atm
-
-
-def smoke_test_greeks():
-    date = pd.Timestamp(CONFIG.backtest.test_date)
-
-    smoke_date = date.strftime("%Y%m%d")
-    etf_by_date = core.data_loader.load_etf_series(smoke_date, smoke_date)
-    opt_by_date = core.data_loader.load_opt_series(smoke_date, smoke_date)
-    trading_calendar = core.data_loader.load_etf_trading_calendar()
-
-    spot = etf_by_date[date].iloc[0]["close"]
-    atm = core.vol_engine.calc_atm_iv_for_day(
-        opt_by_date[date],
-        spot,
-        trading_calendar=trading_calendar,
-    )
-
-    print("\n=== greeks smoke test ===")
-    print(f"date: {date.date()}")
-    print(f"spot: {spot}")
-    print(f"strike: {atm['strike']}")
-    print(f"expiry: {atm['expiry'].date()}")
-    print(f"dte: {atm['dte']}")
-
-    for side in ["call", "put"]:
-        row = atm[side]
-        print(f"\n{side.upper()}")
-        print(f"code: {row['order_book_id']}")
-        print(f"mid: {row['mid']}")
-        print(f"iv: {row['iv']}")
-        print(f"delta: {row['delta']}")
-        print(f"gamma: {row['gamma']}")
-        print(f"vega: {row['vega']}")
-        print(f"theta: {row['theta']}")
-
-    position_greeks = core.strategy.calc_position_greeks(
-        atm["call"],
-        atm["put"],
-    )
-
-    print("\nPOSITION GREEKS")
-    print(position_greeks)
 
 
 def main():

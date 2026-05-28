@@ -8,6 +8,17 @@ import pandas as pd
 from .config import CONFIG
 
 
+def _product_label():
+    product = str(CONFIG.data.product).lower()
+    labels = {
+        "50etf": "50ETF (510050)",
+        "500etf": "500ETF (510500)",
+        "soymeal": "Soymeal Futures Option (DCE M)",
+        "zz1000": "ZZ1000 Index Option (MO)",
+    }
+    return labels.get(product, str(CONFIG.data.product))
+
+
 def plot_vol_features(
     features_df,
     backtest_df=None,
@@ -61,11 +72,11 @@ def plot_vol_features(
     ax_price.plot(
         features_df.index,
         features_df["close"],
-        label="ETF Close",
+        label=f"{_product_label()} Close",
         color="black",
         linewidth=1.5,
     )
-    ax_price.set_ylabel(("ETF Price"))
+    ax_price.set_ylabel(("Underlying Price"))
     if backtest_df is None and ax_volume is None:
         ax_price.set_xlabel("Date")
 
@@ -207,7 +218,7 @@ def plot_vol_features(
         loc="upper right",
     )
 
-    fig.suptitle(("ETF Price, ATM IV and HV"))
+    fig.suptitle(f"{_product_label()} - Underlying Price, ATM IV and HV")
 
     if backtest_df is not None:
         if strategy_label is None:
@@ -371,7 +382,7 @@ def plot_cumulative_greeks_pnl(backtest_df, output_path=None, show=True):
     ax.plot(cum_pnl.index, cum_pnl["greeks_pnl"], label="Total Greeks PnL", color="black", linewidth=1.8)
 
     ax.axhline(0, color="gray", linewidth=1, linestyle="--")
-    ax.set_title("Cumulative Greeks PnL")
+    ax.set_title(f"{_product_label()} - Cumulative Greeks PnL")
     ax.set_xlabel("Date")
     ax.set_ylabel("PnL")
     ax.grid(True, alpha=0.3)
@@ -456,7 +467,9 @@ def plot_cumulative_actual_vs_greeks_pnl(backtest_df, output_path=None, show=Tru
     )
 
     ax.axhline(0, color="gray", linewidth=1, linestyle="--")
-    ax.set_title("Cumulative Actual PnL Before Fees vs Greeks PnL")
+    ax.set_title(
+        f"{_product_label()} - Cumulative Actual PnL Before Fees vs Greeks PnL"
+    )
     ax.set_xlabel("Date")
     ax.set_ylabel("PnL")
     ax.grid(True, alpha=0.3)

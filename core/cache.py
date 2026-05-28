@@ -161,6 +161,8 @@ def _feature_config_signature():
         "atm_target_dte_max": cfg.vol.atm_target_dte_max,
         "atm_moneyness_tol_mode": "absolute_price_diff",
         "atm_moneyness_tol": cfg.vol.atm_moneyness_tol,
+        "atm_min_total_volume": cfg.vol.atm_min_total_volume,
+        "atm_low_volume_search_near_month": cfg.vol.atm_low_volume_search_near_month,
         "contract_multiplier": cfg.vol.contract_multiplier,
     }
 

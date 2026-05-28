@@ -69,6 +69,37 @@ DIRECTION_PARAM_NAMES = {
         "strategy.short_open_iv_threshold",
         "strategy.short_close_iv_threshold",
     ],
+    "500etf_wide": [
+        "strategy.short_open_iv_threshold",
+        "strategy.short_close_iv_threshold",
+        "strategy.short_open_pullback_iv_threshold",
+        "backtest.short_qty",
+    ],
+    "500etf_both_wide": [
+        "strategy.long_open_iv_threshold",
+        "strategy.long_close_iv_threshold",
+        "strategy.short_open_iv_threshold",
+        "strategy.short_close_iv_threshold",
+        "backtest.long_qty",
+        "backtest.short_qty",
+    ],
+    "500etf_both_delta": [
+        "strategy.long_open_iv_threshold",
+        "strategy.long_close_iv_threshold",
+        "strategy.short_open_iv_threshold",
+        "strategy.short_close_iv_threshold",
+        "strategy.short_open_pullback_iv_threshold",
+        "backtest.long_qty",
+        "backtest.short_qty",
+    ],
+    "500etf_full_defense": [
+        "strategy.long_open_iv_threshold",
+        "strategy.long_close_iv_threshold",
+        "strategy.short_open_iv_threshold",
+        "strategy.short_close_iv_threshold",
+        "strategy.short_open_pullback_iv_threshold",
+        "strategy.roll_cooldown_days",
+    ],
 }
 
 
@@ -198,11 +229,77 @@ ZZ1000_RETURN_FINE_PARAM_GRID = {
 
 
 # 细扫：围绕粗扫前几名展开邻域。
+ETF500_WIDE_PARAM_GRID = {
+    "strategy.enable_long_straddle": [False],
+    "strategy.enable_short_straddle": [True],
+    "strategy.short_signal_mode": ["absolute"],
+    "strategy.enable_delta_hedge": [True],
+    "strategy.short_stop_loss_enabled": [True],
+    "strategy.short_volume_spike_exit_enabled": [True],
+    "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+    "strategy.short_open_iv_threshold": [0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.34],
+    "strategy.short_close_iv_threshold": [0.12, 0.14, 0.16, 0.18, 0.20, 0.22],
+    "strategy.short_open_pullback_iv_threshold": [0.30, 0.34, 0.38],
+    "backtest.short_qty": [5, 10, 15, 20, 25],
+}
+
+ETF500_BOTH_WIDE_PARAM_GRID = {
+    "strategy.enable_long_straddle": [True],
+    "strategy.enable_short_straddle": [True],
+    "strategy.short_signal_mode": ["absolute"],
+    "strategy.enable_delta_hedge": [True],
+    "strategy.short_stop_loss_enabled": [True],
+    "strategy.short_volume_spike_exit_enabled": [True],
+    "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+    "strategy.long_open_iv_threshold": [0.12, 0.14, 0.16, 0.18],
+    "strategy.long_close_iv_threshold": [0.24, 0.30, 0.36],
+    "strategy.short_open_iv_threshold": [0.22, 0.25, 0.28, 0.32],
+    "strategy.short_close_iv_threshold": [0.14, 0.17, 0.20],
+    "strategy.short_open_pullback_iv_threshold": [0.34],
+    "backtest.long_qty": [5, 10, 15],
+    "backtest.short_qty": [5, 10, 15, 20],
+}
+
+ETF500_BOTH_DELTA_PARAM_GRID = {
+    "strategy.enable_long_straddle": [True],
+    "strategy.enable_short_straddle": [True],
+    "strategy.short_signal_mode": ["absolute"],
+    "strategy.enable_delta_hedge": [True],
+    "strategy.short_stop_loss_enabled": [True],
+    "strategy.short_volume_spike_exit_enabled": [True],
+    "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+    "strategy.long_open_iv_threshold": [0.13, 0.135, 0.14, 0.145],
+    "strategy.long_close_iv_threshold": [0.22, 0.24, 0.28, 0.32],
+    "strategy.short_open_iv_threshold": [0.28, 0.29, 0.30, 0.32],
+    "strategy.short_close_iv_threshold": [0.20, 0.22, 0.225, 0.24],
+    "strategy.short_open_pullback_iv_threshold": [0.36, 0.38, 0.42, 0.44],
+    "backtest.long_qty": [5, 10, 15],
+    "backtest.short_qty": [5, 10, 15],
+}
+
+ETF500_FULL_DEFENSE_PARAM_GRID = {
+    "strategy.enable_long_straddle": [True],
+    "strategy.enable_short_straddle": [True],
+    "strategy.short_signal_mode": ["absolute"],
+    "strategy.enable_delta_hedge": [True],
+    "strategy.short_stop_loss_enabled": [True],
+    "strategy.short_volume_spike_exit_enabled": [True],
+    "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+    "strategy.long_open_iv_threshold": [0.115, 0.125, 0.135, 0.145, 0.155],
+    "strategy.long_close_iv_threshold": [0.20, 0.24, 0.28, 0.32, 0.36],
+    "strategy.short_open_iv_threshold": [0.20, 0.22, 0.24, 0.26, 0.28, 0.30],
+    "strategy.short_close_iv_threshold": [0.12, 0.15, 0.18, 0.20, 0.225, 0.24],
+    "strategy.short_open_pullback_iv_threshold": [0.26, 0.30, 0.34, 0.38, 0.42, 0.46],
+    "strategy.roll_cooldown_days": [1, 2, 3, 4, 5, 7],
+}
+
 FINE_OFFSETS = {
     "strategy.long_open_iv_threshold": [-0.005, 0.0, 0.005],
     "strategy.long_close_iv_threshold": [-0.015, 0.0, 0.015],
     "strategy.short_open_iv_threshold": [-0.005, 0.0, 0.005],
     "strategy.short_close_iv_threshold": [-0.005, 0.0, 0.005],
+    "strategy.short_open_pullback_iv_threshold": [-0.02, 0.0, 0.02],
+    "strategy.roll_cooldown_days": [-1, 0, 1],
     "strategy.short_open_iv_percentile_threshold": [-0.025, 0.0, 0.025],
     "strategy.short_close_iv_percentile_threshold": [-0.025, 0.0, 0.025],
     "backtest.long_qty": [-5, 0, 5],
@@ -237,9 +334,19 @@ def parse_args():
             "zz1000_simple",
             "zz1000_wide",
             "zz1000_return_fine",
+            "500etf_wide",
+            "500etf_both_wide",
+            "500etf_both_delta",
+            "500etf_full_defense",
         ],
         default="both",
         help="扫描方向：short 会关闭 long，只调卖出跨式；long 会关闭 short；both 同时调两套阈值。",
+    )
+    parser.add_argument(
+        "--objective",
+        choices=["nav_drawdown", "nav_sharpe", "final_nav", "sharpe"],
+        default="nav_drawdown",
+        help="排序目标：默认 NAV/MaxDD；nav_sharpe 用于同时关注最终净值和夏普。",
     )
     parser.add_argument(
         "--coarse-result",
@@ -251,6 +358,12 @@ def parse_args():
         type=int,
         default=10,
         help="细扫时读取粗扫 NAV/MaxDD 前 N 组参数展开邻域。",
+    )
+    parser.add_argument(
+        "--min-held-days",
+        type=int,
+        default=0,
+        help="细扫选取粗扫种子时要求的最低持仓天数；为 0 时不限制。",
     )
     parser.add_argument(
         "--start",
@@ -282,6 +395,11 @@ def unique_sorted(values):
 
 def build_fine_values(key, center):
     values = unique_sorted(center + offset for offset in FINE_OFFSETS[key])
+    if key in {
+        "strategy.roll_cooldown_days",
+        "strategy.short_cooldown_after_long_iv_high_exit_days",
+    }:
+        return sorted({int(value) for value in values if int(value) >= 0})
     if key == "backtest.short_qty":
         return sorted({int(value) for value in values if int(value) > 0})
     if key.startswith("backtest."):
@@ -308,6 +426,7 @@ def is_valid_param_set(param_set):
     short_close = param_set.get("strategy.short_close_iv_percentile_threshold")
     short_open_abs = param_set.get("strategy.short_open_iv_threshold")
     short_close_abs = param_set.get("strategy.short_close_iv_threshold")
+    short_pullback_abs = param_set.get("strategy.short_open_pullback_iv_threshold")
 
     if long_open is not None and long_close is not None and long_open >= long_close:
         return False
@@ -323,9 +442,18 @@ def is_valid_param_set(param_set):
         and short_open_abs <= short_close_abs
     ):
         return False
+    if (
+        short_pullback_abs is not None
+        and short_open_abs is not None
+        and short_pullback_abs <= short_open_abs
+    ):
+        return False
     for percentile_value in (short_open, short_close):
         if percentile_value is not None and not 0 <= percentile_value <= 1:
             return False
+    cooldown_days = param_set.get("strategy.roll_cooldown_days")
+    if cooldown_days is not None and int(cooldown_days) < 0:
+        return False
     for qty_key in ("backtest.long_qty", "backtest.short_qty"):
         qty = param_set.get(qty_key)
         if qty is not None and int(qty) <= 0:
@@ -338,6 +466,14 @@ def get_scan_param_names(direction):
 
 
 def get_coarse_param_grid(direction):
+    if direction == "500etf_full_defense":
+        return ETF500_FULL_DEFENSE_PARAM_GRID
+    if direction == "500etf_wide":
+        return ETF500_WIDE_PARAM_GRID
+    if direction == "500etf_both_wide":
+        return ETF500_BOTH_WIDE_PARAM_GRID
+    if direction == "500etf_both_delta":
+        return ETF500_BOTH_DELTA_PARAM_GRID
     if direction == "zz1000_return_fine":
         return ZZ1000_RETURN_FINE_PARAM_GRID
     if direction == "zz1000_wide":
@@ -356,6 +492,47 @@ def get_coarse_param_grid(direction):
 
 
 def get_direction_switches(direction):
+    if direction == "500etf_full_defense":
+        return {
+            "strategy.enable_long_straddle": [True],
+            "strategy.enable_short_straddle": [True],
+            "strategy.short_signal_mode": ["absolute"],
+            "strategy.enable_delta_hedge": [True],
+            "strategy.short_stop_loss_enabled": [True],
+            "strategy.short_volume_spike_exit_enabled": [True],
+            "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+        }
+    if direction == "500etf_wide":
+        return {
+            "strategy.enable_long_straddle": [False],
+            "strategy.enable_short_straddle": [True],
+            "strategy.short_signal_mode": ["absolute"],
+            "strategy.enable_delta_hedge": [True],
+            "strategy.short_stop_loss_enabled": [True],
+            "strategy.short_volume_spike_exit_enabled": [True],
+            "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+        }
+    if direction == "500etf_both_wide":
+        return {
+            "strategy.enable_long_straddle": [True],
+            "strategy.enable_short_straddle": [True],
+            "strategy.short_signal_mode": ["absolute"],
+            "strategy.enable_delta_hedge": [True],
+            "strategy.short_stop_loss_enabled": [True],
+            "strategy.short_volume_spike_exit_enabled": [True],
+            "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+            "strategy.short_open_pullback_iv_threshold": [0.34],
+        }
+    if direction == "500etf_both_delta":
+        return {
+            "strategy.enable_long_straddle": [True],
+            "strategy.enable_short_straddle": [True],
+            "strategy.short_signal_mode": ["absolute"],
+            "strategy.enable_delta_hedge": [True],
+            "strategy.short_stop_loss_enabled": [True],
+            "strategy.short_volume_spike_exit_enabled": [True],
+            "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+        }
     if direction == "zz1000_return_fine":
         return {
             "strategy.enable_long_straddle": [True],
@@ -464,6 +641,10 @@ def build_fine_param_sets_from_config(base_config, direction):
         ),
         "strategy.short_open_iv_threshold": base_config.strategy.short_open_iv_threshold,
         "strategy.short_close_iv_threshold": base_config.strategy.short_close_iv_threshold,
+        "strategy.short_open_pullback_iv_threshold": (
+            base_config.strategy.short_open_pullback_iv_threshold
+        ),
+        "strategy.roll_cooldown_days": base_config.strategy.roll_cooldown_days,
         "vol.atm_iv_percentile_window": base_config.vol.atm_iv_percentile_window,
         "backtest.long_qty": base_config.backtest.long_qty,
         "backtest.short_qty": base_config.backtest.short_qty,
@@ -471,13 +652,21 @@ def build_fine_param_sets_from_config(base_config, direction):
     return build_fine_param_sets_from_rows(pd.DataFrame([row]), direction)
 
 
-def load_fine_param_sets(base_config, coarse_result_path, top_n, direction):
+def load_fine_param_sets(
+    base_config,
+    coarse_result_path,
+    top_n,
+    direction,
+    objective,
+    min_held_days,
+):
     if coarse_result_path is None:
         print("未传入粗扫结果，细扫将围绕 core/config.py 当前阈值展开。", flush=True)
         return build_fine_param_sets_from_config(base_config, direction)
 
     coarse_df = pd.read_csv(coarse_result_path)
     coarse_df = ensure_nav_drawdown_score(coarse_df)
+    coarse_df = ensure_nav_sharpe_score(coarse_df)
     coarse_df = ensure_cash_usage_metrics(coarse_df, base_config.backtest.initial_cash)
     scan_param_names = get_scan_param_names(direction)
     missing_cols = [col for col in scan_param_names + ["final_nav"] if col not in coarse_df]
@@ -485,7 +674,8 @@ def load_fine_param_sets(base_config, coarse_result_path, top_n, direction):
         raise ValueError(f"粗扫结果缺少必要列: {missing_cols}")
 
     valid_df = coarse_df[coarse_df.get("error", "").fillna("").eq("")]
-    top_rows = sort_result_df(valid_df).head(top_n)
+    valid_df = filter_by_min_held_days(valid_df, min_held_days)
+    top_rows = sort_result_df(valid_df, objective).head(top_n)
     if top_rows.empty:
         raise ValueError("粗扫结果中没有可用于细扫的成功回测。")
     return build_fine_param_sets_from_rows(top_rows, direction)
@@ -500,6 +690,11 @@ def apply_param_set(base_config, param_set):
     for key, value in param_set.items():
         section, field = key.split(".", 1)
         if section == "strategy":
+            if field in {
+                "roll_cooldown_days",
+                "short_cooldown_after_long_iv_high_exit_days",
+            }:
+                value = int(value)
             strategy_updates[field] = value
         elif section == "vol":
             if field == "atm_iv_percentile_window":
@@ -557,12 +752,117 @@ def calc_nav_drawdown_score(final_nav, max_drawdown_pct):
     return final_nav / maxdd_abs
 
 
-def sort_result_df(result_df):
+def calc_sharpe_ratio(nav):
+    daily_return = nav.pct_change().dropna()
+    if daily_return.empty:
+        return pd.NA
+    std = daily_return.std()
+    if pd.isna(std) or std == 0:
+        return pd.NA
+    annual_days = getattr(core.config.CONFIG.vol, "annual_days", 252)
+    return daily_return.mean() / std * (annual_days ** 0.5)
+
+
+def calc_sortino_ratio(nav):
+    daily_return = nav.pct_change().dropna()
+    if daily_return.empty:
+        return pd.NA
+    downside = daily_return[daily_return < 0]
+    downside_std = downside.std()
+    if pd.isna(downside_std) or downside_std == 0:
+        return pd.NA
+    annual_days = getattr(core.config.CONFIG.vol, "annual_days", 252)
+    return daily_return.mean() / downside_std * (annual_days ** 0.5)
+
+
+def calc_annual_return(final_nav, initial_cash, trading_days):
+    if trading_days <= 0 or initial_cash <= 0:
+        return pd.NA
+    annual_days = getattr(core.config.CONFIG.vol, "annual_days", 252)
+    return (final_nav / initial_cash) ** (annual_days / trading_days) - 1
+
+
+def calc_ulcer_index(nav):
+    running_max = nav.cummax()
+    drawdown_pct = nav / running_max - 1
+    return ((drawdown_pct.pow(2).mean()) ** 0.5)
+
+
+def calc_nav_trend_r2(nav):
+    if len(nav) < 2:
+        return pd.NA
+    y = nav.reset_index(drop=True).astype(float)
+    x = pd.Series(range(len(y)), dtype="float64")
+    x_centered = x - x.mean()
+    y_centered = y - y.mean()
+    ss_x = (x_centered ** 2).sum()
+    ss_y = (y_centered ** 2).sum()
+    if ss_x == 0 or ss_y == 0:
+        return pd.NA
+    slope = (x_centered * y_centered).sum() / ss_x
+    fitted = y.mean() + slope * x_centered
+    ss_res = ((y - fitted) ** 2).sum()
+    return 1 - ss_res / ss_y
+
+
+def calc_pnl_concentration(daily_pnl, total_pnl):
+    pnl = pd.to_numeric(daily_pnl, errors="coerce").fillna(0.0)
+    positive = pnl[pnl > 0].sort_values(ascending=False)
+    positive_total = positive.sum()
+    if positive_total <= 0:
+        top5_share = pd.NA
+        top10_share = pd.NA
+        hhi = pd.NA
+    else:
+        top5_share = positive.head(5).sum() / positive_total
+        top10_share = positive.head(10).sum() / positive_total
+        weights = positive / positive_total
+        hhi = (weights ** 2).sum()
+
+    max_gain = positive.iloc[0] if not positive.empty else 0.0
+    max_gain_share_total_pnl = (
+        max_gain / total_pnl if total_pnl > 0 else pd.NA
+    )
+    positive_day_ratio = (pnl > 0).mean() if len(pnl) > 0 else pd.NA
+    return {
+        "top5_profit_share": top5_share,
+        "top10_profit_share": top10_share,
+        "profit_hhi": hhi,
+        "max_gain_share_total_pnl": max_gain_share_total_pnl,
+        "positive_day_ratio": positive_day_ratio,
+    }
+
+
+def calc_nav_sharpe_score(final_nav, sharpe_ratio):
+    if pd.isna(sharpe_ratio):
+        return pd.NA
+    return final_nav * sharpe_ratio
+
+
+def sort_result_df(result_df, objective="nav_drawdown"):
     if result_df.empty or "nav_drawdown_score" not in result_df.columns:
         return result_df
     if "cash_negative_days" not in result_df.columns:
         result_df = result_df.copy()
         result_df["cash_negative_days"] = 0
+    if objective == "nav_sharpe":
+        return result_df.sort_values(
+            ["cash_negative_days", "nav_sharpe_score", "final_nav", "sharpe_ratio"],
+            ascending=[True, False, False, False],
+            na_position="last",
+        )
+    if objective == "final_nav":
+        return result_df.sort_values(
+            ["cash_negative_days", "final_nav", "sharpe_ratio"],
+            ascending=[True, False, False],
+            na_position="last",
+        )
+    if objective == "sharpe":
+        return result_df.sort_values(
+            ["cash_negative_days", "sharpe_ratio", "final_nav"],
+            ascending=[True, False, False],
+            na_position="last",
+        )
     return result_df.sort_values(
         ["cash_negative_days", "nav_drawdown_score", "final_nav"],
         ascending=[True, False, False],
@@ -582,6 +882,17 @@ def ensure_nav_drawdown_score(df):
     return df
 
 
+def ensure_nav_sharpe_score(df):
+    if (
+        "nav_sharpe_score" not in df.columns
+        and {"final_nav", "sharpe_ratio"}.issubset(df.columns)
+    ):
+        df = df.copy()
+        df["nav_sharpe_score"] = df["final_nav"] * df["sharpe_ratio"]
+        df.loc[df["sharpe_ratio"].isna(), "nav_sharpe_score"] = pd.NA
+    return df
+
+
 def ensure_cash_usage_metrics(df, initial_cash=None):
     if df.empty or "min_cash" not in df.columns:
         return df
@@ -593,11 +904,42 @@ def ensure_cash_usage_metrics(df, initial_cash=None):
     return df
 
 
+def filter_by_min_held_days(df, min_held_days):
+    if min_held_days <= 0 or "held_days" not in df.columns:
+        return df
+    filtered = df[df["held_days"].fillna(0) >= min_held_days]
+    if filtered.empty:
+        print(
+            f"没有满足 held_days >= {min_held_days} 的组合，退回不加持仓天数过滤。",
+            flush=True,
+        )
+        return df
+    return filtered
+
+
 def summarize_result(param_set, daily_pnl, trades, initial_cash):
     final_nav = daily_pnl["nav"].iloc[-1]
+    total_pnl = final_nav - initial_cash
     total_return = final_nav / initial_cash - 1
     max_drawdown, max_drawdown_pct = calc_max_drawdown(daily_pnl["nav"])
     nav_drawdown_score = calc_nav_drawdown_score(final_nav, max_drawdown_pct)
+    sharpe_ratio = calc_sharpe_ratio(daily_pnl["nav"])
+    sortino_ratio = calc_sortino_ratio(daily_pnl["nav"])
+    nav_sharpe_score = calc_nav_sharpe_score(final_nav, sharpe_ratio)
+    annual_return = calc_annual_return(final_nav, initial_cash, len(daily_pnl))
+    calmar_ratio = (
+        annual_return / abs(max_drawdown_pct)
+        if not pd.isna(annual_return) and max_drawdown_pct != 0
+        else pd.NA
+    )
+    ulcer_index = calc_ulcer_index(daily_pnl["nav"])
+    nav_trend_r2 = calc_nav_trend_r2(daily_pnl["nav"])
+    pnl_col = (
+        daily_pnl["daily_nav_pnl"]
+        if "daily_nav_pnl" in daily_pnl.columns
+        else daily_pnl["nav"].diff()
+    )
+    concentration = calc_pnl_concentration(pnl_col, total_pnl)
 
     if trades.empty or "type" not in trades.columns:
         open_count = 0
@@ -636,11 +978,19 @@ def summarize_result(param_set, daily_pnl, trades, initial_cash):
     return {
         **param_set,
         "final_nav": final_nav,
-        "total_pnl": final_nav - initial_cash,
+        "total_pnl": total_pnl,
         "total_return": total_return,
+        "annual_return": annual_return,
         "max_drawdown": max_drawdown,
         "max_drawdown_pct": max_drawdown_pct,
         "nav_drawdown_score": nav_drawdown_score,
+        "sharpe_ratio": sharpe_ratio,
+        "sortino_ratio": sortino_ratio,
+        "calmar_ratio": calmar_ratio,
+        "nav_sharpe_score": nav_sharpe_score,
+        "ulcer_index": ulcer_index,
+        "nav_trend_r2": nav_trend_r2,
+        **concentration,
         "min_cash": daily_pnl["cash"].min(),
         "min_cash_ratio": daily_pnl["cash"].min() / initial_cash,
         "cash_usage_ratio": 1 - daily_pnl["cash"].min() / initial_cash,
@@ -734,9 +1084,11 @@ def run_scan(
     start,
     end,
     direction,
+    objective,
 ):
     print(f"\n===== {stage_name} =====", flush=True)
     print(f"参数组合数: {len(param_sets)}", flush=True)
+    print(f"排序目标: {objective}", flush=True)
     print(f"结果输出: {output_path}", flush=True)
 
     rows = []
@@ -767,8 +1119,9 @@ def run_scan(
         rows.append(row)
         result_df = pd.DataFrame(rows)
         result_df = ensure_nav_drawdown_score(result_df)
+        result_df = ensure_nav_sharpe_score(result_df)
         result_df = ensure_cash_usage_metrics(result_df, base_config.backtest.initial_cash)
-        result_df = sort_result_df(result_df)
+        result_df = sort_result_df(result_df, objective)
         result_df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
         if row.get("error") == "":
@@ -780,6 +1133,7 @@ def run_scan(
                 "  NAV="
                 f"{row['final_nav']:,.2f}, "
                 f"收益率={row['total_return']:.2%}, "
+                f"夏普={row['sharpe_ratio']:.2f}, "
                 f"最大回撤={row['max_drawdown_pct']:.2%}, "
                 f"开仓={row['open_count']}, "
                 f"roll={row['roll_count']}, "
@@ -792,16 +1146,29 @@ def run_scan(
 
     result_df = pd.DataFrame(rows)
     result_df = ensure_nav_drawdown_score(result_df)
+    result_df = ensure_nav_sharpe_score(result_df)
     result_df = ensure_cash_usage_metrics(result_df, base_config.backtest.initial_cash)
-    result_df = sort_result_df(result_df)
+    result_df = sort_result_df(result_df, objective)
     result_df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    print(f"\n===== {stage_name} NAV/MaxDD 前 10 参数 =====", flush=True)
+    print(f"\n===== {stage_name} {objective} 前 10 参数 =====", flush=True)
     display_cols = get_scan_param_names(direction) + [
         "final_nav",
         "total_return",
+        "annual_return",
         "max_drawdown_pct",
         "nav_drawdown_score",
+        "sharpe_ratio",
+        "sortino_ratio",
+        "calmar_ratio",
+        "nav_sharpe_score",
+        "ulcer_index",
+        "nav_trend_r2",
+        "top5_profit_share",
+        "top10_profit_share",
+        "profit_hhi",
+        "max_gain_share_total_pnl",
+        "positive_day_ratio",
         "min_cash",
         "min_cash_ratio",
         "cash_usage_ratio",
@@ -870,6 +1237,7 @@ def main():
             start,
             end,
             args.direction,
+            args.objective,
         )
     else:
         coarse_df = None
@@ -879,11 +1247,16 @@ def main():
         if args.stage == "all":
             valid_coarse = coarse_df[coarse_df["error"].fillna("").eq("")]
             valid_coarse = ensure_nav_drawdown_score(valid_coarse)
+            valid_coarse = ensure_nav_sharpe_score(valid_coarse)
             valid_coarse = ensure_cash_usage_metrics(
                 valid_coarse,
                 base_config.backtest.initial_cash,
             )
-            top_rows = sort_result_df(valid_coarse).head(args.top_n)
+            valid_coarse = filter_by_min_held_days(
+                valid_coarse,
+                args.min_held_days,
+            )
+            top_rows = sort_result_df(valid_coarse, args.objective).head(args.top_n)
             fine_param_sets = build_fine_param_sets_from_rows(top_rows, args.direction)
             fine_output_arg = None
         else:
@@ -892,6 +1265,8 @@ def main():
                 args.coarse_result,
                 args.top_n,
                 args.direction,
+                args.objective,
+                args.min_held_days,
             )
             fine_output_arg = args.output
 
@@ -908,6 +1283,7 @@ def main():
             start,
             end,
             args.direction,
+            args.objective,
         )
 
         if args.stage == "all":
