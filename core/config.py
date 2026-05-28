@@ -20,6 +20,8 @@ from .config_schema import (
 
 PRODUCT_CONFIG_MODULES = {
     "50etf": "core.config_50etf",
+    "500etf": "core.config_500etf",
+    "soymeal": "core.config_soymeal",
     "zz1000": "core.config_zz1000",
 }
 

@@ -46,6 +46,7 @@ class StrategyConfig:
     short_low_iv_hv_spread_threshold: float = 0.03
     short_low_iv_close_spread_threshold: float = 0.0
     short_low_iv_hv_col: str = "yz_hv60"
+    short_low_iv_overlay_enabled: bool = False
     short_stop_loss_enabled: bool = False
     short_stop_loss_rate: float = 0.2
     enable_delta_hedge: bool = False
@@ -70,6 +71,8 @@ class VolConfig:
     atm_target_dte_min: int = 7
     atm_target_dte_max: int = 30
     atm_moneyness_tol: float = 0.10
+    atm_min_total_volume: float = 0.0
+    atm_low_volume_search_near_month: bool = False
     contract_multiplier: int = 10000
     risk_free_rate: float = 0.0
     dividend_yield: float = 0.0

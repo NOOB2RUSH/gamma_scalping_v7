@@ -65,7 +65,15 @@ def calc_short_margin(call_row, put_row, call_qty, put_qty, spot):
     return call_margin * call_qty + put_margin * put_qty
 
 
-def open_straddle(date, atm, call_qty=1, put_qty=1, side="long", spot=None):
+def open_straddle(
+    date,
+    atm,
+    call_qty=1,
+    put_qty=1,
+    side="long",
+    spot=None,
+    short_entry_regime=None,
+):
     """根据 ATM 选择结果创建跨式仓位对象。"""
     call = atm["call"]
     put = atm["put"]
@@ -84,6 +92,7 @@ def open_straddle(date, atm, call_qty=1, put_qty=1, side="long", spot=None):
         "entry_total_volume": (call.get("volume") or 0) + (put.get("volume") or 0),
         "contract_multiplier": call["contract_multiplier"],
         "side": side,
+        "short_entry_regime": short_entry_regime,
         "entry_option_value": 0.0,
         "option_margin": 0.0,
     }
@@ -103,13 +112,6 @@ def open_straddle(date, atm, call_qty=1, put_qty=1, side="long", spot=None):
     return position
 
 
-def find_rows(position, chain_df):
-    """从当日期权链中找回当前持仓对应的 call 和 put 行。"""
-    call_rows = chain_df[chain_df["order_book_id"] == position["call_code"]]
-    put_rows = chain_df[chain_df["order_book_id"] == position["put_code"]]
-    return call_rows.iloc[0], put_rows.iloc[0]
-
-
 def trade_fields(position):
     """交易流水中通用的期权合约字段。"""
     return {
@@ -118,6 +120,7 @@ def trade_fields(position):
         "strike": position["strike"],
         "expiry": position["expiry"],
         "side": position.get("side", "long"),
+        "short_entry_regime": position.get("short_entry_regime"),
     }
 
 
@@ -189,16 +192,6 @@ def _build_liquidity_fields(call_row=None, put_row=None, call_qty=0, put_qty=0):
     return fields
 
 
-def has_liquidity_warning(call_row, put_row, call_qty, put_qty):
-    """按交易预警口径判断一组 call/put 是否存在流动性风险。"""
-    return _build_liquidity_fields(
-        call_row,
-        put_row,
-        call_qty,
-        put_qty,
-    )["liquidity_warning"]
-
-
 def has_short_volume_spike(position, call_row, put_row):
     """卖方持仓成交量放大止损：当前持仓合约成交量较开仓时显著放大。"""
     if not CONFIG.strategy.short_volume_spike_exit_enabled:
@@ -230,9 +223,18 @@ def open_trade(
     trade_type,
     side="long",
     spot=None,
+    short_entry_regime=None,
 ):
     """开跨式仓位并写入交易流水。"""
-    position = open_straddle(date, atm, call_qty, put_qty, side=side, spot=spot)
+    position = open_straddle(
+        date,
+        atm,
+        call_qty,
+        put_qty,
+        side=side,
+        spot=spot,
+        short_entry_regime=short_entry_regime,
+    )
     cost = value(position, atm["call"], atm["put"])
     fee = calc_option_fee(call_qty, put_qty)
     if side == "short":

@@ -333,7 +333,6 @@ def add_greeks_pnl(daily_df):
     """用昨日 EOD 持仓解释今日 PnL；long/short 可同时贡献，ETF 对冲单独按账户口径加入。"""
     df = daily_df.copy()
     spot_chg = df["spot"].diff()
-    side_greeks_cols = []
 
     for side in POSITION_SIDES:
         prefix = f"{side}_"
@@ -402,7 +401,6 @@ def add_greeks_pnl(daily_df):
         df[f"{prefix}greeks_pnl"] = df[side_cols].sum(axis=1, min_count=len(side_cols))
         df[f"{prefix}greeks_explainable_day"] = explainable_day
         df[f"{prefix}greeks_position_changed_day"] = position_changed
-        side_greeks_cols.extend(side_cols)
 
     df["hedge_delta_pnl"] = df["hedge_etf_qty"].shift(1) * spot_chg
     df["delta_pnl"] = (
@@ -684,7 +682,11 @@ class BacktestEngine:
             if strategy.is_short_stop_loss(position, current_market_value):
                 close_reason = "short_stop_loss"
             else:
-                close_reason = strategy.get_short_close_reason(feature_row, position_dte)
+                close_reason = strategy.get_short_close_reason(
+                    feature_row,
+                    position_dte,
+                    position,
+                )
         else:
             close_reason = strategy.get_close_reason(feature_row, position_dte)
 
@@ -885,6 +887,11 @@ class BacktestEngine:
             trade_type="roll_open_straddle",
             side=side,
             spot=spot,
+            short_entry_regime=(
+                position.get("short_entry_regime", CONFIG.strategy.short_signal_mode)
+                if side == "short"
+                else None
+            ),
         )
         state.positions[side] = new_position
         self._add_new_option_fees(day, state, trade_count)
@@ -948,6 +955,9 @@ class BacktestEngine:
             return
 
         trade_count = len(state.trades)
+        short_entry_regime = None
+        if side == "short":
+            short_entry_regime = strategy.get_short_open_regime(day["feature_row"])
         state.cash, new_position, option_value = opt_position.open_trade(
             date,
             state.cash,
@@ -958,6 +968,7 @@ class BacktestEngine:
             trade_type=trade_type,
             side=side,
             spot=spot,
+            short_entry_regime=short_entry_regime,
         )
         state.positions[side] = new_position
         self._add_new_option_fees(day, state, trade_count)
@@ -1422,20 +1433,34 @@ class AlwaysAtmBenchmarkEngine(BacktestEngine):
         self._tick_roll_cooldown(state, side)
 
 
-class NoDeltaHedgeBacktestEngine(BacktestEngine):
-    """裸 short vega 对比账户：保留进出场/展期，但不做 ETF delta hedge。"""
-
-    def _hedge_to(
-        self,
-        date,
-        spot,
-        state,
-        day=None,
-        greeks=None,
-        target_qty=None,
-        trade_type="delta_hedge",
-    ):
-        return
+def _backtest_config(
+    initial_cash=None,
+    min_cash_reserve=None,
+    long_qty=None,
+    short_qty=None,
+    etf_fee_rate=None,
+    enable_delta_hedge=None,
+):
+    return {
+        "initial_cash": (
+            CONFIG.backtest.initial_cash if initial_cash is None else initial_cash
+        ),
+        "min_cash_reserve": (
+            CONFIG.backtest.min_cash_reserve
+            if min_cash_reserve is None
+            else min_cash_reserve
+        ),
+        "long_qty": CONFIG.backtest.long_qty if long_qty is None else long_qty,
+        "short_qty": CONFIG.backtest.short_qty if short_qty is None else short_qty,
+        "etf_fee_rate": (
+            CONFIG.backtest.etf_fee_rate if etf_fee_rate is None else etf_fee_rate
+        ),
+        "enable_delta_hedge": (
+            CONFIG.strategy.enable_delta_hedge
+            if enable_delta_hedge is None
+            else enable_delta_hedge
+        ),
+    }
 
 
 def run_backtest(
@@ -1451,71 +1476,18 @@ def run_backtest(
     trading_calendar=None,
     enriched_opt_by_date=None,
 ):
-    if initial_cash is None:
-        initial_cash = CONFIG.backtest.initial_cash
-    if min_cash_reserve is None:
-        min_cash_reserve = CONFIG.backtest.min_cash_reserve
-    if long_qty is None:
-        long_qty = CONFIG.backtest.long_qty
-    if short_qty is None:
-        short_qty = CONFIG.backtest.short_qty
-    if etf_fee_rate is None:
-        etf_fee_rate = CONFIG.backtest.etf_fee_rate
-    if enable_delta_hedge is None:
-        enable_delta_hedge = CONFIG.strategy.enable_delta_hedge
-
     engine = BacktestEngine(
         etf_by_date,
         opt_by_date,
         signals_df,
-        config={
-            "initial_cash": initial_cash,
-            "min_cash_reserve": min_cash_reserve,
-            "long_qty": long_qty,
-            "short_qty": short_qty,
-            "etf_fee_rate": etf_fee_rate,
-            "enable_delta_hedge": enable_delta_hedge,
-        },
-        trading_calendar=trading_calendar,
-        enriched_opt_by_date=enriched_opt_by_date,
-    )
-    return engine.run()
-
-
-def run_no_delta_hedge_backtest(
-    etf_by_date,
-    opt_by_date,
-    signals_df,
-    initial_cash=None,
-    min_cash_reserve=None,
-    long_qty=None,
-    short_qty=None,
-    etf_fee_rate=None,
-    trading_calendar=None,
-    enriched_opt_by_date=None,
-):
-    if initial_cash is None:
-        initial_cash = CONFIG.backtest.initial_cash
-    if min_cash_reserve is None:
-        min_cash_reserve = CONFIG.backtest.min_cash_reserve
-    if long_qty is None:
-        long_qty = CONFIG.backtest.long_qty
-    if short_qty is None:
-        short_qty = CONFIG.backtest.short_qty
-    if etf_fee_rate is None:
-        etf_fee_rate = CONFIG.backtest.etf_fee_rate
-
-    engine = NoDeltaHedgeBacktestEngine(
-        etf_by_date,
-        opt_by_date,
-        signals_df,
-        config={
-            "initial_cash": initial_cash,
-            "min_cash_reserve": min_cash_reserve,
-            "long_qty": long_qty,
-            "short_qty": short_qty,
-            "etf_fee_rate": etf_fee_rate,
-        },
+        config=_backtest_config(
+            initial_cash=initial_cash,
+            min_cash_reserve=min_cash_reserve,
+            long_qty=long_qty,
+            short_qty=short_qty,
+            etf_fee_rate=etf_fee_rate,
+            enable_delta_hedge=enable_delta_hedge,
+        ),
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
     )
@@ -1537,29 +1509,21 @@ def run_always_atm_benchmark(
 ):
     if benchmark_side is None:
         benchmark_side = CONFIG.reference.always_atm_side
-    if initial_cash is None:
-        initial_cash = CONFIG.backtest.initial_cash
-    if min_cash_reserve is None:
-        min_cash_reserve = CONFIG.backtest.min_cash_reserve
     if always_atm_qty is None:
         always_atm_qty = CONFIG.reference.always_atm_qty
-    if etf_fee_rate is None:
-        etf_fee_rate = CONFIG.backtest.etf_fee_rate
-    if enable_delta_hedge is None:
-        enable_delta_hedge = CONFIG.strategy.enable_delta_hedge
 
     engine = AlwaysAtmBenchmarkEngine(
         etf_by_date,
         opt_by_date,
         signals_df,
-        config={
-            "initial_cash": initial_cash,
-            "min_cash_reserve": min_cash_reserve,
-            "long_qty": always_atm_qty,
-            "short_qty": always_atm_qty,
-            "etf_fee_rate": etf_fee_rate,
-            "enable_delta_hedge": enable_delta_hedge,
-        },
+        config=_backtest_config(
+            initial_cash=initial_cash,
+            min_cash_reserve=min_cash_reserve,
+            long_qty=always_atm_qty,
+            short_qty=always_atm_qty,
+            etf_fee_rate=etf_fee_rate,
+            enable_delta_hedge=enable_delta_hedge,
+        ),
         benchmark_side=benchmark_side,
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,

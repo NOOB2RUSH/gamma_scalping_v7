@@ -290,6 +290,40 @@ def _make_atm_result(strike, expiry, call_row, put_row):
     }
 
 
+def _atm_pair_total_volume(atm):
+    """返回 ATM call+put 成交量；缺失时视为 0，便于低流动性过滤。"""
+    if atm is None:
+        return 0.0
+    call_volume = atm["call"].get("volume", 0) or 0
+    put_volume = atm["put"].get("volume", 0) or 0
+    return float(call_volume) + float(put_volume)
+
+
+def _search_near_month_atm_by_volume(candidate_atms, primary_atm):
+    """目标 DTE 合约成交量不足时，在同 strike 更近到期月中寻找更活跃的 ATM。"""
+    min_total_volume = CONFIG.vol.atm_min_total_volume
+    if (
+        not CONFIG.vol.atm_low_volume_search_near_month
+        or min_total_volume <= 0
+        or primary_atm is None
+        or _atm_pair_total_volume(primary_atm) >= min_total_volume
+    ):
+        return primary_atm
+
+    primary_volume = _atm_pair_total_volume(primary_atm)
+    near_month_atms = [
+        atm
+        for atm in candidate_atms
+        if atm["dte"] < primary_atm["dte"]
+        and _atm_pair_total_volume(atm) > primary_volume
+    ]
+    if not near_month_atms:
+        return primary_atm
+
+    # 从原目标月向前找，优先使用最接近原候选的近月，而不是直接跳到最短 DTE。
+    return sorted(near_month_atms, key=lambda atm: atm["dte"], reverse=True)[0]
+
+
 def _select_nearest_atm(
     chain_df,
     spot,
@@ -333,12 +367,19 @@ def _select_nearest_atm(
             .sort_values(["dte_diff", "dte"])
         )
 
+        candidate_atms = []
         for _, expiry_row in expiry_order.iterrows():
             expiry = expiry_row["maturity_date"]
             pair_chain = strike_chain[strike_chain["maturity_date"] == expiry]
             call_row, put_row = select_call_put_pair(pair_chain, spot)
             if call_row is not None:
-                return _make_atm_result(strike, expiry, call_row, put_row)
+                candidate_atms.append(
+                    _make_atm_result(strike, expiry, call_row, put_row)
+                )
+
+        if candidate_atms:
+            primary_atm = candidate_atms[0]
+            return _search_near_month_atm_by_volume(candidate_atms, primary_atm)
 
     return None
 
@@ -435,47 +476,6 @@ def _calc_atm_iv_percentile(atm_iv_series, window):
         raw=True,
     )
     return percentile_series.reindex(atm_iv_series.index)
-
-
-def calc_atm_iv_for_day(
-    daily_opt_chain: pd.DataFrame,
-    spot,
-    target_dte=None,
-    target_dte_min=None,
-    target_dte_max=None,
-    atm_moneyness_tol=None,
-    trading_calendar=None,
-):
-    """按策略交易口径选择当日 ATM 跨式合约并返回 IV 与 Greeks。"""
-    chain_df = add_iv_for_day(daily_opt_chain, spot, trading_calendar=trading_calendar)
-    chain_df = add_greeks_for_day(chain_df, spot)
-    return select_atm_from_chain(
-        chain_df,
-        spot,
-        target_dte=target_dte,
-        target_dte_min=target_dte_min,
-        target_dte_max=target_dte_max,
-        atm_moneyness_tol=atm_moneyness_tol,
-    )
-
-
-def calc_feature_atm_iv_for_day(
-    daily_opt_chain: pd.DataFrame,
-    spot,
-    trading_calendar=None,
-):
-    """按特征计算口径获取真实 ATM 合约 IV；找不到有效合约时返回 None。"""
-    chain_df = add_iv_for_day(daily_opt_chain, spot, trading_calendar=trading_calendar)
-    chain_df = chain_df[
-        (chain_df["contract_multiplier"] == CONFIG.vol.contract_multiplier)
-        & (chain_df["dte"] >= CONFIG.vol.atm_target_dte_min)
-        & (chain_df["dte"] <= CONFIG.vol.atm_target_dte_max)
-    ]
-
-    if chain_df.empty:
-        return None
-
-    return _select_nearest_atm(chain_df, spot)
 
 
 def build_enriched_option_chains(etf_by_date, opt_by_date, trading_calendar=None):
