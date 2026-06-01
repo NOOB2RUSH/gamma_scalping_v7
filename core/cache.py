@@ -8,7 +8,7 @@ import pandas as pd
 from . import config, vol_engine
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 8
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / ".cache" / "backtest"
 
@@ -85,12 +85,18 @@ def build_data_signature(start, end):
     data_cfg = config.CONFIG.data
     etf_dir = _resolve_project_path(data_cfg.etf_dir)
     opt_dir = _resolve_project_path(data_cfg.opt_dir)
+    hedge_dir = (
+        _resolve_project_path(data_cfg.hedge_etf_dir)
+        if data_cfg.hedge_etf_dir is not None
+        else None
+    )
     return {
         "start": str(pd.Timestamp(start).date()),
         "end": str(pd.Timestamp(end).date()),
         "product": data_cfg.product,
         "etf_dir": _path_for_signature(etf_dir),
         "opt_dir": _path_for_signature(opt_dir),
+        "hedge_dir": _path_for_signature(hedge_dir) if hedge_dir is not None else None,
         "etf_range": _file_manifest(
             etf_dir,
             "*price.parquet",
@@ -104,6 +110,17 @@ def build_data_signature(start, end):
             "_chain",
             start,
             end,
+        ),
+        "hedge_range": (
+            _file_manifest(
+                hedge_dir,
+                "*price.parquet",
+                "_price",
+                start,
+                end,
+            )
+            if hedge_dir is not None and hedge_dir.exists()
+            else []
         ),
         # DTE 使用完整 ETF 交易日历，因此完整日历变化也需要让缓存失效。
         "etf_calendar": _file_manifest(
@@ -156,14 +173,28 @@ def _feature_config_signature():
         "annual_days": cfg.vol.annual_days,
         "hv_windows": cfg.vol.hv_windows,
         "atm_iv_percentile_window": cfg.vol.atm_iv_percentile_window,
+        "iv_observation_mode": cfg.vol.iv_observation_mode,
         "atm_target_dte": cfg.vol.atm_target_dte,
         "atm_target_dte_min": cfg.vol.atm_target_dte_min,
         "atm_target_dte_max": cfg.vol.atm_target_dte_max,
+        "atm_selection_mode": cfg.vol.atm_selection_mode,
         "atm_moneyness_tol_mode": "absolute_price_diff",
         "atm_moneyness_tol": cfg.vol.atm_moneyness_tol,
         "atm_min_total_volume": cfg.vol.atm_min_total_volume,
         "atm_low_volume_search_near_month": cfg.vol.atm_low_volume_search_near_month,
+        "contract_specific_underlying_atm_selection": True,
         "contract_multiplier": cfg.vol.contract_multiplier,
+        "surface_atm_iv_enabled": cfg.vol.surface_atm_iv_enabled,
+        "surface_atm_target_dte": cfg.vol.surface_atm_target_dte,
+        "surface_standard_dtes": cfg.vol.surface_standard_dtes,
+        "surface_min_dte": cfg.vol.surface_min_dte,
+        "surface_min_volume": cfg.vol.surface_min_volume,
+        "surface_max_spread_pct": cfg.vol.surface_max_spread_pct,
+        "surface_min_abs_delta": cfg.vol.surface_min_abs_delta,
+        "surface_max_abs_delta": cfg.vol.surface_max_abs_delta,
+        "surface_allow_term_extrapolate": cfg.vol.surface_allow_term_extrapolate,
+        "surface_term_extrapolate_mode": cfg.vol.surface_term_extrapolate_mode,
+        "surface_k_grid_mode": cfg.vol.surface_k_grid_mode,
     }
 
 
@@ -202,7 +233,7 @@ def get_vol_features(
     """读取或计算回测所需的波动率 features 缓存。"""
     key_payload = {
         "kind": "vol_features",
-        "schema": "atm_pool_volume_valid_iv_percentile_v1",
+        "schema": "separated_iv_observation_mode_v1",
         "data": build_data_signature(start, end),
         "enriched_config": _enriched_config_signature(),
         "feature_config": _feature_config_signature(),

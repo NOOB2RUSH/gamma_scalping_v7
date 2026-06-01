@@ -47,9 +47,9 @@ def parse_args():
     parser.add_argument(
         "--tasks",
         nargs="+",
-        choices=("all", "underlying", "option"),
+        choices=("all", "underlying", "futures", "option"),
         default=("all",),
-        help="all=主连+期权；underlying=只下载 M0；option=只下载期权链。",
+        help="all=主连+具体期货合约+期权；underlying=只下载 M0；futures=只下载期权对应期货；option=只下载期权链。",
     )
     parser.add_argument(
         "--output-root",
@@ -129,6 +129,82 @@ def download_underlying(start, end, output_dir):
         payload.to_parquet(file_path, index=False)
 
     return df
+
+
+def option_month_to_futures_symbol(contract_month):
+    """豆粕期权 mYYMM 对应同到期月豆粕期货 MYYMM。"""
+    year, month = parse_contract_month(contract_month)
+    return f"M{year % 100:02d}{month:02d}"
+
+
+def option_month_to_futures_order_book_id(contract_month):
+    return f"{option_month_to_futures_symbol(contract_month)}.DCE"
+
+
+def download_futures_contract(symbol, start, end, output_dir, skip_existing=False):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    order_book_id = f"{str(symbol).upper()}.DCE"
+    df = ak_call(ak.futures_zh_daily_sina, symbol=symbol)
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"])
+    df = df[(df["date"] >= pd.Timestamp(start)) & (df["date"] <= pd.Timestamp(end))]
+    if df.empty:
+        return df
+
+    keep_cols = ["date", "open", "high", "low", "close", "volume", "settle"]
+    if "hold" in df.columns:
+        keep_cols.append("hold")
+    df = df[keep_cols].copy()
+    for col in [col for col in keep_cols if col != "date"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+
+    for _, row in df.iterrows():
+        date = row["date"]
+        file_path = output_dir / f"{order_book_id}_{date:%Y-%m-%d}_price.parquet"
+        if skip_existing and file_path.exists():
+            continue
+        payload = row.drop(labels=["date"]).to_frame().T
+        payload.insert(0, "order_book_id", order_book_id)
+        payload.to_parquet(file_path, index=False)
+
+    return df
+
+
+def download_matched_futures(months, start, end, output_dir, request_sleep, skip_existing):
+    rows = []
+    for idx, month in enumerate(months, start=1):
+        symbol = option_month_to_futures_symbol(month)
+        try:
+            df = download_futures_contract(
+                symbol,
+                start,
+                end,
+                output_dir,
+                skip_existing=skip_existing,
+            )
+        except Exception as exc:
+            print(
+                f"[soymeal] futures {idx}/{len(months)} {symbol} failed: "
+                f"{type(exc).__name__}",
+                flush=True,
+            )
+            df = pd.DataFrame()
+        rows.append(
+            {
+                "contract_month": month,
+                "underlying_order_book_id": option_month_to_futures_order_book_id(month),
+                "rows": len(df),
+            }
+        )
+        print(
+            f"[soymeal] futures {idx}/{len(months)} {symbol}: rows={len(df)}",
+            flush=True,
+        )
+        time.sleep(request_sleep)
+    return pd.DataFrame(rows)
 
 
 def current_contract_months():
@@ -281,6 +357,7 @@ def fetch_option_history(code, start, end, trading_calendar):
 
     df = df.assign(
         order_book_id=code,
+        underlying_order_book_id=option_month_to_futures_order_book_id(contract_month),
         strike_price=strike,
         maturity_date=pd.Timestamp(expiry),
         option_type=option_type,
@@ -293,6 +370,7 @@ def fetch_option_history(code, start, end, trading_calendar):
         [
             "date",
             "order_book_id",
+            "underlying_order_book_id",
             "strike_price",
             "maturity_date",
             "option_type",
@@ -413,17 +491,10 @@ def main():
     output_root = Path(args.output_root)
     tasks = set(args.tasks)
     if "all" in tasks:
-        tasks = {"underlying", "option"}
+        tasks = {"underlying", "futures", "option"}
 
-    if "underlying" in tasks:
-        underlying_df = download_underlying(start, end, output_root / "underlying")
-        print(
-            f"[soymeal] underlying rows={len(underlying_df)}, "
-            f"range={underlying_df['date'].min()} - {underlying_df['date'].max()}",
-            flush=True,
-        )
-
-    if "option" in tasks:
+    months = None
+    if "futures" in tasks or "option" in tasks:
         if args.contract_months:
             months = args.contract_months
         elif args.auto_months:
@@ -436,6 +507,30 @@ def main():
         else:
             months = current_contract_months()
         print(f"[soymeal] contract months: {months}", flush=True)
+
+    if "underlying" in tasks:
+        underlying_df = download_underlying(start, end, output_root / "underlying")
+        print(
+            f"[soymeal] underlying rows={len(underlying_df)}, "
+            f"range={underlying_df['date'].min()} - {underlying_df['date'].max()}",
+            flush=True,
+        )
+
+    if "futures" in tasks:
+        futures_df = download_matched_futures(
+            months,
+            start,
+            end,
+            output_root / "futures",
+            args.request_sleep,
+            args.skip_existing,
+        )
+        print(
+            f"[soymeal] matched futures rows={futures_df['rows'].sum() if not futures_df.empty else 0}",
+            flush=True,
+        )
+
+    if "option" in tasks:
         options = download_options(
             start,
             end,

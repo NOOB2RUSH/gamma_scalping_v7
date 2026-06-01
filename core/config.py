@@ -6,8 +6,8 @@
 
 from importlib import import_module
 
-from .config_50etf import CONFIG
-from .config_schema import (
+from .configs.config_50etf import CONFIG
+from .configs.config_schema import (
     AppConfig,
     BacktestConfig,
     DataConfig,
@@ -19,10 +19,11 @@ from .config_schema import (
 
 
 PRODUCT_CONFIG_MODULES = {
-    "50etf": "core.config_50etf",
-    "500etf": "core.config_500etf",
-    "soymeal": "core.config_soymeal",
-    "zz1000": "core.config_zz1000",
+    "300etf": "core.configs.config_300etf",
+    "50etf": "core.configs.config_50etf",
+    "500etf": "core.configs.config_500etf",
+    "kc50etf": "core.configs.config_kc50etf",
+    "zz1000": "core.configs.config_zz1000",
 }
 
 

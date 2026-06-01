@@ -100,6 +100,14 @@ DIRECTION_PARAM_NAMES = {
         "strategy.short_open_pullback_iv_threshold",
         "strategy.roll_cooldown_days",
     ],
+    "300etf_full_defense": [
+        "strategy.long_open_iv_threshold",
+        "strategy.long_close_iv_threshold",
+        "strategy.short_open_iv_threshold",
+        "strategy.short_close_iv_threshold",
+        "strategy.short_open_pullback_iv_threshold",
+        "strategy.roll_cooldown_days",
+    ],
 }
 
 
@@ -293,6 +301,22 @@ ETF500_FULL_DEFENSE_PARAM_GRID = {
     "strategy.roll_cooldown_days": [1, 2, 3, 4, 5, 7],
 }
 
+ETF300_FULL_DEFENSE_PARAM_GRID = {
+    "strategy.enable_long_straddle": [True],
+    "strategy.enable_short_straddle": [True],
+    "strategy.short_signal_mode": ["absolute"],
+    "strategy.enable_delta_hedge": [True],
+    "strategy.short_stop_loss_enabled": [True],
+    "strategy.short_volume_spike_exit_enabled": [True],
+    "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+    "strategy.long_open_iv_threshold": [0.10, 0.12, 0.14, 0.16, 0.18],
+    "strategy.long_close_iv_threshold": [0.18, 0.22, 0.26, 0.30, 0.36],
+    "strategy.short_open_iv_threshold": [0.18, 0.20, 0.22, 0.24, 0.26, 0.30, 0.34],
+    "strategy.short_close_iv_threshold": [0.10, 0.12, 0.14, 0.16, 0.18, 0.20],
+    "strategy.short_open_pullback_iv_threshold": [0.24, 0.28, 0.32, 0.36, 0.42, 0.50],
+    "strategy.roll_cooldown_days": [1, 2, 3, 5, 7],
+}
+
 FINE_OFFSETS = {
     "strategy.long_open_iv_threshold": [-0.005, 0.0, 0.005],
     "strategy.long_close_iv_threshold": [-0.015, 0.0, 0.015],
@@ -338,6 +362,7 @@ def parse_args():
             "500etf_both_wide",
             "500etf_both_delta",
             "500etf_full_defense",
+            "300etf_full_defense",
         ],
         default="both",
         help="扫描方向：short 会关闭 long，只调卖出跨式；long 会关闭 short；both 同时调两套阈值。",
@@ -466,6 +491,8 @@ def get_scan_param_names(direction):
 
 
 def get_coarse_param_grid(direction):
+    if direction == "300etf_full_defense":
+        return ETF300_FULL_DEFENSE_PARAM_GRID
     if direction == "500etf_full_defense":
         return ETF500_FULL_DEFENSE_PARAM_GRID
     if direction == "500etf_wide":
@@ -492,6 +519,16 @@ def get_coarse_param_grid(direction):
 
 
 def get_direction_switches(direction):
+    if direction == "300etf_full_defense":
+        return {
+            "strategy.enable_long_straddle": [True],
+            "strategy.enable_short_straddle": [True],
+            "strategy.short_signal_mode": ["absolute"],
+            "strategy.enable_delta_hedge": [True],
+            "strategy.short_stop_loss_enabled": [True],
+            "strategy.short_volume_spike_exit_enabled": [True],
+            "strategy.short_cooldown_after_long_iv_high_exit_days": [3],
+        }
     if direction == "500etf_full_defense":
         return {
             "strategy.enable_long_straddle": [True],
@@ -1032,6 +1069,7 @@ def run_one_param_set(
     param_set,
     etf_by_date,
     opt_by_date,
+    hedge_by_date,
     trading_calendar,
     feature_cache,
     enriched_chain_cache,
@@ -1069,6 +1107,7 @@ def run_one_param_set(
         signals,
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
+        hedge_by_date=hedge_by_date,
     )
     return summarize_result(param_set, daily_pnl, trades, config.backtest.initial_cash)
 
@@ -1080,6 +1119,7 @@ def run_scan(
     base_config,
     etf_by_date,
     opt_by_date,
+    hedge_by_date,
     trading_calendar,
     start,
     end,
@@ -1105,6 +1145,7 @@ def run_scan(
                 param_set,
                 etf_by_date,
                 opt_by_date,
+                hedge_by_date,
                 trading_calendar,
                 feature_cache,
                 enriched_chain_cache,
@@ -1214,6 +1255,8 @@ def main():
     print("加载数据...", flush=True)
     etf_by_date = core.data_loader.load_etf_series(start, end)
     opt_by_date = core.data_loader.load_opt_series(start, end)
+    hedge_by_date = core.data_loader.load_hedge_series(start, end)
+    opt_by_date = core.data_loader.attach_underlying_prices(opt_by_date, hedge_by_date)
     print(
         "调参品种: "
         f"{base_config.data.product}, "
@@ -1233,6 +1276,7 @@ def main():
             base_config,
             etf_by_date,
             opt_by_date,
+            hedge_by_date,
             trading_calendar,
             start,
             end,
@@ -1279,6 +1323,7 @@ def main():
             base_config,
             etf_by_date,
             opt_by_date,
+            hedge_by_date,
             trading_calendar,
             start,
             end,

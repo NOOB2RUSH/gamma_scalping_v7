@@ -90,6 +90,7 @@ class BacktestState:
     hedge_etf_qty: float = 0.0
     hedge_entry_price: float = 0.0
     hedge_margin: float = 0.0
+    hedge_underlying_order_book_id: str | None = None
     strike_mismatch_days: dict = field(
         default_factory=lambda: {
             "long": 0,
@@ -118,6 +119,9 @@ def execute_delta_hedge(
     target_qty=None,
     trade_type="delta_hedge",
     etf_fee_rate=None,
+    underlying_order_book_id=None,
+    current_price=None,
+    current_underlying_order_book_id=None,
 ):
     """把 ETF 对冲仓位调整到目标数量，并记录交易和手续费。"""
     if etf_fee_rate is None:
@@ -125,29 +129,78 @@ def execute_delta_hedge(
 
     if target_qty is None:
         target_qty = -greeks["delta"]
+    if target_qty == 0:
+        underlying_order_book_id = current_underlying_order_book_id
+    if current_price is None:
+        current_price = spot
 
-    if hedge_etf_qty == target_qty:
-        return cash, hedge_etf_qty, hedge_entry_price, hedge_margin
-
-    old_qty = hedge_etf_qty
-    cash, hedge_etf_qty, hedge_entry_price, hedge_margin, hedge_pnl = (
-        hedge.rebalance_etf_hedge(
+    if (
+        hedge_etf_qty == target_qty
+        and current_underlying_order_book_id == underlying_order_book_id
+    ):
+        return (
             cash,
             hedge_etf_qty,
             hedge_entry_price,
             hedge_margin,
-            target_qty,
-            spot,
+            current_underlying_order_book_id,
         )
+
+    old_qty = hedge_etf_qty
+    old_underlying = current_underlying_order_book_id
+    hedge_pnl = 0.0
+    fee_notional = 0.0
+
+    underlying_changed = (
+        old_qty != 0
+        and target_qty != 0
+        and old_underlying != underlying_order_book_id
     )
+    if underlying_changed:
+        cash, hedge_pnl = hedge.close_etf_hedge(
+            cash,
+            hedge_etf_qty,
+            hedge_entry_price,
+            hedge_margin,
+            current_price,
+        )
+        fee_notional += abs(old_qty) * current_price
+        cash, hedge_etf_qty, hedge_entry_price, hedge_margin, open_pnl = (
+            hedge.rebalance_etf_hedge(
+                cash,
+                0.0,
+                0.0,
+                0.0,
+                target_qty,
+                spot,
+            )
+        )
+        hedge_pnl += open_pnl
+        fee_notional += abs(target_qty) * spot
+    else:
+        cash, hedge_etf_qty, hedge_entry_price, hedge_margin, hedge_pnl = (
+            hedge.rebalance_etf_hedge(
+                cash,
+                hedge_etf_qty,
+                hedge_entry_price,
+                hedge_margin,
+                target_qty,
+                spot,
+            )
+        )
+        fee_notional += abs(hedge_etf_qty - old_qty) * spot
+
     trade_qty = hedge_etf_qty - old_qty
-    etf_fee = abs(trade_qty) * spot * etf_fee_rate
+    etf_fee = fee_notional * etf_fee_rate
     cash -= etf_fee
+    new_underlying = underlying_order_book_id if hedge_etf_qty != 0 else None
 
     trades.append(
         {
             "date": date,
             "type": trade_type,
+            "old_hedge_underlying_order_book_id": old_underlying,
+            "hedge_underlying_order_book_id": new_underlying,
             "old_etf_qty": old_qty,
             "new_etf_qty": hedge_etf_qty,
             "trade_etf_qty": trade_qty,
@@ -157,7 +210,7 @@ def execute_delta_hedge(
             "fee": etf_fee,
         }
     )
-    return cash, hedge_etf_qty, hedge_entry_price, hedge_margin
+    return cash, hedge_etf_qty, hedge_entry_price, hedge_margin, new_underlying
 
 
 def build_daily_record(
@@ -166,6 +219,8 @@ def build_daily_record(
     cash,
     option_value,
     hedge_etf_qty,
+    hedge_underlying_order_book_id,
+    hedge_price,
     hedge_entry_price,
     hedge_margin,
     hedge_unrealized_pnl,
@@ -209,6 +264,8 @@ def build_daily_record(
         "option_value": option_value,
         "option_margin": option_margin,
         "hedge_etf_qty": hedge_etf_qty,
+        "hedge_underlying_order_book_id": hedge_underlying_order_book_id,
+        "hedge_price": hedge_price,
         "hedge_entry_price": hedge_entry_price,
         "hedge_margin": hedge_margin,
         "hedge_unrealized_pnl": hedge_unrealized_pnl,
@@ -219,6 +276,7 @@ def build_daily_record(
         "eod_position_side": eod_position_side,
         "eod_position_call_code": None,
         "eod_position_put_code": None,
+        "eod_position_underlying_order_book_id": None,
         "eod_position_strike": None,
         "eod_position_expiry": None,
         "eod_position_dte": eod_position_dte,
@@ -267,6 +325,9 @@ def build_daily_record(
         position = positions[active_sides[0]]
         record["eod_position_call_code"] = position["call_code"]
         record["eod_position_put_code"] = position["put_code"]
+        record["eod_position_underlying_order_book_id"] = position.get(
+            "underlying_order_book_id"
+        )
         record["eod_position_strike"] = position["strike"]
         record["eod_position_expiry"] = position["expiry"]
 
@@ -284,6 +345,11 @@ def build_daily_record(
                 ),
                 f"{prefix}position_put_code": (
                     position["put_code"] if position is not None else None
+                ),
+                f"{prefix}position_underlying_order_book_id": (
+                    position.get("underlying_order_book_id")
+                    if position is not None
+                    else None
                 ),
                 f"{prefix}position_strike": (
                     position["strike"] if position is not None else None
@@ -402,10 +468,42 @@ def add_greeks_pnl(daily_df):
         df[f"{prefix}greeks_explainable_day"] = explainable_day
         df[f"{prefix}greeks_position_changed_day"] = position_changed
 
-    df["hedge_delta_pnl"] = df["hedge_etf_qty"].shift(1) * spot_chg
+    if "hedge_price" in df.columns:
+        hedge_price_chg = df["hedge_price"].diff()
+    else:
+        hedge_price_chg = spot_chg
+    if "hedge_underlying_order_book_id" in df.columns:
+        hedge_underlying = df["hedge_underlying_order_book_id"]
+        prev_hedge_underlying = hedge_underlying.shift(1)
+        same_hedge_underlying = (
+            hedge_underlying.eq(prev_hedge_underlying)
+            | (hedge_underlying.isna() & prev_hedge_underlying.isna())
+        )
+    else:
+        same_hedge_underlying = pd.Series(True, index=df.index)
+    df["hedge_delta_pnl"] = df["hedge_etf_qty"].shift(1) * hedge_price_chg
+    df.loc[~same_hedge_underlying.fillna(False), "hedge_delta_pnl"] = 0.0
     df["delta_pnl"] = (
         df["long_delta_pnl"] + df["short_delta_pnl"] + df["hedge_delta_pnl"]
     )
+
+    prev_side_delta = {}
+    for side in POSITION_SIDES:
+        prefix = f"{side}_"
+        prev_side_delta[side] = (
+            df[f"{prefix}eod_call_delta"].shift(1)
+            + df[f"{prefix}eod_put_delta"].shift(1)
+        )
+    prev_option_delta = sum(prev_side_delta.values())
+    for side in POSITION_SIDES:
+        prefix = f"{side}_"
+        hedge_share = prev_side_delta[side] / prev_option_delta
+        hedge_share = hedge_share.where(prev_option_delta != 0, 0.0).fillna(0.0)
+        df[f"{prefix}hedge_delta_pnl"] = df["hedge_delta_pnl"] * hedge_share
+        df[f"{prefix}total_delta_pnl"] = (
+            df[f"{prefix}delta_pnl"] + df[f"{prefix}hedge_delta_pnl"]
+        )
+
     df["gamma_pnl"] = df["long_gamma_pnl"] + df["short_gamma_pnl"]
     df["vega_pnl"] = df["long_vega_pnl"] + df["short_vega_pnl"]
     df["theta_pnl"] = df["long_theta_pnl"] + df["short_theta_pnl"]
@@ -463,10 +561,12 @@ class BacktestEngine:
         config,
         trading_calendar=None,
         enriched_opt_by_date=None,
+        hedge_by_date=None,
     ):
         self.etf_by_date = etf_by_date
         self.opt_by_date = opt_by_date
         self.enriched_opt_by_date = enriched_opt_by_date
+        self.hedge_by_date = hedge_by_date
         self.signals_df = signals_df
         self.config = config
         self.daily_ohlc = vol_engine.build_daily_ohlc_df(etf_by_date)
@@ -826,7 +926,7 @@ class BacktestEngine:
             call_qty,
             put_qty,
             side,
-            spot,
+            self._atm_underlying_price(atm, spot),
         )
         projected_greeks = strategy.calc_position_greeks(
             atm["call"],
@@ -843,8 +943,10 @@ class BacktestEngine:
         projected_cash = self._project_cash_after_hedge(
             projected_cash,
             state,
+            date,
             spot,
             -account_greeks["delta"],
+            atm.get("underlying_order_book_id"),
         )
         cash_would_decrease = projected_cash < state.cash
         if cash_would_decrease and not self._has_cash_reserve(projected_cash):
@@ -886,7 +988,7 @@ class BacktestEngine:
             state.trades,
             trade_type="roll_open_straddle",
             side=side,
-            spot=spot,
+            spot=self._atm_underlying_price(atm, spot),
             short_entry_regime=(
                 position.get("short_entry_regime", CONFIG.strategy.short_signal_mode)
                 if side == "short"
@@ -924,7 +1026,7 @@ class BacktestEngine:
             call_qty,
             put_qty,
             side,
-            spot,
+            self._atm_underlying_price(atm, spot),
         )
         projected_greeks = strategy.calc_position_greeks(
             atm["call"],
@@ -941,8 +1043,10 @@ class BacktestEngine:
         projected_cash = self._project_cash_after_hedge(
             projected_cash,
             state,
+            date,
             spot,
             -account_greeks["delta"],
+            atm.get("underlying_order_book_id"),
         )
         if not self._has_cash_reserve(projected_cash):
             self._record_cash_reserve_skip(
@@ -967,7 +1071,7 @@ class BacktestEngine:
             state.trades,
             trade_type=trade_type,
             side=side,
-            spot=spot,
+            spot=self._atm_underlying_price(atm, spot),
             short_entry_regime=short_entry_regime,
         )
         state.positions[side] = new_position
@@ -990,12 +1094,19 @@ class BacktestEngine:
             return 0.0
 
         old_margin = position.get("option_margin", 0.0)
+        underlying_price = call_row.get("underlying_close")
+        if pd.isna(underlying_price):
+            underlying_price = self._position_underlying_price(
+                {"date": call_row["date"]},
+                position,
+                spot,
+            )
         new_margin = opt_position.calc_short_margin(
             call_row,
             put_row,
             position["call_qty"],
             position["put_qty"],
-            spot,
+            underlying_price,
         )
         margin_change = new_margin - old_margin
         if margin_change != 0:
@@ -1078,6 +1189,19 @@ class BacktestEngine:
             return cash + trade_value - fee - option_margin
         return cash - trade_value - fee
 
+    def _atm_underlying_price(self, atm, fallback_price):
+        value = atm.get("underlying_price")
+        if pd.notna(value):
+            return float(value)
+        return fallback_price
+
+    def _position_underlying_price(self, day, position, fallback_price):
+        return self._get_hedge_price(
+            day["date"],
+            position.get("underlying_order_book_id"),
+            fallback_price,
+        )
+
     def _project_cash_after_option_close(self, cash, position, call_row, put_row):
         close_value = opt_position.value(position, call_row, put_row)
         fee = opt_position.calc_option_fee(position["call_qty"], position["put_qty"])
@@ -1085,16 +1209,93 @@ class BacktestEngine:
             return cash + position.get("option_margin", 0.0) - close_value - fee
         return cash + close_value - fee
 
-    def _project_cash_after_hedge(self, cash, state, spot, target_qty):
-        projected_cash, _, _, _, _ = hedge.rebalance_etf_hedge(
-            cash,
-            state.hedge_etf_qty,
-            state.hedge_entry_price,
-            state.hedge_margin,
-            target_qty,
-            spot,
+    def _get_hedge_price(self, date, underlying_order_book_id, fallback_price):
+        if underlying_order_book_id is None:
+            return fallback_price
+        if self.hedge_by_date is None:
+            raise ValueError(
+                "启用 delta hedge 时缺少 hedge 标的数据；"
+                f"无法为 {underlying_order_book_id} 取价"
+            )
+        hedge_df = self.hedge_by_date.get(pd.Timestamp(date))
+        if hedge_df is None:
+            raise ValueError(f"{date} 缺少 hedge 标的数据")
+        rows = hedge_df[
+            hedge_df["order_book_id"].astype(str) == str(underlying_order_book_id)
+        ]
+        if rows.empty:
+            raise ValueError(f"{date} 缺少 hedge 标的 {underlying_order_book_id}")
+        return float(rows.iloc[0]["close"])
+
+    def _active_hedge_underlying_order_book_id(self, state):
+        ids = {
+            position.get("underlying_order_book_id")
+            for position in state.positions.values()
+            if position is not None and position.get("underlying_order_book_id")
+        }
+        if len(ids) > 1:
+            raise ValueError(f"当前账户持有多个 hedge 标的，暂不支持账户级单腿对冲: {ids}")
+        return next(iter(ids), None)
+
+    def _project_cash_after_hedge(
+        self,
+        cash,
+        state,
+        date,
+        fallback_price,
+        target_qty,
+        target_underlying_order_book_id=None,
+    ):
+        if target_qty == 0:
+            target_underlying_order_book_id = state.hedge_underlying_order_book_id
+        target_price = self._get_hedge_price(
+            date,
+            target_underlying_order_book_id,
+            fallback_price,
         )
-        etf_fee = abs(target_qty - state.hedge_etf_qty) * spot * self.config["etf_fee_rate"]
+        current_price = self._get_hedge_price(
+            date,
+            state.hedge_underlying_order_book_id,
+            fallback_price,
+        )
+
+        fee_notional = 0.0
+        underlying_changed = (
+            state.hedge_etf_qty != 0
+            and target_qty != 0
+            and state.hedge_underlying_order_book_id
+            != target_underlying_order_book_id
+        )
+        if underlying_changed:
+            projected_cash, _ = hedge.close_etf_hedge(
+                cash,
+                state.hedge_etf_qty,
+                state.hedge_entry_price,
+                state.hedge_margin,
+                current_price,
+            )
+            fee_notional += abs(state.hedge_etf_qty) * current_price
+            projected_cash, _, _, _, _ = hedge.rebalance_etf_hedge(
+                projected_cash,
+                0.0,
+                0.0,
+                0.0,
+                target_qty,
+                target_price,
+            )
+            fee_notional += abs(target_qty) * target_price
+        else:
+            projected_cash, _, _, _, _ = hedge.rebalance_etf_hedge(
+                cash,
+                state.hedge_etf_qty,
+                state.hedge_entry_price,
+                state.hedge_margin,
+                target_qty,
+                target_price,
+            )
+            fee_notional += abs(target_qty - state.hedge_etf_qty) * target_price
+
+        etf_fee = fee_notional * self.config["etf_fee_rate"]
         return projected_cash - etf_fee
 
     def _record_cash_reserve_skip(self, date, state, trade_type, projected_cash, side=None):
@@ -1170,11 +1371,18 @@ class BacktestEngine:
             greeks = empty_greeks()
 
         projected_target_qty = -greeks["delta"] if target_qty is None else target_qty
+        target_underlying_order_book_id = (
+            state.hedge_underlying_order_book_id
+            if projected_target_qty == 0
+            else self._active_hedge_underlying_order_book_id(state)
+        )
         projected_cash = self._project_cash_after_hedge(
             state.cash,
             state,
+            date,
             spot,
             projected_target_qty,
+            target_underlying_order_book_id,
         )
         cash_would_decrease = projected_cash < state.cash
         if cash_would_decrease and not self._has_cash_reserve(projected_cash):
@@ -1192,6 +1400,7 @@ class BacktestEngine:
             state.hedge_etf_qty,
             state.hedge_entry_price,
             state.hedge_margin,
+            state.hedge_underlying_order_book_id,
         ) = execute_delta_hedge(
             date,
             state.cash,
@@ -1199,11 +1408,22 @@ class BacktestEngine:
             state.hedge_etf_qty,
             state.hedge_entry_price,
             state.hedge_margin,
-            spot,
+            self._get_hedge_price(
+                date,
+                target_underlying_order_book_id,
+                spot,
+            ),
             state.trades,
             target_qty=target_qty,
             trade_type=trade_type,
             etf_fee_rate=self.config["etf_fee_rate"],
+            underlying_order_book_id=target_underlying_order_book_id,
+            current_price=self._get_hedge_price(
+                date,
+                state.hedge_underlying_order_book_id,
+                spot,
+            ),
+            current_underlying_order_book_id=state.hedge_underlying_order_book_id,
         )
 
         if day is not None and len(state.trades) > trade_count:
@@ -1222,10 +1442,15 @@ class BacktestEngine:
 
     def _record_day(self, day, state):
         self._update_day_aggregates(day)
+        hedge_price = self._get_hedge_price(
+            day["date"],
+            state.hedge_underlying_order_book_id,
+            day["spot"],
+        )
         hedge_unrealized_pnl = hedge.calc_unrealized_pnl(
             state.hedge_etf_qty,
             state.hedge_entry_price,
-            day["spot"],
+            hedge_price,
         )
         option_margin = sum(
             opt_position.margin_value(state.positions[side])
@@ -1246,6 +1471,8 @@ class BacktestEngine:
                 state.cash,
                 day["option_value"],
                 state.hedge_etf_qty,
+                state.hedge_underlying_order_book_id,
+                hedge_price,
                 state.hedge_entry_price,
                 state.hedge_margin,
                 hedge_unrealized_pnl,
@@ -1277,6 +1504,7 @@ class AlwaysAtmBenchmarkEngine(BacktestEngine):
         benchmark_side,
         trading_calendar=None,
         enriched_opt_by_date=None,
+        hedge_by_date=None,
     ):
         super().__init__(
             etf_by_date,
@@ -1285,6 +1513,7 @@ class AlwaysAtmBenchmarkEngine(BacktestEngine):
             config,
             trading_calendar=trading_calendar,
             enriched_opt_by_date=enriched_opt_by_date,
+            hedge_by_date=hedge_by_date,
         )
         if benchmark_side not in POSITION_SIDES:
             raise ValueError("benchmark_side 只能是 'long' 或 'short'")
@@ -1475,6 +1704,7 @@ def run_backtest(
     enable_delta_hedge=None,
     trading_calendar=None,
     enriched_opt_by_date=None,
+    hedge_by_date=None,
 ):
     engine = BacktestEngine(
         etf_by_date,
@@ -1490,6 +1720,7 @@ def run_backtest(
         ),
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
+        hedge_by_date=hedge_by_date,
     )
     return engine.run()
 
@@ -1506,6 +1737,7 @@ def run_always_atm_benchmark(
     enable_delta_hedge=None,
     trading_calendar=None,
     enriched_opt_by_date=None,
+    hedge_by_date=None,
 ):
     if benchmark_side is None:
         benchmark_side = CONFIG.reference.always_atm_side
@@ -1527,5 +1759,6 @@ def run_always_atm_benchmark(
         benchmark_side=benchmark_side,
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
+        hedge_by_date=hedge_by_date,
     )
     return engine.run()

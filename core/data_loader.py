@@ -37,6 +37,38 @@ def load_etf_series(start, end):
     return etf_by_date
 
 
+def load_hedge_series(start, end):
+    """加载 delta hedge 标的日线；支持同一日期多只合约。"""
+    hedge_dir = config.CONFIG.data.hedge_etf_dir
+    if hedge_dir is None:
+        return None
+
+    hedge_by_date = {}
+    data_dir = _resolve_data_dir(hedge_dir)
+    required_cols = {"open", "high", "low", "close", "volume"}
+
+    start = pd.Timestamp(start)
+    end = pd.Timestamp(end)
+
+    for file_path in sorted(data_dir.glob("*price.parquet")):
+        date = _parse_date_from_file(file_path, "_price")
+        if not start <= date <= end:
+            continue
+
+        df = _read_parquet(file_path).copy()
+        if "order_book_id" not in df.columns:
+            df.insert(0, "order_book_id", _parse_symbol_from_price_file(file_path))
+        df = _validate_df(df, required_cols | {"order_book_id"}, date)
+        if date in hedge_by_date:
+            hedge_by_date[date] = pd.concat([hedge_by_date[date], df], ignore_index=True)
+        else:
+            hedge_by_date[date] = df
+
+    if not hedge_by_date:
+        raise ValueError(f"delta hedge 标的数据为空: {data_dir}")
+    return hedge_by_date
+
+
 def load_etf_trading_calendar():
     """从 ETF 日线文件名提取完整交易日历，用于按真实交易日计算 DTE。"""
     data_dir = _resolve_data_dir(config.CONFIG.data.etf_dir)
@@ -74,11 +106,75 @@ def load_opt_series(start, end):
         if start <= date <= end:
             df = _read_parquet(file_path)
             df.insert(0, "date", date)
+            df = _ensure_option_underlying_id(df)
             opt_by_date[date] = _validate_df(df, required_cols, date)
 
     if not opt_by_date:
         raise ValueError("期权数据为空")
     return opt_by_date
+
+
+def attach_underlying_prices(opt_by_date, hedge_by_date):
+    """把期权对应期货合约的当日价格贴到期权链，供 IV/Greeks 和 hedge 使用。"""
+    if hedge_by_date is None:
+        return opt_by_date
+
+    result = {}
+    price_cols = ["open", "high", "low", "close", "volume"]
+    for date, chain_df in opt_by_date.items():
+        df = chain_df.copy()
+        if "underlying_order_book_id" not in df.columns or date not in hedge_by_date:
+            result[date] = df
+            continue
+
+        hedge_df = hedge_by_date[date]
+        available_cols = [
+            col for col in price_cols if col in hedge_df.columns
+        ]
+        price_df = hedge_df[["order_book_id", *available_cols]].drop_duplicates(
+            subset=["order_book_id"],
+            keep="last",
+        )
+        rename_map = {
+            col: f"underlying_{col}"
+            for col in available_cols
+        }
+        price_df = price_df.rename(
+            columns={
+                "order_book_id": "underlying_order_book_id",
+                **rename_map,
+            }
+        )
+        df = df.merge(price_df, on="underlying_order_book_id", how="left")
+        result[date] = df
+
+    return result
+
+
+def _ensure_option_underlying_id(df):
+    """旧豆粕期权 parquet 没有标的期货代码时，按期权月份补齐。"""
+    if (
+        config.CONFIG.data.product != "soymeal"
+        or "underlying_order_book_id" in df.columns
+        or "order_book_id" not in df.columns
+    ):
+        return df
+
+    df = df.copy()
+    df["underlying_order_book_id"] = df["order_book_id"].map(
+        _infer_soymeal_underlying_order_book_id
+    )
+    return df
+
+
+def _infer_soymeal_underlying_order_book_id(option_code):
+    text = str(option_code)
+    if len(text) < 5 or text[0].lower() != "m":
+        return None
+    month_text = text[1:5]
+    if not month_text.isdigit():
+        return None
+    return f"M{month_text}.DCE"
 
 
 def _validate_df(df, required_cols, date):
@@ -104,3 +200,7 @@ def _parse_date_from_file(file_path, suffix):
     base = file_path.stem.rsplit(suffix, 1)
     date_str = base[0].rsplit("_", 1)[1]
     return pd.Timestamp(date_str)
+
+
+def _parse_symbol_from_price_file(file_path):
+    return file_path.stem.rsplit("_", 1)[0]

@@ -3,6 +3,7 @@ import json
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 import core
@@ -74,6 +75,7 @@ def run_backtest_with_strategy_mode(
     features,
     etf_by_date,
     opt_by_date,
+    hedge_by_date,
     trading_calendar,
     enriched_opt_by_date,
     enable_delta_hedge=None,
@@ -112,6 +114,7 @@ def run_backtest_with_strategy_mode(
             signals,
             trading_calendar=trading_calendar,
             enriched_opt_by_date=enriched_opt_by_date,
+            hedge_by_date=hedge_by_date,
         )
     finally:
         sync_config(original_config)
@@ -126,13 +129,20 @@ def load_data():
         CONFIG.backtest.start,
         CONFIG.backtest.end,
     )
-    return etf_by_date, opt_by_date
+    hedge_by_date = core.data_loader.load_hedge_series(
+        CONFIG.backtest.start,
+        CONFIG.backtest.end,
+    )
+    opt_by_date = core.data_loader.attach_underlying_prices(opt_by_date, hedge_by_date)
+    return etf_by_date, opt_by_date, hedge_by_date
 
 
 def build_daily_report(features, daily_pnl):
     """生成对外日报：只展示收盘后持仓口径，隐藏内部 PnL 归因用的旧仓明细。"""
     feature_cols = [
-        col for col in CONFIG.report.daily_feature_cols if col in features.columns
+        col
+        for col in CONFIG.report.daily_feature_cols
+        if col in features.columns and col not in daily_pnl.columns
     ]
     report = daily_pnl.join(features[feature_cols], how="left")
 
@@ -258,12 +268,34 @@ def calc_summary_breakdown(daily_pnl, trades):
     components["by_side"] = {}
     for side in ["long", "short"]:
         prefix = f"{side}_"
+        delta_col = (
+            f"{prefix}total_delta_pnl"
+            if f"{prefix}total_delta_pnl" in daily_pnl.columns
+            else f"{prefix}delta_pnl"
+        )
+        hedge_delta_col = (
+            f"{prefix}hedge_delta_pnl"
+            if f"{prefix}hedge_delta_pnl" in daily_pnl.columns
+            else None
+        )
+        total_delta = daily_pnl[delta_col].sum(skipna=True)
         components["by_side"][side] = {
-            "delta": daily_pnl[f"{prefix}delta_pnl"].sum(skipna=True),
+            "delta": total_delta,
+            "option_delta": daily_pnl[f"{prefix}delta_pnl"].sum(skipna=True),
+            "hedge_delta": (
+                daily_pnl[hedge_delta_col].sum(skipna=True)
+                if hedge_delta_col is not None
+                else 0.0
+            ),
             "gamma": daily_pnl[f"{prefix}gamma_pnl"].sum(skipna=True),
             "vega": daily_pnl[f"{prefix}vega_pnl"].sum(skipna=True),
             "theta": daily_pnl[f"{prefix}theta_pnl"].sum(skipna=True),
-            "greeks_trading": daily_pnl[f"{prefix}greeks_pnl"].sum(skipna=True),
+            "greeks_trading": (
+                total_delta
+                + daily_pnl[f"{prefix}gamma_pnl"].sum(skipna=True)
+                + daily_pnl[f"{prefix}vega_pnl"].sum(skipna=True)
+                + daily_pnl[f"{prefix}theta_pnl"].sum(skipna=True)
+            ),
             "option_fee": -option_fee_by_side[side],
             "days": int(daily_pnl[f"{prefix}greeks_explainable_day"].sum()),
         }
@@ -306,19 +338,14 @@ def print_side_breakdown(side_name, side_breakdown):
     total_greeks = side_breakdown["greeks_trading"]
     print(f"\n--- {side_name} Greeks 分解 ---")
     print(f"可解释交易日: {side_breakdown['days']}")
-    print("Delta PnL: 仅在账户总口径展示，分方向不展示期权腿 delta。")
+    print_breakdown_item("Delta PnL（期权 + ETF hedge）", side_breakdown["delta"], total_greeks)
+    print(f"  期权腿 delta: {format_money(side_breakdown['option_delta'])}")
+    print(f"  ETF hedge delta: {format_money(side_breakdown['hedge_delta'])}")
     print_breakdown_item("Gamma PnL", side_breakdown["gamma"], total_greeks)
     print_breakdown_item("Vega PnL", side_breakdown["vega"], total_greeks)
     print_breakdown_item("Theta PnL", side_breakdown["theta"], total_greeks)
-    option_leg_greeks = (
-        side_breakdown["gamma"] + side_breakdown["vega"] + side_breakdown["theta"]
-    )
-    print_breakdown_item(
-        "Greeks PnL（不含期权腿 delta）",
-        option_leg_greeks,
-        option_leg_greeks,
-    )
-    print_breakdown_item("期权手续费", side_breakdown["option_fee"], option_leg_greeks)
+    print_breakdown_item("Greeks PnL", total_greeks, total_greeks)
+    print_breakdown_item("期权手续费", side_breakdown["option_fee"], total_greeks)
 
 
 def print_summary(daily_pnl, trades):
@@ -496,6 +523,44 @@ def save_summary_files(output_dir, daily_pnl, trades):
             f"{format_money(breakdown['unexplained_trading_before_fee'])}"
         ),
         "",
+        "--- Long Greeks 分解 ---",
+        f"可解释交易日: {breakdown['by_side']['long']['days']}",
+        (
+            "Delta PnL（期权 + ETF hedge）: "
+            f"{format_money(breakdown['by_side']['long']['delta'])}"
+        ),
+        (
+            "期权腿 delta: "
+            f"{format_money(breakdown['by_side']['long']['option_delta'])}"
+        ),
+        (
+            "ETF hedge delta: "
+            f"{format_money(breakdown['by_side']['long']['hedge_delta'])}"
+        ),
+        f"Gamma PnL: {format_money(breakdown['by_side']['long']['gamma'])}",
+        f"Vega PnL: {format_money(breakdown['by_side']['long']['vega'])}",
+        f"Theta PnL: {format_money(breakdown['by_side']['long']['theta'])}",
+        f"Greeks PnL: {format_money(breakdown['by_side']['long']['greeks_trading'])}",
+        "",
+        "--- Short Greeks 分解 ---",
+        f"可解释交易日: {breakdown['by_side']['short']['days']}",
+        (
+            "Delta PnL（期权 + ETF hedge）: "
+            f"{format_money(breakdown['by_side']['short']['delta'])}"
+        ),
+        (
+            "期权腿 delta: "
+            f"{format_money(breakdown['by_side']['short']['option_delta'])}"
+        ),
+        (
+            "ETF hedge delta: "
+            f"{format_money(breakdown['by_side']['short']['hedge_delta'])}"
+        ),
+        f"Gamma PnL: {format_money(breakdown['by_side']['short']['gamma'])}",
+        f"Vega PnL: {format_money(breakdown['by_side']['short']['vega'])}",
+        f"Theta PnL: {format_money(breakdown['by_side']['short']['theta'])}",
+        f"Greeks PnL: {format_money(breakdown['by_side']['short']['greeks_trading'])}",
+        "",
         "=== 手续费 ===",
         f"期权手续费: {format_money(breakdown['option_fee'])}",
         f"ETF 手续费: {format_money(breakdown['etf_fee'])}",
@@ -591,6 +656,149 @@ def save_runtime_config(output_dir):
     )
 
 
+def _runtime_surface_config():
+    filters = core.vol_surface.SurfaceFilters(
+        min_dte=CONFIG.vol.surface_min_dte,
+        min_volume=CONFIG.vol.surface_min_volume,
+        max_spread_pct=CONFIG.vol.surface_max_spread_pct,
+        min_abs_delta=CONFIG.vol.surface_min_abs_delta,
+        max_abs_delta=CONFIG.vol.surface_max_abs_delta,
+    )
+    return core.vol_surface.SurfaceConfig(
+        standard_dtes=CONFIG.vol.surface_standard_dtes,
+        annual_days=CONFIG.vol.annual_days,
+        risk_free_rate=CONFIG.vol.risk_free_rate,
+        filters=filters,
+    )
+
+
+def plot_full_sample_vol_surface(output_dir, enriched_opt_by_date):
+    """用整个回测期样本汇总平均曲面；该图有前视偏差，只用于诊断展示。"""
+    observation_mode = getattr(CONFIG.vol, "iv_observation_mode", "legacy")
+    surface_plot_enabled = (
+        observation_mode == "surface_percentile"
+        or (
+            observation_mode == "legacy"
+            and CONFIG.vol.surface_atm_iv_enabled
+        )
+    )
+    if (
+        not surface_plot_enabled
+        or not CONFIG.report.enable_surface_full_sample_plot
+    ):
+        return None
+
+    surface_config = _runtime_surface_config()
+    smile_rows = []
+    raw_points = []
+    for date in sorted(enriched_opt_by_date):
+        surface = core.vol_surface.build_daily_surface(
+            enriched_opt_by_date[date],
+            config=surface_config,
+            standard_dtes=CONFIG.vol.surface_standard_dtes,
+            k_grid_mode=CONFIG.vol.surface_k_grid_mode,
+            allow_term_extrapolate=CONFIG.vol.surface_allow_term_extrapolate,
+            term_extrapolate_mode=CONFIG.vol.surface_term_extrapolate_mode,
+        )
+        points = surface.get("points")
+        if points is not None and not points.empty:
+            raw_points.append(points.assign(sample_date=date))
+
+        for target_dte, smile in surface.get("smiles", {}).items():
+            if smile is None or smile.empty:
+                continue
+            df = smile[["target_dte", "log_moneyness", "surface_iv"]].copy()
+            df["sample_date"] = date
+            df["target_dte"] = float(target_dte)
+            smile_rows.append(df)
+
+    if not smile_rows:
+        return None
+
+    all_smiles = pd.concat(smile_rows, ignore_index=True).dropna(
+        subset=["log_moneyness", "surface_iv"]
+    )
+    k_low = all_smiles["log_moneyness"].quantile(0.02)
+    k_high = all_smiles["log_moneyness"].quantile(0.98)
+    if pd.isna(k_low) or pd.isna(k_high) or k_low >= k_high:
+        return None
+    k_grid = np.linspace(float(k_low), float(k_high), 41)
+
+    normalized_rows = []
+    for (sample_date, target_dte), group in all_smiles.groupby(
+        ["sample_date", "target_dte"]
+    ):
+        group = group.sort_values("log_moneyness")
+        k = group["log_moneyness"].to_numpy(dtype=float)
+        iv = group["surface_iv"].to_numpy(dtype=float)
+        valid_grid = k_grid[(k_grid >= k.min()) & (k_grid <= k.max())]
+        if len(valid_grid) == 0:
+            continue
+        interp_iv = np.interp(valid_grid, k, iv)
+        for grid_k, surface_iv in zip(valid_grid, interp_iv):
+            normalized_rows.append(
+                {
+                    "target_dte": float(target_dte),
+                    "log_moneyness": float(grid_k),
+                    "surface_iv": float(surface_iv),
+                }
+            )
+
+    normalized = pd.DataFrame(normalized_rows)
+    if normalized.empty:
+        return None
+
+    average_smile = (
+        normalized.groupby(["target_dte", "log_moneyness"], as_index=False)[
+            "surface_iv"
+        ]
+        .mean()
+        .sort_values(["target_dte", "log_moneyness"])
+    )
+    average_smile["total_variance"] = (
+        average_smile["surface_iv"] ** 2
+        * (average_smile["target_dte"] / float(CONFIG.vol.annual_days))
+    )
+
+    smiles = {
+        dte: group.copy()
+        for dte, group in average_smile.groupby("target_dte", sort=True)
+    }
+    points = (
+        pd.concat(raw_points, ignore_index=True)
+        if raw_points
+        else pd.DataFrame(columns=["log_moneyness", "dte", "surface_iv"])
+    )
+    max_dte = CONFIG.vol.surface_raw_point_max_dte
+    if max_dte is not None and not points.empty:
+        points = points[points["dte"] <= max_dte]
+    if len(points) > 20000:
+        points = points.sample(20000, random_state=42)
+
+    output_path = output_dir / "full_sample_vol_surface.png"
+    core.vol_surface.plot_vol_surface(
+        {"points": points, "smiles": smiles},
+        output_path=output_path,
+        title=(
+            f"{CONFIG.data.product} full-sample average fixed-tenor IV surface "
+            "(diagnostic, look-ahead biased)"
+        ),
+        include_raw_points=not points.empty,
+        raw_point_max_dte=max_dte,
+        invert_log_moneyness_axis=True,
+        invert_dte_axis=True,
+        show=False,
+    )
+    (output_dir / "surface_limitations.txt").write_text(
+        "full_sample_vol_surface.png 使用整个回测区间的期权样本汇总平均曲面，"
+        "因此包含前视偏差；它只用于诊断换月跳变和曲面覆盖，不参与逐日交易信号。\n"
+        "逐日信号使用每个交易日当日可见期权链提取的 30 天固定期限 ATM IV "
+        "及其历史分位数。\n",
+        encoding="utf-8",
+    )
+    return output_path
+
+
 def main():
     args = parse_args()
     sync_config(select_runtime_config(args))
@@ -601,7 +809,7 @@ def main():
         flush=True,
     )
 
-    etf_by_date, opt_by_date = load_data()
+    etf_by_date, opt_by_date, hedge_by_date = load_data()
     trading_calendar = core.data_loader.load_etf_trading_calendar()
     enriched_opt_by_date = core.cache.get_enriched_option_chains(
         etf_by_date,
@@ -625,6 +833,7 @@ def main():
         signals,
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
+        hedge_by_date=hedge_by_date,
     )
     reference_config = CONFIG.reference
     benchmark_pnl = None
@@ -639,6 +848,7 @@ def main():
             enable_delta_hedge=reference_config.always_atm_enable_delta_hedge,
             trading_calendar=trading_calendar,
             enriched_opt_by_date=enriched_opt_by_date,
+            hedge_by_date=hedge_by_date,
         )
 
     experiment_pnl = None
@@ -680,6 +890,7 @@ def main():
             features,
             etf_by_date,
             opt_by_date,
+            hedge_by_date,
             trading_calendar,
             enriched_opt_by_date,
             enable_delta_hedge=reference_config.experiment_enable_delta_hedge,
@@ -736,6 +947,9 @@ def main():
         output_path=output_dir / "cumulative_actual_vs_greeks_pnl.png",
         show=False,
     )
+    surface_path = plot_full_sample_vol_surface(output_dir, enriched_opt_by_date)
+    if surface_path is not None:
+        print(f"full-sample vol surface: {surface_path}")
 
     save_summary_files(output_dir, daily_pnl, trades)
     print_summary(daily_pnl, trades)

@@ -18,7 +18,7 @@
   - 最后扩展到完整历史范围，下载脚本放入 `scripts/download/<product>/`，原始数据和整理后的 parquet/csv 放入 `data/<product>/`，避免不同品种混放。
   - 如果成交量不是交易所逐合约真实成交量，而是估算、活跃度或按总量缩放后的结果，必须在下载脚本和对应 config 注释中说明局限性。
 - 整理配置文件：
-  - 每个品种使用独立配置文件，例如 `core/config_50etf.py`、`core/config_zz1000.py`、`core/config_500etf.py`。
+  - 每个品种使用独立配置文件，并统一放在 `core/configs/` 下，例如 `core/configs/config_50etf.py`、`core/configs/config_zz1000.py`、`core/configs/config_500etf.py`。
   - 品种专属的数据路径、合约乘数、回测区间、ATM DTE、成交量过滤、delta hedge 标的路径、默认策略参数都放在该品种配置文件里。
   - `core/config.py` 只负责选择和加载品种配置，不把某个品种的策略参数写死在公共入口里。
 - 接入回测验证：
@@ -36,5 +36,7 @@
   - 查看远端 output 最新目录：`ssh yangziqi@172.16.128.67 "cd /home/yangziqi/strategy/gamma_scalping_v7 && find output -maxdepth 1 -type d -printf '%TY-%Tm-%Td %TH:%TM %p\n' | sort | tail -30"`
   - 查看远端 output 最新文件：`ssh yangziqi@172.16.128.67 "cd /home/yangziqi/strategy/gamma_scalping_v7 && find output -maxdepth 2 -type f | sort | tail -80"`
   - 拉取扫描结果到本地：`scp yangziqi@172.16.128.67:/home/yangziqi/strategy/gamma_scalping_v7/output/<file> .\output\`
+- 本地向远端传文件时，不要传到系统 `/tmp`。临时包传到 `yangziqi` 用户家目录下的 `~/tmp/`，或直接传到远端策略目录 `/home/yangziqi/strategy/gamma_scalping_v7/`；用完后清理对应位置的临时包。
+- 所有远端操作必须只作用于 `yangziqi` 用户空间：ssh/scp 使用 `yangziqi@172.16.128.67`；读写、解压、清理、启动/停止任务只在 `/home/yangziqi/` 下进行；不要使用 `sudo`，不要改系统目录，不要操作其他用户文件或进程。
 - 500ETF 扫描结果通常在远端 `output/optimize_coarse_*.csv`、`output/optimize_fine_*.csv` 和 `output/*500etf*_scan*.log`。读取时先看最新 `optimize_fine_*.csv` 的列名确认方向：`500etf_wide` 通常只有 short 参数；`500etf_full_defense` 会有 long/short 阈值和 `strategy.roll_cooldown_days`。
 - 拉回扫描 CSV 后，先检查行数、`error` 非空数量、排序首行和关键指标，不要只凭日志尾部判断最终结果。
