@@ -3,11 +3,45 @@ import pandas as pd
 from .config import CONFIG
 
 
+LONG_SIGNAL_MODES = {"absolute", "percentile"}
 SHORT_SIGNAL_MODES = {"absolute", "percentile", "low_iv_hv_spread"}
+IV_OBSERVATION_MODES = {"legacy", "simple_atm_absolute", "surface_percentile"}
+
+
+def _iv_observation_mode():
+    mode = getattr(CONFIG.vol, "iv_observation_mode", "legacy")
+    if mode not in IV_OBSERVATION_MODES:
+        raise ValueError(
+            "CONFIG.vol.iv_observation_mode 只能是 "
+            "'legacy'、'simple_atm_absolute' 或 'surface_percentile'"
+        )
+    return mode
+
+
+def _long_signal_mode():
+    """读取买入跨式主信号口径。"""
+    observation_mode = _iv_observation_mode()
+    if observation_mode == "simple_atm_absolute":
+        return "absolute"
+    if observation_mode == "surface_percentile":
+        return "percentile"
+
+    mode = getattr(CONFIG.strategy, "long_signal_mode", "absolute")
+    if mode not in LONG_SIGNAL_MODES:
+        raise ValueError(
+            "CONFIG.strategy.long_signal_mode 只能是 'absolute' 或 'percentile'"
+        )
+    return mode
 
 
 def _short_signal_mode():
     """读取卖出跨式主信号口径。"""
+    observation_mode = _iv_observation_mode()
+    if observation_mode == "simple_atm_absolute":
+        return "absolute"
+    if observation_mode == "surface_percentile":
+        return "percentile"
+
     mode = CONFIG.strategy.short_signal_mode
     if mode not in SHORT_SIGNAL_MODES:
         raise ValueError(
@@ -17,9 +51,61 @@ def _short_signal_mode():
     return mode
 
 
+def _signal_iv(feature_row):
+    """策略使用的 IV：按观察模式在简单 ATM 和曲面 ATM 之间切换。"""
+    if _iv_observation_mode() == "simple_atm_absolute":
+        return feature_row.get("atm_iv", pd.NA)
+
+    value = feature_row.get("signal_iv", pd.NA)
+    if pd.isna(value):
+        value = feature_row.get("atm_iv", pd.NA)
+    return value
+
+
+def _signal_iv_percentile(feature_row):
+    """策略使用 IV 的历史分位数。"""
+    if _iv_observation_mode() == "simple_atm_absolute":
+        return pd.NA
+
+    value = feature_row.get("signal_iv_percentile", pd.NA)
+    if pd.isna(value):
+        value = feature_row.get("atm_iv_percentile", pd.NA)
+    return value
+
+
+def _calc_long_open_signal(feature_row):
+    mode = _long_signal_mode()
+    if mode == "percentile":
+        iv_percentile = _signal_iv_percentile(feature_row)
+        return (
+            pd.notna(iv_percentile)
+            and iv_percentile <= CONFIG.strategy.long_open_iv_percentile_threshold
+        )
+
+    iv = _signal_iv(feature_row)
+    return pd.notna(iv) and iv <= CONFIG.strategy.long_open_iv_threshold
+
+
+def _get_long_close_reason_by_signal(feature_row):
+    mode = _long_signal_mode()
+    if mode == "percentile":
+        iv_percentile = _signal_iv_percentile(feature_row)
+        if (
+            pd.notna(iv_percentile)
+            and iv_percentile >= CONFIG.strategy.long_close_iv_percentile_threshold
+        ):
+            return "iv_percentile_high"
+        return None
+
+    iv = _signal_iv(feature_row)
+    if pd.notna(iv) and iv >= CONFIG.strategy.long_close_iv_threshold:
+        return "iv_high"
+    return None
+
+
 def _calc_low_iv_hv_spread_open_signal(feature_row):
     """低 IV 收租：IV 处于低位，但仍高于 HV 一定安全垫时开仓。"""
-    atm_iv = feature_row.get("atm_iv", pd.NA)
+    atm_iv = _signal_iv(feature_row)
     hv = feature_row.get(CONFIG.strategy.short_low_iv_hv_col, pd.NA)
     if pd.isna(atm_iv) or pd.isna(hv):
         return False
@@ -33,13 +119,15 @@ def _calc_low_iv_hv_spread_open_signal(feature_row):
 
 def _calc_absolute_short_open_signal(feature_row):
     """高 IV 卖波动：达到普通阈值即可开仓，极端高位需先确认 IV 回落。"""
-    atm_iv = feature_row.get("atm_iv", pd.NA)
+    atm_iv = _signal_iv(feature_row)
     if pd.isna(atm_iv) or atm_iv < CONFIG.strategy.short_open_iv_threshold:
         return False
 
     pullback_threshold = CONFIG.strategy.short_open_pullback_iv_threshold
     if pullback_threshold is not None and atm_iv >= pullback_threshold:
-        prev_atm_iv = feature_row.get("prev_atm_iv", pd.NA)
+        prev_atm_iv = feature_row.get("prev_signal_iv", pd.NA)
+        if pd.isna(prev_atm_iv):
+            prev_atm_iv = feature_row.get("prev_atm_iv", pd.NA)
         return pd.notna(prev_atm_iv) and atm_iv < prev_atm_iv
 
     return True
@@ -50,7 +138,7 @@ def _short_open_regime(feature_row):
     mode = _short_signal_mode()
 
     if mode == "percentile":
-        atm_iv_percentile = feature_row.get("atm_iv_percentile", pd.NA)
+        atm_iv_percentile = _signal_iv_percentile(feature_row)
         if (
             pd.notna(atm_iv_percentile)
             and atm_iv_percentile >= CONFIG.strategy.short_open_iv_percentile_threshold
@@ -83,7 +171,7 @@ def _get_short_close_reason_by_signal(feature_row, mode=None):
     mode = mode or _short_signal_mode()
 
     if mode == "percentile":
-        atm_iv_percentile = feature_row.get("atm_iv_percentile", pd.NA)
+        atm_iv_percentile = _signal_iv_percentile(feature_row)
         if (
             pd.notna(atm_iv_percentile)
             and atm_iv_percentile <= CONFIG.strategy.short_close_iv_percentile_threshold
@@ -92,7 +180,7 @@ def _get_short_close_reason_by_signal(feature_row, mode=None):
         return None
 
     if mode == "low_iv_hv_spread":
-        atm_iv = feature_row.get("atm_iv", pd.NA)
+        atm_iv = _signal_iv(feature_row)
         hv = feature_row.get(CONFIG.strategy.short_low_iv_hv_col, pd.NA)
         if pd.isna(atm_iv) or pd.isna(hv):
             return None
@@ -103,16 +191,15 @@ def _get_short_close_reason_by_signal(feature_row, mode=None):
             return "short_low_iv_spread_gone"
         return None
 
-    atm_iv = feature_row.get("atm_iv", pd.NA)
+    atm_iv = _signal_iv(feature_row)
     if pd.notna(atm_iv) and atm_iv <= CONFIG.strategy.short_close_iv_threshold:
         return "short_iv_low"
     return None
 
 
 def calc_entry_target_qty(feature_row, max_qty):
-    """买入跨式：ATM IV 低于开仓阈值时持有固定最大张数。"""
-    atm_iv = feature_row.get("atm_iv", pd.NA)
-    if pd.isna(atm_iv) or atm_iv > CONFIG.strategy.long_open_iv_threshold:
+    """买入跨式：按配置选择绝对 IV 或历史分位数信号。"""
+    if not _calc_long_open_signal(feature_row):
         return 0
     return max_qty
 
@@ -136,9 +223,23 @@ def build_signals(features_df):
         signals_df["atm_iv"] = pd.NA
     if "atm_iv_percentile" not in signals_df.columns:
         signals_df["atm_iv_percentile"] = pd.NA
+    if "signal_iv" not in signals_df.columns:
+        signals_df["signal_iv"] = signals_df["atm_iv"]
+    else:
+        signals_df["signal_iv"] = signals_df["signal_iv"].fillna(signals_df["atm_iv"])
+    if _iv_observation_mode() == "simple_atm_absolute":
+        signals_df["signal_iv"] = signals_df["atm_iv"]
+        signals_df["signal_iv_percentile"] = pd.NA
+    elif "signal_iv_percentile" not in signals_df.columns:
+        signals_df["signal_iv_percentile"] = signals_df["atm_iv_percentile"]
+    else:
+        signals_df["signal_iv_percentile"] = signals_df[
+            "signal_iv_percentile"
+        ].fillna(signals_df["atm_iv_percentile"])
     signals_df["prev_atm_iv"] = signals_df["atm_iv"].shift(1)
+    signals_df["prev_signal_iv"] = signals_df["signal_iv"].shift(1)
 
-    long_open = signals_df["atm_iv"] <= CONFIG.strategy.long_open_iv_threshold
+    long_open = signals_df.apply(_calc_long_open_signal, axis=1)
     short_regime = signals_df.apply(_short_open_regime, axis=1)
 
     signals_df["long_open_signal"] = (
@@ -153,9 +254,9 @@ def build_signals(features_df):
 
 def get_close_reason(feature_row, position_dte):
     """买入跨式在 ATM IV 升高或临近到期时平仓。"""
-    atm_iv = feature_row.get("atm_iv", pd.NA)
-    if pd.notna(atm_iv) and atm_iv >= CONFIG.strategy.long_close_iv_threshold:
-        return "iv_high"
+    close_reason = _get_long_close_reason_by_signal(feature_row)
+    if close_reason is not None:
+        return close_reason
 
     if position_dte <= CONFIG.strategy.min_exit_dte:
         return "near_expiry"

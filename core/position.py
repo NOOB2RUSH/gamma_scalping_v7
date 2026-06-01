@@ -77,6 +77,18 @@ def open_straddle(
     """根据 ATM 选择结果创建跨式仓位对象。"""
     call = atm["call"]
     put = atm["put"]
+    call_underlying = call.get("underlying_order_book_id")
+    put_underlying = put.get("underlying_order_book_id")
+    underlying_order_book_id = call_underlying or put_underlying
+    if (
+        call_underlying is not None
+        and put_underlying is not None
+        and call_underlying != put_underlying
+    ):
+        raise ValueError(
+            "call/put 对应的标的期货合约不一致: "
+            f"{call_underlying} != {put_underlying}"
+        )
     position = {
         "entry_date": date,
         "call_code": call["order_book_id"],
@@ -91,6 +103,7 @@ def open_straddle(
         "entry_put_volume": put.get("volume"),
         "entry_total_volume": (call.get("volume") or 0) + (put.get("volume") or 0),
         "contract_multiplier": call["contract_multiplier"],
+        "underlying_order_book_id": underlying_order_book_id,
         "side": side,
         "short_entry_regime": short_entry_regime,
         "entry_option_value": 0.0,
@@ -121,6 +134,7 @@ def trade_fields(position):
         "expiry": position["expiry"],
         "side": position.get("side", "long"),
         "short_entry_regime": position.get("short_entry_regime"),
+        "underlying_order_book_id": position.get("underlying_order_book_id"),
     }
 
 

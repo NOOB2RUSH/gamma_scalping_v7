@@ -8,12 +8,17 @@ import pandas as pd
 from .config import CONFIG
 
 
+def _iv_observation_mode():
+    return getattr(CONFIG.vol, "iv_observation_mode", "legacy")
+
+
 def _product_label():
     product = str(CONFIG.data.product).lower()
     labels = {
         "50etf": "50ETF (510050)",
+        "300etf": "300ETF (510300)",
         "500etf": "500ETF (510500)",
-        "soymeal": "Soymeal Futures Option (DCE M)",
+        "kc50etf": "STAR 50 ETF (588000)",
         "zz1000": "ZZ1000 Index Option (MO)",
     }
     return labels.get(product, str(CONFIG.data.product))
@@ -91,7 +96,28 @@ def plot_vol_features(
         color="tab:red",
         linewidth=1.5,
     )
-    if CONFIG.strategy.enable_long_straddle:
+    observation_mode = _iv_observation_mode()
+    signal_iv_col = "atm_iv"
+    if observation_mode == "surface_percentile" and "signal_iv" in features_df.columns:
+        signal_iv_col = "signal_iv"
+    elif (
+        observation_mode == "legacy"
+        and getattr(CONFIG.vol, "surface_atm_iv_enabled", False)
+        and "signal_iv" in features_df.columns
+    ):
+        signal_iv_col = "signal_iv"
+    if signal_iv_col != "atm_iv":
+        ax_vol.plot(
+            features_df.index,
+            features_df[signal_iv_col],
+            label=f"Signal IV ({CONFIG.vol.surface_atm_target_dte}D Surface ATM)",
+            color="tab:orange",
+            linewidth=1.4,
+            alpha=0.9,
+        )
+
+    long_mode = getattr(CONFIG.strategy, "long_signal_mode", "absolute")
+    if CONFIG.strategy.enable_long_straddle and long_mode == "absolute":
         ax_vol.axhline(
             CONFIG.strategy.long_open_iv_threshold,
             label=f"Long Open IV Threshold {CONFIG.strategy.long_open_iv_threshold:.2%}",
@@ -132,44 +158,84 @@ def plot_vol_features(
             linestyle="--",
             alpha=0.75,
         )
-    if (
-        CONFIG.strategy.enable_short_straddle
-        and short_mode == "percentile"
-        and "atm_iv_percentile" in features_df.columns
-    ):
+    percentile_col = (
+        "signal_iv_percentile"
+        if observation_mode == "surface_percentile"
+        and "signal_iv_percentile" in features_df.columns
+        else "atm_iv_percentile"
+    )
+    show_percentile = (
+        observation_mode != "simple_atm_absolute"
+        and (
+            (
+                CONFIG.strategy.enable_short_straddle
+                and short_mode == "percentile"
+            )
+            or (
+                CONFIG.strategy.enable_long_straddle
+                and long_mode == "percentile"
+            )
+        )
+        and percentile_col in features_df.columns
+    )
+    if show_percentile:
         ax_percentile = ax_price.twinx()
         ax_percentile.spines["right"].set_position(("axes", 1.06))
         ax_percentile.plot(
             features_df.index,
-            features_df["atm_iv_percentile"],
-            label="ATM IV Percentile",
+            features_df[percentile_col],
+            label="Signal IV Percentile",
             color="tab:purple",
             linewidth=1.1,
             alpha=0.8,
         )
-        ax_percentile.axhline(
-            CONFIG.strategy.short_open_iv_percentile_threshold,
-            label=(
-                "Short Open IV Percentile "
-                f"{CONFIG.strategy.short_open_iv_percentile_threshold:.0%}"
-            ),
-            color="tab:purple",
-            linewidth=1.0,
-            linestyle="--",
-            alpha=0.75,
-        )
-        ax_percentile.axhline(
-            CONFIG.strategy.short_close_iv_percentile_threshold,
-            label=(
-                "Short Close IV Percentile "
-                f"{CONFIG.strategy.short_close_iv_percentile_threshold:.0%}"
-            ),
-            color="tab:brown",
-            linewidth=1.0,
-            linestyle="--",
-            alpha=0.75,
-        )
-        ax_percentile.set_ylabel("ATM IV Percentile")
+        if CONFIG.strategy.enable_long_straddle and long_mode == "percentile":
+            ax_percentile.axhline(
+                CONFIG.strategy.long_open_iv_percentile_threshold,
+                label=(
+                    "Long Open IV Percentile "
+                    f"{CONFIG.strategy.long_open_iv_percentile_threshold:.0%}"
+                ),
+                color="tab:green",
+                linewidth=1.0,
+                linestyle="--",
+                alpha=0.75,
+            )
+            ax_percentile.axhline(
+                CONFIG.strategy.long_close_iv_percentile_threshold,
+                label=(
+                    "Long Close IV Percentile "
+                    f"{CONFIG.strategy.long_close_iv_percentile_threshold:.0%}"
+                ),
+                color="tab:orange",
+                linewidth=1.0,
+                linestyle="--",
+                alpha=0.75,
+            )
+        if CONFIG.strategy.enable_short_straddle and short_mode == "percentile":
+            ax_percentile.axhline(
+                CONFIG.strategy.short_open_iv_percentile_threshold,
+                label=(
+                    "Short Open IV Percentile "
+                    f"{CONFIG.strategy.short_open_iv_percentile_threshold:.0%}"
+                ),
+                color="tab:purple",
+                linewidth=1.0,
+                linestyle="--",
+                alpha=0.75,
+            )
+            ax_percentile.axhline(
+                CONFIG.strategy.short_close_iv_percentile_threshold,
+                label=(
+                    "Short Close IV Percentile "
+                    f"{CONFIG.strategy.short_close_iv_percentile_threshold:.0%}"
+                ),
+                color="tab:brown",
+                linewidth=1.0,
+                linestyle="--",
+                alpha=0.75,
+            )
+        ax_percentile.set_ylabel("Signal IV Percentile")
         ax_percentile.set_ylim(-0.02, 1.02)
 
     if "yz_hv20" in features_df.columns:
