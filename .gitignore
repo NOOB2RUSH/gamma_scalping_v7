@@ -6,4 +6,6 @@ __pycache__/
 *.py[cod]
 
 data/
+live_hold/
 output/
+state/
