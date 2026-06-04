@@ -36,8 +36,9 @@ def fetch_quote_snapshot(product, source="local", date="latest"):
     """Save one quote snapshot and return its metadata.
 
     `source=local` snapshots existing parquet files. `source=akshare` pulls the
-    latest SSE ETF option quote through AKShare, writes canonical daily parquet
-    files, and also writes immutable live quote snapshots.
+    latest SSE ETF option quote through AKShare and writes immutable live quote
+    snapshots. Canonical research/backtest parquet files are not modified by
+    live quote pulls.
     """
     if source == "akshare":
         return _fetch_akshare_sse_snapshot(product)
@@ -97,17 +98,7 @@ def _fetch_akshare_sse_snapshot(product):
         ["maturity_date", "strike_price", "option_type", "order_book_id"]
     ).reset_index(drop=True)
 
-    etf_dir = project_path(config.data.etf_dir)
-    opt_dir = project_path(config.data.opt_dir)
-    etf_dir.mkdir(parents=True, exist_ok=True)
-    opt_dir.mkdir(parents=True, exist_ok=True)
-
     date_text = quote_date.strftime("%Y-%m-%d")
-    etf_canonical = etf_dir / f"{spec.etf_file_prefix}_{date_text}_price.parquet"
-    opt_canonical = opt_dir / f"{spec.option_file_prefix}_{date_text}_chain.parquet"
-    etf_df.to_parquet(etf_canonical, index=False)
-    chain_df.to_parquet(opt_canonical, index=False)
-
     out_dir, time_part, stamp = storage.quote_snapshot_dir(product)
     etf_out = out_dir / f"{time_part}_etf.parquet"
     opt_out = out_dir / f"{time_part}_option_chain.parquet"
@@ -124,8 +115,9 @@ def _fetch_akshare_sse_snapshot(product):
         "snapshot_stamp": stamp,
         "quote_date": date_text,
         "etf_symbol": spec.etf_symbol,
-        "etf_canonical": str(etf_canonical),
-        "option_canonical": str(opt_canonical),
+        "etf_canonical": None,
+        "option_canonical": None,
+        "canonical_written": False,
         "etf_snapshot": str(etf_out),
         "option_snapshot": str(opt_out),
         "option_rows": len(chain_df),

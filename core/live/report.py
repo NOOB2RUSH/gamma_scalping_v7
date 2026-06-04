@@ -111,14 +111,14 @@ def _format_advice_item(item):
             )
         ]
 
-    if action == "PROJECTED_DELTA_HEDGE":
+    if action == "FINAL_DELTA_HEDGE":
         trade_qty = item.get("trade_etf_qty")
         direction = _trade_direction(trade_qty)
         return [
             (
-                f"PROJECTED_DELTA_HEDGE trigger={item.get('trigger_action')} "
-                f"side={side} direction={direction} qty={_fmt(trade_qty)} "
-                f"projected_option_delta={_fmt(item.get('projected_option_delta'))} "
+                f"FINAL_DELTA_HEDGE after={item.get('after_actions')} "
+                f"direction={direction} qty={_fmt(trade_qty)} "
+                f"planned_option_delta={_fmt(item.get('planned_option_delta'))} "
                 f"target_hedge_qty={_fmt(item.get('target_hedge_qty'))} "
                 f"current_hedge_qty={_fmt(item.get('current_hedge_qty'))} "
                 f"price={_fmt(item.get('estimated_price'))} "

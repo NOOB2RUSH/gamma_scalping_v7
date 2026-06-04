@@ -12,13 +12,32 @@ def parse_args():
     parser.add_argument("--product", choices=core.config.available_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--date", default=None)
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Deprecated; signal generation is always read-only.",
+    )
+    parser.add_argument(
+        "--write-state",
+        action="store_true",
+        help="Deprecated and unsupported; account changes must come from imports.",
+    )
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    payload = signal_engine.generate_signal(args.product, args.account_id, args.date)
+    if args.write_state:
+        raise SystemExit(
+            "--write-state is unsupported. Signal generation is always read-only; "
+            "update holdings and fills through broker import workflows."
+        )
+    payload = signal_engine.generate_signal(
+        args.product,
+        args.account_id,
+        args.date,
+    )
     report_path = report.write_signal_report(args.product, payload)
     json_path = report_path.with_suffix(".json")
     storage.write_json(json_path, payload)

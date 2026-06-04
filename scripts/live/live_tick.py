@@ -23,12 +23,14 @@ def main():
         args.product,
         args.account_id,
         snapshot["quote_date"],
+        quote_snapshot=snapshot,
     )
     payload["quote_snapshot"] = snapshot
     report_path = report.write_signal_report(args.product, payload)
     storage.write_json(report_path.with_suffix(".json"), payload)
     print(f"quote_date={snapshot['quote_date']}")
     print(f"signal_report={report_path}")
+    print("read_only=True")
     for line in report.format_signal_summary(payload):
         print(line)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from pathlib import Path
 
 import pandas as pd
 
@@ -12,10 +13,15 @@ from . import storage
 from .runtime import load_product_config
 
 
-def generate_signal(product, account_id="default", date=None):
+def generate_signal(product, account_id="default", date=None, quote_snapshot=None, read_only=True):
     config = load_product_config(product)
     live_account = account_store.load_account(product, account_id=account_id)
-    market = _load_market_context(config, date)
+    market = _load_market_context(
+        config,
+        date,
+        quote_snapshot=quote_snapshot,
+        persist_feature_history=False,
+    )
 
     feature_row = market["signal_row"]
     spot = float(feature_row["close"])
@@ -28,7 +34,7 @@ def generate_signal(product, account_id="default", date=None):
         market["date"],
     )
 
-    advice = []
+    strategy_advice = []
     position_greeks = []
     position_greeks_by_side = {}
     position_values = []
@@ -37,16 +43,19 @@ def generate_signal(product, account_id="default", date=None):
         if position is None:
             continue
         side_advice, greeks, option_value = _advice_for_existing_position(
+            product,
             side,
             position,
             chain_df,
             feature_row,
+            market["signals"],
+            market["date"],
             atm,
             spot,
             live_account.strategy_state,
             config,
         )
-        advice.extend(side_advice)
+        strategy_advice.extend(side_advice)
         if greeks is not None:
             position_greeks.append(greeks)
             position_greeks_by_side[side] = greeks
@@ -54,7 +63,7 @@ def generate_signal(product, account_id="default", date=None):
             position_values.append(option_value)
 
     if all(value is None for value in live_account.positions.values()):
-        advice.extend(
+        strategy_advice.extend(
             _entry_advice(
                 config,
                 feature_row,
@@ -65,16 +74,15 @@ def generate_signal(product, account_id="default", date=None):
         )
 
     account_greeks = core.backtester.combine_greeks(position_greeks)
-    advice.extend(_hedge_advice(config, live_account, account_greeks, spot, atm))
-    advice.extend(
-        _projected_hedge_advices(
-            config,
-            live_account,
-            chain_df,
-            spot,
-            advice,
-            position_greeks_by_side,
-        )
+    advice, planned_greeks = _build_execution_plan(
+        config,
+        live_account,
+        chain_df,
+        spot,
+        atm,
+        strategy_advice,
+        account_greeks,
+        position_greeks_by_side,
     )
 
     if not advice:
@@ -86,9 +94,6 @@ def generate_signal(product, account_id="default", date=None):
             }
         )
 
-    if state_changed:
-        account_store.save_account(live_account)
-
     return {
         "product": product,
         "account_id": account_id,
@@ -97,30 +102,56 @@ def generate_signal(product, account_id="default", date=None):
         "account": live_account.to_dict(),
         "feature": _feature_summary(feature_row),
         "account_greeks": account_greeks,
+        "planned_account_greeks": planned_greeks,
         "account_delta_after_hedge": account_greeks["delta"] + live_account.hedge.qty,
         "estimated_option_value": sum(position_values),
         "strategy_state": live_account.strategy_state.to_dict(),
         "advice": advice,
-        "data_warning": market["data_warning"],
+        "data_warning": {
+            **market["data_warning"],
+            "read_only_signal": True,
+            "state_changed_in_memory": state_changed,
+        },
     }
 
 
-def _load_market_context(config, date):
+def preview_signal(product, account_id="default", date=None, quote_snapshot=None):
+    return generate_signal(
+        product,
+        account_id=account_id,
+        date=date,
+        quote_snapshot=quote_snapshot,
+        read_only=True,
+    )
+
+
+def _load_market_context(config, date, quote_snapshot=None, persist_feature_history=True):
     start = config.backtest.start
     end = config.backtest.end if date is None else date
     etf_by_date = core.data_loader.load_etf_series(start, end)
     trading_calendar = core.data_loader.load_etf_trading_calendar()
-    latest_date = _resolve_latest_signal_date(config, etf_by_date, date)
+    data_mode = "daily_eod_reference_incremental"
 
-    latest_opt_by_date = core.data_loader.load_opt_series(latest_date, latest_date)
-    latest_hedge_by_date = core.data_loader.load_hedge_series(
-        latest_date,
-        latest_date,
-    )
-    latest_opt_by_date = core.data_loader.attach_underlying_prices(
-        latest_opt_by_date,
-        latest_hedge_by_date,
-    )
+    if quote_snapshot is not None:
+        latest_date = pd.Timestamp(quote_snapshot["quote_date"]).normalize()
+        etf_by_date[latest_date], latest_opt_by_date = _load_snapshot_quote_series(
+            quote_snapshot,
+            latest_date,
+        )
+        trading_calendar = _append_calendar_date(trading_calendar, latest_date)
+        data_mode = "live_snapshot_incremental"
+    else:
+        latest_date = _resolve_latest_signal_date(config, etf_by_date, date)
+        latest_opt_by_date = core.data_loader.load_opt_series(latest_date, latest_date)
+        latest_hedge_by_date = core.data_loader.load_hedge_series(
+            latest_date,
+            latest_date,
+        )
+        latest_opt_by_date = core.data_loader.attach_underlying_prices(
+            latest_opt_by_date,
+            latest_hedge_by_date,
+        )
+
     latest_enriched = _build_latest_enriched_chain(
         etf_by_date,
         latest_opt_by_date,
@@ -143,6 +174,7 @@ def _load_market_context(config, date):
             trading_calendar,
             start,
             latest_date,
+            persist=persist_feature_history,
         )
         seeded_history = True
 
@@ -151,6 +183,7 @@ def _load_market_context(config, date):
         history,
         latest_features,
         latest_date,
+        persist=persist_feature_history,
     )
     signals = core.strategy.build_signals(features)
     if latest_date not in signals.index:
@@ -163,10 +196,32 @@ def _load_market_context(config, date):
         "signals": signals,
         "data_warning": {
             "latest_signal_date": str(latest_date.date()),
-            "mode": "daily_eod_reference_incremental",
+            "mode": data_mode,
             "seeded_feature_history": seeded_history,
+            "read_only": not persist_feature_history,
         },
     }
+
+
+def _load_snapshot_quote_series(quote_snapshot, latest_date):
+    etf_path = quote_snapshot.get("etf_snapshot")
+    opt_path = quote_snapshot.get("option_snapshot")
+    if not etf_path or not opt_path:
+        raise ValueError("quote_snapshot must include etf_snapshot and option_snapshot.")
+
+    etf_df = pd.read_parquet(etf_path)
+    chain_df = pd.read_parquet(opt_path)
+    if "date" not in chain_df.columns:
+        chain_df.insert(0, "date", latest_date)
+    else:
+        chain_df["date"] = pd.to_datetime(chain_df["date"]).fillna(latest_date)
+    chain_df = core.data_loader._ensure_option_underlying_id(chain_df)
+    return etf_df, {latest_date: chain_df}
+
+
+def _append_calendar_date(trading_calendar, latest_date):
+    dates = pd.DatetimeIndex(pd.to_datetime(trading_calendar)).normalize()
+    return pd.DatetimeIndex(sorted(set(dates) | {pd.Timestamp(latest_date).normalize()}))
 
 
 def _resolve_latest_signal_date(config, etf_by_date, date):
@@ -227,7 +282,7 @@ def _save_feature_history(product, features):
             time.sleep(0.2)
 
 
-def _seed_feature_history(config, etf_by_date, trading_calendar, start, latest_date):
+def _seed_feature_history(config, etf_by_date, trading_calendar, start, latest_date, persist=True):
     """Build the rolling live feature store once.
 
     This may use the slower historical cache on the first live run. Subsequent
@@ -251,18 +306,20 @@ def _seed_feature_history(config, etf_by_date, trading_calendar, start, latest_d
         start,
         latest_date,
     )
-    _save_feature_history(config.data.product, features)
+    if persist:
+        _save_feature_history(config.data.product, features)
     return features
 
 
-def _merge_latest_features(product, history, latest_features, latest_date):
+def _merge_latest_features(product, history, latest_features, latest_date, persist=True):
     latest_features = latest_features.copy()
     latest_features.index = pd.to_datetime(latest_features.index)
     latest_row = latest_features.loc[[latest_date]]
     history = history[history.index != latest_date]
     combined = pd.concat([history, latest_row], axis=0).sort_index()
     combined = _refresh_signal_columns(combined)
-    _save_feature_history(product, combined)
+    if persist:
+        _save_feature_history(product, combined)
     return combined
 
 
@@ -397,6 +454,150 @@ def _strike_differs(left, right):
         return True
 
 
+def _historical_strike_mismatch(product, side, position, signals, latest_date):
+    latest_date = pd.Timestamp(latest_date).normalize()
+    entry_date = _date_or_none(position.get("entry_date"))
+    if entry_date is None:
+        raise ValueError(
+            f"Cannot evaluate roll mismatch for {side}: current position has no entry_date."
+        )
+
+    indexed = signals.copy()
+    indexed.index = pd.DatetimeIndex(pd.to_datetime(indexed.index)).normalize()
+    trading_dates = pd.DatetimeIndex(sorted(set(indexed.index)))
+    dates = [
+        date
+        for date in trading_dates
+        if entry_date <= date <= latest_date
+    ]
+    if not dates:
+        raise ValueError(
+            f"Cannot evaluate roll mismatch for {side}: no signal rows between "
+            f"{entry_date.date()} and {latest_date.date()}."
+        )
+
+    snapshots = _holding_snapshot_files_by_date()
+    consecutive = 0
+    trace = []
+    for date in dates:
+        date_text = str(date.date())
+        path = snapshots.get(date_text)
+        if path is None:
+            raise ValueError(
+                "Missing broker option holding snapshot for roll mismatch check: "
+                f"date={date_text}, expected live_hold/实时持仓*.csv. "
+                "No strategy_state fallback is used."
+            )
+
+        row = indexed.loc[date]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        atm_strike = row.get("atm_strike", pd.NA)
+        if pd.isna(atm_strike):
+            raise ValueError(
+                "Missing ATM strike for roll mismatch check: "
+                f"date={date_text}. No strategy_state fallback is used."
+            )
+
+        if not _holding_snapshot_contains_position(path, position, side):
+            raise ValueError(
+                "Broker holding snapshot does not contain the current live position "
+                "during roll mismatch check: "
+                f"date={date_text}, side={side}, "
+                f"call={position.get('call_code')}, put={position.get('put_code')}, "
+                f"file={path}. No strategy_state fallback is used."
+            )
+
+        differs = _strike_differs(position.get("strike"), atm_strike)
+        consecutive = consecutive + 1 if differs else 0
+        trace.append(
+            {
+                "date": date_text,
+                "holding_file": str(path),
+                "position_strike": float(position.get("strike")),
+                "atm_strike": float(atm_strike),
+                "mismatch": bool(differs),
+                "consecutive_mismatch_days": int(consecutive),
+            }
+        )
+
+    return {"days": int(consecutive), "trace": trace}
+
+
+def _holding_snapshot_files_by_date():
+    live_hold_dir = storage.PROJECT_ROOT / "live_hold"
+    files_by_date = {}
+    for path in sorted(live_hold_dir.glob("实时持仓*.csv"), key=lambda item: item.stat().st_mtime):
+        date_text = _date_from_filename(path)
+        if date_text is None:
+            continue
+        files_by_date[date_text] = path
+    return files_by_date
+
+
+def _holding_snapshot_contains_position(path, position, side):
+    df = _read_export_csv(path)
+    required = {"合约代码", "总持仓"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Holding snapshot {path} missing columns: {sorted(missing)}")
+
+    call_code = str(position.get("call_code"))
+    put_code = str(position.get("put_code"))
+    call_ok = False
+    put_ok = False
+    for _, row in df.iterrows():
+        code = str(row.get("合约代码", "")).strip()
+        qty = _number(row.get("总持仓"), 0.0) or 0.0
+        if qty <= 0:
+            continue
+        row_side = _side_from_holding_snapshot_row(row)
+        if row_side != side:
+            continue
+        if code == call_code:
+            call_ok = True
+        if code == put_code:
+            put_ok = True
+    return call_ok and put_ok
+
+
+def _side_from_holding_snapshot_row(row):
+    buy_sell = str(row.get("买卖", "")).strip()
+    position_type = str(row.get("持仓类型", "")).strip()
+    if "卖" in buy_sell or "义务" in position_type:
+        return "short"
+    return "long"
+
+
+def _read_export_csv(path):
+    for encoding in ["utf-8-sig", "gbk", "gb18030"]:
+        try:
+            return pd.read_csv(path, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path)
+
+
+def _number(value, default=None):
+    if value is None or pd.isna(value):
+        return default
+    text = str(value).strip().replace(",", "").replace("%", "")
+    if text in {"", "--", "待设置", "全部"}:
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+def _date_from_filename(path):
+    match = Path(path).name
+    parsed = pd.Series([match]).str.extract(r"(20\d{2})_(\d{2})_(\d{2})").iloc[0]
+    if parsed.isna().any():
+        return None
+    return "-".join(str(item) for item in parsed)
+
+
 def _entry_advice(config, feature_row, atm, spot, strategy_state):
     if atm is None:
         return [
@@ -468,10 +669,13 @@ def _open_advice(action, side, qty, atm, spot):
 
 
 def _advice_for_existing_position(
+    product,
     side,
     position,
     chain_df,
     feature_row,
+    signals,
+    latest_date,
     atm,
     spot,
     strategy_state,
@@ -515,21 +719,23 @@ def _advice_for_existing_position(
 
     if close_reason:
         advice.append(_close_advice(side, position, call_row, put_row, option_value, close_reason))
-
-    roll_payload = _roll_payload(
-        config,
-        side,
-        position,
-        chain_df,
-        feature_row,
-        atm,
-        spot,
-        position_dte,
-        strategy_state,
-    )
-    if roll_payload:
-        advice.append(
-            {
+    else:
+        roll_payload = _roll_payload(
+            config,
+            product,
+            side,
+            position,
+            chain_df,
+            feature_row,
+            signals,
+            latest_date,
+            atm,
+            spot,
+            position_dte,
+            strategy_state,
+        )
+        if roll_payload:
+            item = {
                 "action": "ROLL_SHORT_STRADDLE" if side == "short" else "ROLL_LONG_STRADDLE",
                 "priority": "action",
                 "side": side,
@@ -540,7 +746,10 @@ def _advice_for_existing_position(
                 "current_dte": position_dte,
                 **roll_payload,
             }
-        )
+            if item.get("target_call_code") is None or item.get("target_put_code") is None:
+                item["action"] = "DATA_WARNING"
+                item["priority"] = "warning"
+            advice.append(item)
 
     return advice, greeks, core.position.signed_value(position, call_row, put_row)
 
@@ -567,10 +776,13 @@ def _close_advice(side, position, call_row, put_row, option_value, reason):
 
 def _roll_payload(
     config,
+    product,
     side,
     position,
     chain_df,
     feature_row,
+    signals,
+    latest_date,
     atm,
     spot,
     position_dte,
@@ -582,10 +794,20 @@ def _roll_payload(
 
     feature_atm_strike = feature_row.get("atm_strike", pd.NA)
     if pd.isna(feature_atm_strike):
-        return None
+        raise ValueError(
+            "Missing current ATM strike for roll mismatch check. "
+            "No strategy_state fallback is used."
+        )
 
     dte_too_low = position_dte <= config.strategy.roll_dte_threshold
-    mismatch_days = int(strategy_state.strike_mismatch_days.get(side, 0) or 0)
+    mismatch = _historical_strike_mismatch(
+        product,
+        side,
+        position,
+        signals,
+        latest_date,
+    )
+    mismatch_days = mismatch["days"]
     strike_roll_ready = (
         _strike_differs(position.get("strike"), feature_atm_strike)
         and mismatch_days >= config.strategy.roll_strike_mismatch_days
@@ -607,6 +829,8 @@ def _roll_payload(
             "reason": "roll_condition_active_but_no_valid_target_atm",
             "roll_cooldown_left": cooldown_left,
             "strike_mismatch_days": mismatch_days,
+            "strike_mismatch_days_source": "broker_holding_history",
+            "strike_mismatch_trace": mismatch["trace"],
             "target_strike": None,
             "target_expiry": None,
         }
@@ -620,6 +844,8 @@ def _roll_payload(
         "reason": "+".join(reasons),
         "roll_cooldown_left": cooldown_left,
         "strike_mismatch_days": mismatch_days,
+        "strike_mismatch_days_source": "broker_holding_history",
+        "strike_mismatch_trace": mismatch["trace"],
         "target_call_code": target_atm["call"]["order_book_id"],
         "target_put_code": target_atm["put"]["order_book_id"],
         "target_strike": float(target_atm["strike"]),
@@ -635,6 +861,110 @@ def _entry_target_qty(feature_row, max_qty, side):
     if side == "short":
         return core.strategy.calc_short_entry_target_qty(feature_row, max_qty)
     return core.strategy.calc_entry_target_qty(feature_row, max_qty)
+
+
+def _build_execution_plan(
+    config,
+    live_account,
+    chain_df,
+    spot,
+    atm,
+    strategy_advice,
+    account_greeks,
+    current_greeks_by_side,
+):
+    plan = list(strategy_advice)
+    option_actions = [
+        item
+        for item in plan
+        if item.get("priority") == "action"
+        and _is_option_execution_action(item.get("action"))
+    ]
+    if not option_actions:
+        plan.extend(_hedge_advice(config, live_account, account_greeks, spot, atm))
+        return plan, account_greeks
+
+    planned_greeks = _project_greeks_after_plan(
+        option_actions,
+        chain_df,
+        current_greeks_by_side,
+    )
+    if planned_greeks is None:
+        return plan, account_greeks
+
+    final_hedge = _final_hedge_advice(
+        config,
+        live_account,
+        planned_greeks,
+        spot,
+        option_actions,
+        chain_df,
+        atm,
+    )
+    if final_hedge is not None:
+        plan.append(final_hedge)
+    return plan, planned_greeks
+
+
+def _is_option_execution_action(action):
+    if action is None:
+        return False
+    return (
+        action.startswith("OPEN_")
+        or action.startswith("ROLL_")
+        or action.startswith("CLOSE_")
+    )
+
+
+def _project_greeks_after_plan(option_actions, chain_df, current_greeks_by_side):
+    projected_by_side = dict(current_greeks_by_side)
+    for item in option_actions:
+        action = item.get("action")
+        side = item.get("side")
+        if side not in account_store.POSITION_SIDES:
+            continue
+
+        if action.startswith("CLOSE_"):
+            projected_by_side.pop(side, None)
+            continue
+
+        leg_fields = _planned_leg_fields(item)
+        if leg_fields is None:
+            return None
+        call_code, put_code, call_qty, put_qty = leg_fields
+        try:
+            call_row = _chain_row(chain_df, call_code)
+            put_row = _chain_row(chain_df, put_code)
+        except IndexError:
+            return None
+
+        projected_by_side[side] = core.strategy.calc_position_greeks(
+            call_row,
+            put_row,
+            int(call_qty or 0),
+            int(put_qty or 0),
+            side=side,
+        )
+    return core.backtester.combine_greeks(projected_by_side.values())
+
+
+def _planned_leg_fields(item):
+    action = item.get("action")
+    if action.startswith("OPEN_"):
+        return (
+            item.get("call_code"),
+            item.get("put_code"),
+            item.get("call_qty"),
+            item.get("put_qty"),
+        )
+    if action.startswith("ROLL_"):
+        return (
+            item.get("target_call_code"),
+            item.get("target_put_code"),
+            item.get("target_call_qty"),
+            item.get("target_put_qty"),
+        )
+    return None
 
 
 def _hedge_advice(config, live_account, greeks, spot, atm):
@@ -672,135 +1002,70 @@ def _hedge_advice(config, live_account, greeks, spot, atm):
     ]
 
 
-def _projected_hedge_advices(
+def _final_hedge_advice(
     config,
     live_account,
-    chain_df,
+    planned_greeks,
     spot,
-    advice,
-    current_greeks_by_side,
+    option_actions,
+    chain_df,
+    atm,
 ):
     if not config.strategy.enable_delta_hedge:
-        return []
-
-    result = []
-    for item in advice:
-        action = item.get("action")
-        if action is None or action in {"DELTA_HEDGE", "PROJECTED_DELTA_HEDGE"}:
-            continue
-        projection = _project_greeks_after_advice(
-            item,
-            chain_df,
-            current_greeks_by_side,
-        )
-        if projection is None:
-            continue
-        projected_greeks, target_call_row, target_put_row = projection
-        projected = _projected_hedge_advice(
-            item,
-            live_account,
-            projected_greeks,
-            spot,
-            target_call_row,
-            target_put_row,
-        )
-        if projected is not None:
-            result.append(projected)
-    return result
-
-
-def _project_greeks_after_advice(item, chain_df, current_greeks_by_side):
-    action = item.get("action")
-    side = item.get("side")
-    if side not in account_store.POSITION_SIDES:
         return None
 
-    if action.startswith("OPEN_"):
-        call_code = item.get("call_code")
-        put_code = item.get("put_code")
-        call_qty = item.get("call_qty")
-        put_qty = item.get("put_qty")
-    elif action.startswith("ROLL_"):
-        call_code = item.get("target_call_code")
-        put_code = item.get("target_put_code")
-        call_qty = item.get("target_call_qty")
-        put_qty = item.get("target_put_qty")
-    elif action.startswith("CLOSE_"):
-        projected = [
-            greeks
-            for item_side, greeks in current_greeks_by_side.items()
-            if item_side != side
-        ]
-        return core.backtester.combine_greeks(projected), None, None
-    else:
+    planned_option_delta = float(planned_greeks["delta"])
+    planned_account_delta = planned_option_delta + live_account.hedge.qty
+    tolerance = max(1.0, abs(planned_option_delta) * 0.05)
+    if abs(planned_account_delta) <= tolerance:
         return None
 
-    if call_code is None or put_code is None:
-        return None
-    try:
-        call_row = _chain_row(chain_df, call_code)
-        put_row = _chain_row(chain_df, put_code)
-    except IndexError:
-        return None
-
-    projected = [
-        greeks
-        for item_side, greeks in current_greeks_by_side.items()
-        if item_side != side
-    ]
-    projected.append(
-        core.strategy.calc_position_greeks(
-            call_row,
-            put_row,
-            int(call_qty or 0),
-            int(put_qty or 0),
-            side=side,
-        )
-    )
-    return core.backtester.combine_greeks(projected), call_row, put_row
-
-
-def _projected_hedge_advice(
-    trigger_item,
-    live_account,
-    projected_greeks,
-    spot,
-    target_call_row=None,
-    target_put_row=None,
-):
-    projected_option_delta = float(projected_greeks["delta"])
-    projected_account_delta = projected_option_delta + live_account.hedge.qty
-    tolerance = max(1.0, abs(projected_option_delta) * 0.05)
-    if abs(projected_account_delta) <= tolerance:
-        return None
-
-    target_qty = -projected_option_delta
+    target_qty = -planned_option_delta
     trade_qty = target_qty - live_account.hedge.qty
     return {
-        "action": "PROJECTED_DELTA_HEDGE",
+        "action": "FINAL_DELTA_HEDGE",
         "priority": "action",
-        "side": trigger_item.get("side"),
         "reason": (
-            "If the preceding strategy action is executed, projected account "
-            "delta exceeds tolerance."
+            "After executing the option plan, projected account delta exceeds "
+            "tolerance."
         ),
-        "trigger_action": trigger_item.get("action"),
-        "trigger_side": trigger_item.get("side"),
-        "projected_option_delta": projected_option_delta,
+        "after_actions": [item.get("action") for item in option_actions],
+        "planned_option_delta": planned_option_delta,
         "current_hedge_qty": live_account.hedge.qty,
-        "projected_account_delta": projected_account_delta,
+        "planned_account_delta": planned_account_delta,
         "target_hedge_qty": target_qty,
         "trade_etf_qty": trade_qty,
         "estimated_price": spot,
-        "underlying_order_book_id": _projected_underlying_id(
-            target_call_row,
-            target_put_row,
+        "underlying_order_book_id": _underlying_id_after_plan(
+            option_actions,
+            chain_df,
+            atm,
         ),
-        "projected_account_gamma": projected_greeks["gamma"],
-        "projected_account_vega": projected_greeks["vega"],
-        "projected_account_theta": projected_greeks["theta"],
+        "planned_account_gamma": planned_greeks["gamma"],
+        "planned_account_vega": planned_greeks["vega"],
+        "planned_account_theta": planned_greeks["theta"],
         "hedge_tolerance": tolerance,
     }
+
+
+def _underlying_id_after_plan(option_actions, chain_df, atm):
+    for item in reversed(option_actions):
+        leg_fields = _planned_leg_fields(item)
+        if leg_fields is None:
+            continue
+        call_code, put_code, _, _ = leg_fields
+        if call_code is None or put_code is None:
+            continue
+        try:
+            return _projected_underlying_id(
+                _chain_row(chain_df, call_code),
+                _chain_row(chain_df, put_code),
+            )
+        except IndexError:
+            continue
+    if atm is not None:
+        return _projected_underlying_id(atm.get("call"), atm.get("put"))
+    return None
 
 
 def _chain_row(chain_df, order_book_id):

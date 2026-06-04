@@ -32,6 +32,11 @@ def parse_args():
         help="Do not write report files.",
     )
     parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Do not update cumulative account/position history CSV files.",
+    )
+    parser.add_argument(
         "--format",
         choices=["excel", "csv", "both"],
         default="excel",
@@ -49,6 +54,7 @@ def main():
         source=args.source,
         date=args.date,
         all_trades=args.all_trades,
+        persist_history=not args.no_history,
     )
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))

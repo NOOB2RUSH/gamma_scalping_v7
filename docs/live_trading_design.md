@@ -139,6 +139,25 @@ through reconciliation. Close/roll confirmations cannot be inferred safely from
 a holding snapshot alone when the position is absent or changed; those still
 need explicit fill JSON or a real transaction export.
 
+## ETF Hedge Snapshot Import
+
+`import_hedge.py` reads the newest `证券持仓查询*.csv` and
+`证券委托查询_实时成交*.csv` under `live_hold/` by default and can auto-confirm
+the ETF delta hedge state into the shadow account.
+
+```bash
+python scripts/live/import_hedge.py --product kc50etf --dry-run
+python scripts/live/import_hedge.py --product kc50etf
+```
+
+The holding export supplies the final ETF hedge quantity, cost price, market
+value, and ETF code. The trade export supplies the report-date ETF executions
+used to estimate `cash_delta`. The generated fill is a `delta_hedge` fill: it
+sets the local hedge to the broker-reported target quantity while recording the
+matched ETF execution rows for audit. If no matching trade rows are found,
+`cash_delta` falls back to an estimate from holding cost and the import result
+emits a warning.
+
 ## Live Account Report
 
 `live_account_report.py` produces the operator-facing account status report. It
@@ -164,12 +183,13 @@ and CSV outputs. Current option positions are revalued against current mid
 prices, with IV and Greeks calculated through the same project valuation
 functions used by live signals.
 
-## Projected Hedge Advice
+## Planned Hedge Advice
 
 Live signals only mutate cash and positions after manual fill confirmation.
-When an open, close, or roll advice is generated, live mode also emits
-`PROJECTED_DELTA_HEDGE` if executing that advice would leave projected account
-delta outside tolerance. This projected hedge is an execution hint for the
+When open, close, or roll advice is generated, live mode treats those option
+actions as an execution plan first. It then simulates the plan in order and
+emits one final `FINAL_DELTA_HEDGE` only if the post-plan account delta would
+remain outside tolerance. This final hedge is an execution hint for the
 operator; it is not written into the shadow account until the hedge fill is
 confirmed.
 

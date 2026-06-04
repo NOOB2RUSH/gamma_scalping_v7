@@ -31,6 +31,19 @@ def import_holding_file(
     metadata = _load_contract_metadata(config, codes)
 
     warnings = []
+    if not rows and not include_existing:
+        existing_qty = _total_positive_holding_qty(raw)
+        if existing_qty > 0:
+            warnings.append(
+                {
+                    "reason": (
+                        "holding_snapshot_has_positions_but_today_open_qty_is_zero; "
+                        "use include_existing/导入总持仓 when seeding or repairing "
+                        "the local shadow account"
+                    ),
+                    "total_positive_holding_qty": existing_qty,
+                }
+            )
     candidates = _build_straddle_candidates(
         rows,
         metadata,
@@ -148,6 +161,15 @@ def _normalize_rows(df, include_existing):
             }
         )
     return rows
+
+
+def _total_positive_holding_qty(df):
+    if "总持仓" not in df.columns:
+        return 0
+    total = 0
+    for _, row in df.iterrows():
+        total += int(_number(row.get("总持仓"), 0) or 0)
+    return total
 
 
 def _side_from_row(row):

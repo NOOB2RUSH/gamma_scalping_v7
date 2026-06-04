@@ -18,6 +18,7 @@ CODE_EXCLUDES = [
     "*.pyc",
     "output/",
     "data/",
+    "state/",
 ]
 
 ALL_EXCLUDES = [
@@ -27,6 +28,7 @@ ALL_EXCLUDES = [
     "__pycache__/",
     "*.pyc",
     "output/",
+    "state/",
 ]
 
 

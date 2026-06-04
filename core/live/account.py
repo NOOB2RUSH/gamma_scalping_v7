@@ -164,6 +164,16 @@ def _ensure_column(conn, table, column, column_type):
 def initialize_account(product, initial_cash, db_path=None, account_id="default", reset=False):
     db_path = db_path or storage.account_db_path(product)
     with connect(db_path) as conn:
+        existing = conn.execute(
+            "select 1 from account_state where account_id = ?",
+            (account_id,),
+        ).fetchone()
+        if existing is not None and not reset:
+            raise ValueError(
+                f"Live account already exists: {product}/{account_id}. "
+                "Use --reset to reinitialize and clear positions/fills, or use a "
+                "cash_adjustment fill to change cash."
+            )
         if reset:
             conn.execute("delete from account_state where account_id = ?", (account_id,))
             conn.execute("delete from option_positions where account_id = ?", (account_id,))
@@ -215,33 +225,125 @@ def initialize_account(product, initial_cash, db_path=None, account_id="default"
 def load_account(product, db_path=None, account_id="default"):
     db_path = db_path or storage.account_db_path(product)
     with connect(db_path) as conn:
-        state_row = conn.execute(
-            "select * from account_state where account_id = ?",
-            (account_id,),
-        ).fetchone()
-        if state_row is None:
-            return initialize_account(product, 1_000_000.0, db_path, account_id)
+        account = _load_account_from_conn(conn, product, account_id)
+    if account is None:
+        return initialize_account(product, _default_initial_cash(product), db_path, account_id)
+    return account
 
-        positions = {side: None for side in POSITION_SIDES}
-        for row in conn.execute(
-            "select side, payload from option_positions where account_id = ?",
-            (account_id,),
-        ):
-            positions[row["side"]] = json.loads(row["payload"])
 
-        hedge_row = conn.execute(
-            "select payload from hedge_position where account_id = ?",
-            (account_id,),
-        ).fetchone()
-        hedge_payload = json.loads(hedge_row["payload"]) if hedge_row else {}
-        strategy_row = conn.execute(
-            "select payload from strategy_state where account_id = ?",
-            (account_id,),
-        ).fetchone()
-        strategy_payload = json.loads(strategy_row["payload"]) if strategy_row else {}
+def save_account(account, db_path=None):
+    db_path = db_path or storage.account_db_path(account.product)
+    now = storage.utc_now_text()
+    with connect(db_path) as conn:
+        _save_account_to_conn(conn, account, now)
+        conn.commit()
+    account.updated_at = now
+    return account
+
+
+def record_fill(product, fill, db_path=None, account_id="default"):
+    """Apply a manually confirmed fill to the shadow account.
+
+    Fill payloads are intentionally explicit. This keeps broker execution truth
+    separate from model advice.
+    """
+    db_path = db_path or storage.account_db_path(product)
+    fill = normalize_fill(fill)
+    with connect(db_path) as conn:
+        account = _load_account_from_conn(conn, product, account_id)
+        if account is None:
+            account = AccountState(
+                product=product,
+                account_id=account_id,
+                cash=float(_default_initial_cash(product)),
+                positions={side: None for side in POSITION_SIDES},
+                hedge=HedgeState(),
+                strategy_state=StrategyState(),
+            )
+        _apply_fill(account, product, fill)
+        now = storage.utc_now_text()
+        _save_account_to_conn(conn, account, now)
+        _insert_fill_to_conn(conn, fill, account_id, now)
+        conn.commit()
+        account.updated_at = now
+    return account
+
+
+def normalize_fill(fill):
+    result = dict(fill)
+    action = result.get("action")
+    if action is None:
+        raise ValueError("Fill missing action.")
+
+    action_text = str(action)
+    action_key = action_text.lower()
+    action_map = {
+        "open_short_straddle": "open_short_straddle",
+        "open_long_straddle": "open_long_straddle",
+        "open_straddle": "open_straddle",
+        "roll_short_straddle": "roll_short_straddle",
+        "roll_long_straddle": "roll_long_straddle",
+        "roll_straddle": "roll_straddle",
+        "close_short_straddle": "close_short_straddle",
+        "close_long_straddle": "close_long_straddle",
+        "close_straddle": "close_straddle",
+        "delta_hedge": "delta_hedge",
+        "projected_delta_hedge": "delta_hedge",
+        "final_delta_hedge": "delta_hedge",
+        "rebalance_hedge": "rebalance_hedge",
+        "close_hedge": "close_hedge",
+        "cash_adjustment": "cash_adjustment",
+    }
+    if action_key not in action_map:
+        raise ValueError(f"Unsupported fill action: {action}")
+    result["action"] = action_map[action_key]
+    if result["action"] != action_text:
+        result.setdefault("source_action", action_text)
+
+    _copy_if_missing(result, "estimated_call_price", "entry_call_price")
+    _copy_if_missing(result, "estimated_put_price", "entry_put_price")
+    _copy_if_missing(result, "estimated_trade_value", "entry_option_value")
+    _copy_if_missing(result, "estimated_option_margin", "option_margin")
+    _copy_if_missing(result, "estimated_cash_effect", "cash_delta")
+    _copy_if_missing(result, "estimated_price", "price")
+    _copy_if_missing(result, "target_hedge_qty", "new_etf_qty")
+    _copy_if_missing(result, "target_hedge_qty", "qty")
+    return result
+
+
+def _copy_if_missing(payload, source_key, target_key):
+    if target_key not in payload and source_key in payload:
+        payload[target_key] = payload[source_key]
+
+
+def _load_account_from_conn(conn, product, account_id):
+    state_row = conn.execute(
+        "select * from account_state where account_id = ?",
+        (account_id,),
+    ).fetchone()
+    if state_row is None:
+        return None
+
+    positions = {side: None for side in POSITION_SIDES}
+    for row in conn.execute(
+        "select side, payload from option_positions where account_id = ?",
+        (account_id,),
+    ):
+        positions[row["side"]] = json.loads(row["payload"])
+
+    hedge_row = conn.execute(
+        "select payload from hedge_position where account_id = ?",
+        (account_id,),
+    ).fetchone()
+    hedge_payload = json.loads(hedge_row["payload"]) if hedge_row else {}
+    strategy_row = conn.execute(
+        "select payload from strategy_state where account_id = ?",
+        (account_id,),
+    ).fetchone()
+    strategy_payload = json.loads(strategy_row["payload"]) if strategy_row else {}
 
     return AccountState(
-        product=state_row["product"],
+        product=state_row["product"] or product,
         account_id=account_id,
         cash=float(state_row["cash"]),
         positions=positions,
@@ -256,91 +358,73 @@ def load_account(product, db_path=None, account_id="default"):
     )
 
 
-def save_account(account, db_path=None):
-    db_path = db_path or storage.account_db_path(account.product)
-    now = storage.utc_now_text()
-    with connect(db_path) as conn:
+def _save_account_to_conn(conn, account, now):
+    conn.execute(
+        """
+        insert into account_state(account_id, product, cash, updated_at)
+        values (?, ?, ?, ?)
+        on conflict(account_id) do update set
+            product=excluded.product,
+            cash=excluded.cash,
+            updated_at=excluded.updated_at
+        """,
+        (account.account_id, account.product, float(account.cash), now),
+    )
+    conn.execute(
+        "delete from option_positions where account_id = ?",
+        (account.account_id,),
+    )
+    for side, payload in account.positions.items():
+        if payload is None:
+            continue
         conn.execute(
             """
-            insert into account_state(account_id, product, cash, updated_at)
+            insert into option_positions(account_id, side, payload, updated_at)
             values (?, ?, ?, ?)
-            on conflict(account_id) do update set
-                product=excluded.product,
-                cash=excluded.cash,
-                updated_at=excluded.updated_at
-            """,
-            (account.account_id, account.product, float(account.cash), now),
-        )
-        conn.execute(
-            "delete from option_positions where account_id = ?",
-            (account.account_id,),
-        )
-        for side, payload in account.positions.items():
-            if payload is None:
-                continue
-            conn.execute(
-                """
-                insert into option_positions(account_id, side, payload, updated_at)
-                values (?, ?, ?, ?)
-                """,
-                (
-                    account.account_id,
-                    side,
-                    json.dumps(payload, ensure_ascii=False, default=str),
-                    now,
-                ),
-            )
-        conn.execute(
-            """
-            insert into hedge_position(account_id, payload, updated_at)
-            values (?, ?, ?)
-            on conflict(account_id) do update set
-                payload=excluded.payload,
-                updated_at=excluded.updated_at
             """,
             (
                 account.account_id,
-                json.dumps(account.hedge.to_dict(), ensure_ascii=False, default=str),
+                side,
+                json.dumps(payload, ensure_ascii=False, default=str),
                 now,
             ),
         )
-        conn.execute(
-            """
-            insert into strategy_state(account_id, payload, updated_at)
-            values (?, ?, ?)
-            on conflict(account_id) do update set
-                payload=excluded.payload,
-                updated_at=excluded.updated_at
-            """,
-            (
-                account.account_id,
-                json.dumps(
-                    account.strategy_state.to_dict(),
-                    ensure_ascii=False,
-                    default=str,
-                ),
-                now,
+    conn.execute(
+        """
+        insert into hedge_position(account_id, payload, updated_at)
+        values (?, ?, ?)
+        on conflict(account_id) do update set
+            payload=excluded.payload,
+            updated_at=excluded.updated_at
+        """,
+        (
+            account.account_id,
+            json.dumps(account.hedge.to_dict(), ensure_ascii=False, default=str),
+            now,
+        ),
+    )
+    conn.execute(
+        """
+        insert into strategy_state(account_id, payload, updated_at)
+        values (?, ?, ?)
+        on conflict(account_id) do update set
+            payload=excluded.payload,
+            updated_at=excluded.updated_at
+        """,
+        (
+            account.account_id,
+            json.dumps(
+                account.strategy_state.to_dict(),
+                ensure_ascii=False,
+                default=str,
             ),
-        )
-        conn.commit()
-    account.updated_at = now
-    return account
-
-
-def record_fill(product, fill, db_path=None, account_id="default"):
-    """Apply a manually confirmed fill to the shadow account.
-
-    Fill payloads are intentionally explicit. This keeps broker execution truth
-    separate from model advice.
-    """
-    account = load_account(product, db_path, account_id)
-    _apply_fill(account, product, fill)
-    save_account(account, db_path)
-    _insert_fill(product, fill, db_path, account_id)
-    return account
+            now,
+        ),
+    )
 
 
 def _apply_fill(account, product, fill):
+    fill = normalize_fill(fill)
     action = fill["action"]
     side = fill.get("side")
     cash_delta = float(fill.get("cash_delta", 0.0) or 0.0)
@@ -375,7 +459,7 @@ def _apply_fill(account, product, fill):
     elif action in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
         hedge = fill.get("hedge", fill)
         account.hedge = HedgeState(
-            qty=float(hedge.get("qty", hedge.get("new_etf_qty", 0.0)) or 0.0),
+            qty=float(hedge.get("qty", hedge.get("new_etf_qty", hedge.get("target_hedge_qty", 0.0))) or 0.0),
             entry_price=float(hedge.get("entry_price", hedge.get("price", 0.0)) or 0.0),
             margin=float(hedge.get("margin", 0.0) or 0.0),
             underlying_order_book_id=hedge.get("underlying_order_book_id"),
@@ -423,6 +507,7 @@ def amend_fill(
         )
         replacement_fill_id = None
         if replacement_fill is not None:
+            replacement_fill = normalize_fill(replacement_fill)
             cursor = conn.execute(
                 """
                 insert into fills(
@@ -539,6 +624,7 @@ def list_fill_table(
 def _fill_table_row(row):
     payload = row["payload"]
     action = payload.get("action", row["action"])
+    action_lower = str(action).lower()
     return {
         "id": row["id"],
         "status": "VOID" if row["voided_at"] else "ACTIVE",
@@ -558,11 +644,11 @@ def _fill_table_row(row):
         "option_value": payload.get("entry_option_value"),
         "option_margin": payload.get("option_margin"),
         "exit_reason": payload.get("exit_reason"),
-        "hedge_qty": payload.get("qty", payload.get("new_etf_qty"))
-        if "hedge" in action
+        "hedge_qty": payload.get("qty", payload.get("new_etf_qty", payload.get("target_hedge_qty")))
+        if "hedge" in action_lower
         else None,
         "hedge_price": payload.get("entry_price", payload.get("price"))
-        if "hedge" in action
+        if "hedge" in action_lower
         else None,
         "underlying_order_book_id": payload.get("underlying_order_book_id"),
         "short_entry_regime": payload.get("short_entry_regime"),
@@ -703,20 +789,25 @@ def _default_initial_cash(product):
 
 def _insert_fill(product, fill, db_path=None, account_id="default"):
     db_path = db_path or storage.account_db_path(product)
+    fill = normalize_fill(fill)
     with connect(db_path) as conn:
-        conn.execute(
-            """
-            insert into fills(account_id, action, payload, created_at)
-            values (?, ?, ?, ?)
-            """,
-            (
-                account_id,
-                fill["action"],
-                json.dumps(fill, ensure_ascii=False, default=str),
-                storage.utc_now_text(),
-            ),
-        )
+        _insert_fill_to_conn(conn, fill, account_id, storage.utc_now_text())
         conn.commit()
+
+
+def _insert_fill_to_conn(conn, fill, account_id, now):
+    conn.execute(
+        """
+        insert into fills(account_id, action, payload, created_at)
+        values (?, ?, ?, ?)
+        """,
+        (
+            account_id,
+            fill["action"],
+            json.dumps(fill, ensure_ascii=False, default=str),
+            now,
+        ),
+    )
 
 
 def record_broker_snapshot(product, snapshot, db_path=None, account_id="default"):
