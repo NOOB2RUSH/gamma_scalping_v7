@@ -152,29 +152,7 @@ def attach_underlying_prices(opt_by_date, hedge_by_date):
 
 
 def _ensure_option_underlying_id(df):
-    """旧豆粕期权 parquet 没有标的期货代码时，按期权月份补齐。"""
-    if (
-        config.CONFIG.data.product != "soymeal"
-        or "underlying_order_book_id" in df.columns
-        or "order_book_id" not in df.columns
-    ):
-        return df
-
-    df = df.copy()
-    df["underlying_order_book_id"] = df["order_book_id"].map(
-        _infer_soymeal_underlying_order_book_id
-    )
     return df
-
-
-def _infer_soymeal_underlying_order_book_id(option_code):
-    text = str(option_code)
-    if len(text) < 5 or text[0].lower() != "m":
-        return None
-    month_text = text[1:5]
-    if not month_text.isdigit():
-        return None
-    return f"M{month_text}.DCE"
 
 
 def _validate_df(df, required_cols, date):
