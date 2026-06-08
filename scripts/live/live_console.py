@@ -140,11 +140,98 @@ def _action_confirm_fill(session):
 
 
 def _action_import_holdings(session):
-    import_type = _prompt_choice("导入类型", ["option", "hedge"], "option")
-    if import_type == "hedge":
-        _action_import_hedge(session)
-        return
+    date = _prompt_optional("交易日期，留空则分别自动选择最新 option/hedge 导出")
+    include_existing = _confirm("导入总持仓，而不是仅导入今日开仓", False)
+    dry_run = _confirm("先预览，不写入账户", True)
+    results = _run_auto_imports(
+        session,
+        date=date or None,
+        include_existing=include_existing,
+        dry_run=dry_run,
+    )
+    _print_auto_import_results(results)
 
+    if dry_run and _auto_import_has_writes(results) and _confirm("是否将上述内容写入账户", False):
+        results = _run_auto_imports(
+            session,
+            date=date or None,
+            include_existing=include_existing,
+            dry_run=False,
+            only_kinds=_auto_import_writable_kinds(results),
+        )
+        _print_auto_import_results(results)
+
+
+def _run_auto_imports(session, date, include_existing, dry_run, only_kinds=None):
+    kinds = set(only_kinds or ["option", "hedge"])
+    results = []
+    if "option" in kinds:
+        results.append(
+            _try_auto_import(
+                "option",
+                lambda: holding_importer.import_holding_file(
+                    session["product"],
+                    file_path=None,
+                    account_id=session["account_id"],
+                    date=date,
+                    include_existing=include_existing,
+                    dry_run=dry_run,
+                ),
+            )
+        )
+    if "hedge" in kinds:
+        results.append(
+            _try_auto_import(
+                "hedge",
+                lambda: hedge_importer.import_hedge_files(
+                    session["product"],
+                    holding_file=None,
+                    trade_file=None,
+                    account_id=session["account_id"],
+                    date=date,
+                    dry_run=dry_run,
+                ),
+            )
+        )
+    return results
+
+
+def _try_auto_import(kind, factory):
+    try:
+        return {"kind": kind, "result": factory(), "error": None}
+    except FileNotFoundError as exc:
+        return {"kind": kind, "result": None, "error": str(exc), "skipped": True}
+    except Exception as exc:
+        return {"kind": kind, "result": None, "error": str(exc), "skipped": False}
+
+
+def _print_auto_import_results(results):
+    for item in results:
+        print("")
+        print(f"== {item['kind']} import ==")
+        if item.get("result") is not None:
+            _print_import_result(item["result"])
+            continue
+        label = "SKIPPED" if item.get("skipped") else "FAILED"
+        print(f"{label} reason={item.get('error')}")
+
+
+def _auto_import_has_writes(results):
+    return any(
+        item.get("result") is not None and item["result"].get("applied")
+        for item in results
+    )
+
+
+def _auto_import_writable_kinds(results):
+    return [
+        item["kind"]
+        for item in results
+        if item.get("result") is not None and item["result"].get("applied")
+    ]
+
+
+def _action_import_option(session):
     file_path = _prompt_optional("实时持仓导出文件，留空则自动选择 live_hold/ 最新实时持仓文件")
     date = _prompt_optional("交易日期，留空则从文件名解析")
     include_existing = _confirm("导入总持仓，而不是仅导入今日开仓", False)
@@ -172,7 +259,7 @@ def _action_import_holdings(session):
 
 def _action_import_hedge(session):
     holding_file = _prompt_optional("证券持仓查询文件，留空则自动选择 live_hold/ 最新证券持仓查询文件")
-    trade_file = _prompt_optional("证券委托查询_实时成交文件，留空则自动选择 live_hold/ 最新证券委托文件")
+    trade_file = _prompt_optional("证券委托查询文件，留空则自动选择 live_hold/ 最新证券委托文件")
     date = _prompt_optional("交易日期，留空则从文件名解析")
     dry_run = _confirm("先预览，不写入账户", True)
     result = hedge_importer.import_hedge_files(
@@ -221,7 +308,7 @@ def _action_account_report(session):
 
 
 def _action_show_account(session):
-    limit = _prompt_int_optional("最多显示多少条成交，留空则全部")
+    limit = _prompt_int_optional("最多显示多少条最新成交，留空则全部")
     active_only = _confirm("只显示有效成交", False)
     table = _confirm("使用统一表格展示成交", True)
     state = account.load_account(session["product"], account_id=session["account_id"])
@@ -233,6 +320,8 @@ def _action_show_account(session):
             account_id=session["account_id"],
             include_voided=include_voided,
             limit=limit,
+            order="desc",
+            expand_security_trades=True,
         )
         _print_table(rows)
     else:
@@ -241,6 +330,7 @@ def _action_show_account(session):
             account_id=session["account_id"],
             include_voided=include_voided,
             limit=limit,
+            order="desc",
         )
         _print_json_rows(rows)
 
@@ -299,19 +389,29 @@ def _action_rebuild_account(session):
 
 
 def _action_reconcile(session):
-    path = _prompt("券商账户快照 JSON 路径")
-    snapshot = storage.read_json(path)
+    start_date = _prompt_optional("开始日期，留空则从第二条历史开始")
+    end_date = _prompt_optional("结束日期，留空则到最新历史")
+    abs_tolerance = _prompt_float(
+        "绝对残差容忍度",
+        reconciler.DEFAULT_ABS_TOLERANCE,
+    )
+    rel_tolerance = _prompt_float(
+        "相对残差容忍度",
+        reconciler.DEFAULT_REL_TOLERANCE,
+    )
     payload = reconciler.reconcile(
         session["product"],
-        snapshot,
-        session["account_id"],
+        account_id=session["account_id"],
+        start_date=start_date,
+        end_date=end_date,
+        abs_tolerance=abs_tolerance,
+        rel_tolerance=rel_tolerance,
     )
     report_path = reconciler.write_reconcile_report(session["product"], payload)
     storage.write_json(report_path.with_suffix(".json"), payload)
     print(f"reconcile_report={report_path}")
-    print(f"ok={payload['ok']}")
-    for diff in payload.get("diffs", []):
-        print(f"{diff['field']}: local={diff.get('local')} broker={diff.get('broker')}")
+    for line in reconciler.format_terminal_summary(payload):
+        print(line)
 
 
 def _read_fill_or_signal_payload():
@@ -488,8 +588,8 @@ def _prompt_float_optional(label):
 
 
 def _confirm(label, default=False):
-    default_text = "Y/n" if default else "y/N"
-    value = _readline(f"{label} ({default_text}): ").strip().lower()
+    default_text = "Y" if default else "N"
+    value = _readline(f"{label} [默认: {default_text}] (y/n): ").strip().lower()
     if value == "":
         return default
     return value in {"y", "yes", "是", "1", "true"}
@@ -648,12 +748,32 @@ def _print_import_result(result):
     for item in result["applied"]:
         fill = item["fill"]
         prefix = "DRY_RUN" if item["dry_run"] else "CONFIRMED"
-        if fill["action"] == "delta_hedge":
+        if _is_hedge_fill(fill):
             print(
                 f"{prefix} {fill['action']} "
                 f"target_qty={fill['target_hedge_qty']:.0f} "
-                f"trade_qty={fill['trade_etf_qty']:.0f} "
+                f"trade_qty={fill.get('trade_etf_qty', 0.0):.0f} "
                 f"entry_price={fill['entry_price']:.6f} "
+                f"trade_price={_fmt_optional(fill.get('price'))} "
+                f"latest_price={_fmt_optional(fill.get('latest_price'))} "
+                f"cash_delta={fill['cash_delta']:.2f}"
+            )
+        elif fill["action"] in {"option_mark_update", "option_hedge_mark_update"}:
+            print(
+                f"{prefix} {fill['action']} side={fill.get('side')} "
+                f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
+                f"call={fill.get('call_code')} put={fill.get('put_code')} "
+                f"last_call_px={_fmt_optional(fill.get('last_call_price'))} "
+                f"last_put_px={_fmt_optional(fill.get('last_put_price'))} "
+                f"last_option_value={_fmt_optional(fill.get('last_option_value'))} "
+                f"cash_delta={fill['cash_delta']:.2f}"
+            )
+        elif fill["action"] in {"open_option_hedge", "close_option_hedge"}:
+            print(
+                f"{prefix} {fill['action']} side={fill.get('side')} "
+                f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
+                f"call={fill.get('call_code')} put={fill.get('put_code')} "
+                f"price={_fmt_optional(fill.get('price', fill.get('entry_price')))} "
                 f"cash_delta={fill['cash_delta']:.2f}"
             )
         else:
@@ -665,7 +785,7 @@ def _print_import_result(result):
             )
     for item in result["skipped"]:
         fill = item["fill"]
-        if fill["action"] == "delta_hedge":
+        if _is_hedge_fill(fill):
             print(
                 f"SKIPPED reason={item['reason']} "
                 f"target_qty={fill['target_hedge_qty']:.0f} "
@@ -680,6 +800,24 @@ def _print_import_result(result):
         print(f"WARNING {warning}")
 
 
+def _is_hedge_fill(fill):
+    return fill.get("action") in {
+        "delta_hedge",
+        "rebalance_hedge",
+        "close_hedge",
+        "hedge_mark_update",
+    }
+
+
+def _fmt_optional(value):
+    if value is None:
+        return "nan"
+    try:
+        return f"{float(value):.6f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _print_report_paths(paths):
     if "excel" in paths:
         print(f"account_report_excel={paths['excel']}")
@@ -688,6 +826,8 @@ def _print_report_paths(paths):
             print(f"account_report_csv[{sheet_name}]={path}")
     if "json" in paths:
         print(f"account_report_json={paths['json']}")
+    if "diagnostics" in paths:
+        print(f"account_report_diagnostics={paths['diagnostics']}")
 
 
 def _print_dict(payload):
@@ -706,7 +846,11 @@ def _print_table(rows):
     if not rows:
         print("(none)")
         return
-    columns = list(rows[0].keys())
+    columns = []
+    for row in rows:
+        for column in row.keys():
+            if column not in columns:
+                columns.append(column)
     widths = {
         column: min(
             24,

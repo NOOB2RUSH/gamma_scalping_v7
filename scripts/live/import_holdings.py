@@ -59,14 +59,33 @@ def main():
     for item in result["applied"]:
         fill = item["fill"]
         prefix = "DRY_RUN" if item["dry_run"] else "CONFIRMED"
-        print(
-            f"{prefix} {fill['action']} side={fill['side']} "
-            f"qty={fill['call_qty']}/{fill['put_qty']} "
-            f"strike={fill['strike']} expiry={fill['expiry']} "
-            f"call={fill['call_code']} put={fill['put_code']} "
-            f"call_px={fill['entry_call_price']} put_px={fill['entry_put_price']} "
-            f"cash_delta={fill['cash_delta']:.2f} margin={fill['option_margin']:.2f}"
-        )
+        if fill["action"] in {"option_mark_update", "option_hedge_mark_update"}:
+            print(
+                f"{prefix} {fill['action']} side={fill['side']} "
+                f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
+                f"call={fill.get('call_code')} put={fill.get('put_code')} "
+                f"last_call_px={fill.get('last_call_price')} "
+                f"last_put_px={fill.get('last_put_price')} "
+                f"last_option_value={fill.get('last_option_value')} "
+                f"margin={fill.get('option_margin')}"
+            )
+        elif fill["action"] in {"open_option_hedge", "close_option_hedge"}:
+            print(
+                f"{prefix} {fill['action']} side={fill['side']} "
+                f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
+                f"call={fill.get('call_code')} put={fill.get('put_code')} "
+                f"price={fill.get('price', fill.get('entry_price'))} "
+                f"cash_delta={fill['cash_delta']:.2f}"
+            )
+        else:
+            print(
+                f"{prefix} {fill['action']} side={fill['side']} "
+                f"qty={fill['call_qty']}/{fill['put_qty']} "
+                f"strike={fill['strike']} expiry={fill['expiry']} "
+                f"call={fill['call_code']} put={fill['put_code']} "
+                f"call_px={fill['entry_call_price']} put_px={fill['entry_put_price']} "
+                f"cash_delta={fill['cash_delta']:.2f} margin={fill['option_margin']:.2f}"
+            )
     for item in result["skipped"]:
         fill = item["fill"]
         print(

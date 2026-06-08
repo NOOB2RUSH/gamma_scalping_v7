@@ -59,10 +59,12 @@ output/live/<product>/YYYYMMDD_HHMMSS_reconcile.md
 - `core/live/*` may import existing `core.config`, `core.data_loader`,
   `core.cache`, `core.vol_engine`, `core.strategy`, and `core.position`.
 - Existing backtest modules should not import `core.live`.
-- Signal generation must not mutate cash, positions, hedge, or fills. It may
-  update the persisted strategy-state memory used by later live signals.
-- Only manual fill confirmation updates the shadow account.
-- Reconciliation reports differences first; it does not auto-adjust state.
+- Signal generation must not mutate cash, positions, hedge, fills, or strategy
+  state. It is a read-only execution-plan generator.
+- Broker import of option and ETF exports is the source of truth for position
+  and trade changes in the shadow account.
+- Reconciliation validates how well daily Greeks PnL explains fee-adjusted NAV
+  changes (`NAV change + daily fee`) and does not auto-adjust state.
 
 ## Quote Sources
 
@@ -75,30 +77,23 @@ option board through AKShare, writes immutable live snapshots, and also updates
 the canonical product parquet files so the existing signal pipeline can include
 the newest date.
 
-Live signal generation is incremental. It only enriches the latest option chain
-with IV/Greeks, then merges that row into
-`state/live/<product>/feature_history.parquet` for rolling IV percentiles. If
-the feature history file is missing, the first run seeds it from the historical
-cache; later hourly ticks do not recompute the full historical cache.
+Live signal generation is read-only. It enriches the latest option chain with
+IV/Greeks and builds the latest signal row without mutating the shadow account
+or the live feature-history store. Account state changes are driven by broker
+holding/trade imports and explicit account rebuild/amend tools.
 
-## Strategy-State Memory
+## Roll State
 
-Live signals persist the cross-day state that the backtest state machine keeps
-in memory:
+Roll cooldown still lives in the shadow account because it is created by
+confirmed close/roll fills. Signal generation reads that cooldown but does not
+advance or persist it.
 
-- `last_signal_date`: the latest trading date already processed by live mode.
-- `strike_mismatch_days`: consecutive trading days where an existing position's
-  strike differs from current ATM, by side.
-- `roll_cooldown_left`: remaining trading days before a side may open or roll.
-- `cooldown_total_days` and `cooldown_started_date`: deterministic cooldown
-  anchors so repeated hourly ticks on the same date do not double-count.
-
-Manual fill confirmation resets the relevant side on open/roll. Confirmed
-closes start the configured side cooldown; a long close with `exit_reason` set
-to `iv_high` also starts the configured short-side cooldown. Signal generation
-advances this memory once per trading date, blocks entries during cooldown, and
-only recommends rolls when the backtest roll conditions are met: low DTE or
-enough consecutive ATM-strike mismatch days, plus an active entry signal.
+ATM-strike mismatch is not stored in strategy state. For each signal run the
+engine reconstructs consecutive mismatch days from broker option holding
+snapshots under `live_hold/实时持仓*.csv` and the historical `atm_strike` signal
+rows. If any required holding snapshot or ATM row is missing during the current
+holding period, signal generation raises an error instead of falling back to a
+stored counter.
 
 ## Fill Audit And Corrections
 
@@ -134,10 +129,11 @@ the total holding quantity and is intended for one-time shadow-account seeding.
 The broker holding export is not a per-fill execution report. It has no unique
 execution id, execution time, exact commission, or exact cash movement.
 Therefore generated fills use open average price, configured option fee, and
-occupied margin to estimate `cash_delta`. Broker cash should still be checked
-through reconciliation. Close/roll confirmations cannot be inferred safely from
-a holding snapshot alone when the position is absent or changed; those still
-need explicit fill JSON or a real transaction export.
+occupied margin to estimate `cash_delta`. Account reconciliation now checks
+Greeks PnL explainability against fee-adjusted NAV changes instead of comparing
+to a separate broker account snapshot. Close/roll confirmations cannot be
+inferred safely from a holding snapshot alone when the position is absent or
+changed; those still need explicit fill JSON or a real transaction export.
 
 ## ETF Hedge Snapshot Import
 
