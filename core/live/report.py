@@ -6,34 +6,26 @@ from . import storage
 def write_signal_report(product, signal_payload):
     stamp = storage.local_now_stamp()
     path = storage.output_dir(product) / f"{stamp}_signal.md"
+    rows, notices = _execution_rows(signal_payload)
     lines = [
         f"# Live Signal: {product}",
         "",
-        f"- date: {signal_payload['date']}",
-        f"- spot: {signal_payload['spot']:.6f}",
-        f"- account_delta_after_hedge: {signal_payload['account_delta_after_hedge']:.2f}",
-        f"- estimated_option_value: {signal_payload['estimated_option_value']:.2f}",
+        "## Execution Plan",
         "",
-        "## Feature",
-        "",
+        "| 执行顺序 | 合约代码 | 方向 | 数量 | 执行价格 |",
+        "| ---: | --- | --- | ---: | ---: |",
     ]
-    for key, value in signal_payload["feature"].items():
-        lines.append(f"- {key}: {value}")
-
-    strategy_state = signal_payload.get("strategy_state")
-    if strategy_state:
-        lines.extend(["", "## Strategy State", ""])
-        for key, value in strategy_state.items():
-            lines.append(f"- {key}: {value}")
-
-    lines.extend(["", "## Advice", ""])
-    for item in signal_payload["advice"]:
-        lines.append(f"### {item['action']}")
-        for key, value in item.items():
-            if key == "action":
-                continue
-            lines.append(f"- {key}: {value}")
-        lines.append("")
+    if rows:
+        for row in rows:
+            lines.append(
+                f"| {row['执行顺序']} | {row['合约代码']} | {row['方向']} | "
+                f"{_fmt_qty(row['数量'])} | {_fmt(row['执行价格'])} |"
+            )
+    else:
+        lines.append("| - | - | 无操作 | 0 | - |")
+    if notices:
+        lines.extend(["", "## Notices", ""])
+        lines.extend(f"- {notice}" for notice in notices)
 
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -41,118 +33,179 @@ def write_signal_report(product, signal_payload):
 
 def format_signal_summary(signal_payload):
     """Return terminal-friendly live advice lines for manual execution."""
+    rows, notices = _execution_rows(signal_payload)
     lines = [
-        f"date={signal_payload['date']} spot={signal_payload['spot']:.6f}",
-        f"account_delta_after_hedge={signal_payload['account_delta_after_hedge']:.2f}",
+        "执行顺序 | 合约代码 | 方向 | 数量 | 执行价格",
     ]
-    for item in signal_payload["advice"]:
-        lines.extend(_format_advice_item(item))
+    if not rows:
+        lines.append("- | - | 无操作 | 0 | -")
+    for row in rows:
+        lines.append(
+            f"{row['执行顺序']} | {row['合约代码']} | {row['方向']} | "
+            f"{_fmt_qty(row['数量'])} | {_fmt(row['执行价格'])}"
+        )
+    lines.extend(f"提示: {notice}" for notice in notices)
     return lines
 
 
-def _format_advice_item(item):
-    action = item["action"]
-    reason = item.get("reason")
+def _execution_rows(signal_payload):
+    rows = []
+    notices = []
+    for item in signal_payload["advice"]:
+        item_rows = _advice_execution_rows(item)
+        if item_rows:
+            rows.extend(item_rows)
+        elif item.get("reason"):
+            notices.append(f"{item.get('action')}: {item.get('reason')}")
+    for index, row in enumerate(rows, start=1):
+        row["执行顺序"] = index
+    return rows, notices
+
+
+def _advice_execution_rows(item):
+    action = item.get("action", "")
     side = item.get("side")
-    prefix = action if side is None else f"{action} side={side}"
 
     if action.startswith("OPEN_"):
-        return [
-            (
-                f"{prefix} qty={item.get('call_qty')}/{item.get('put_qty')} "
-                f"strike={item.get('strike')} expiry={item.get('expiry')} "
-                f"call={item.get('call_code')} put={item.get('put_code')} "
-                f"call_px={_fmt(item.get('estimated_call_price'))} "
-                f"put_px={_fmt(item.get('estimated_put_price'))} "
-                f"cash_effect={_fmt(item.get('estimated_cash_effect'))} "
-                f"margin={_fmt(item.get('estimated_option_margin'))} "
-                f"reason={reason}"
-            )
-        ]
+        return _option_pair_rows(
+            item,
+            "买入开仓" if side == "long" else "卖出开仓",
+            "call_code",
+            "put_code",
+            "call_qty",
+            "put_qty",
+            "estimated_call_price",
+            "estimated_put_price",
+        )
 
     if action.startswith("CLOSE_"):
-        return [
-            (
-                f"{prefix} qty={item.get('call_qty')}/{item.get('put_qty')} "
-                f"call={item.get('call_code')} put={item.get('put_code')} "
-                f"call_px={_fmt(item.get('estimated_call_price'))} "
-                f"put_px={_fmt(item.get('estimated_put_price'))} "
-                f"cash_effect={_fmt(item.get('estimated_cash_effect'))} "
-                f"reason={reason}"
-            )
-        ]
+        return _option_pair_rows(
+            item,
+            "卖出平仓" if side == "long" else "买入平仓",
+            "call_code",
+            "put_code",
+            "call_qty",
+            "put_qty",
+            "estimated_call_price",
+            "estimated_put_price",
+        )
 
     if action.startswith("ROLL_"):
-        return [
-            (
-                f"{prefix} current_strike={item.get('current_strike')} "
-                f"current_expiry={item.get('current_expiry')} "
-                f"current_dte={item.get('current_dte')} "
-                f"target_qty={item.get('target_call_qty')}/{item.get('target_put_qty')} "
-                f"target_strike={item.get('target_strike')} "
-                f"target_expiry={item.get('target_expiry')} "
-                f"target_call={item.get('target_call_code')} "
-                f"target_put={item.get('target_put_code')} "
-                f"reason={reason}"
-            )
-        ]
+        close_direction = "卖出平仓" if side == "long" else "买入平仓"
+        open_direction = "买入开仓" if side == "long" else "卖出开仓"
+        return _option_pair_rows(
+            item,
+            close_direction,
+            "current_call_code",
+            "current_put_code",
+            "current_call_qty",
+            "current_put_qty",
+            "estimated_current_call_price",
+            "estimated_current_put_price",
+        ) + _option_pair_rows(
+            item,
+            open_direction,
+            "target_call_code",
+            "target_put_code",
+            "target_call_qty",
+            "target_put_qty",
+            "estimated_target_call_price",
+            "estimated_target_put_price",
+        )
 
-    if action == "DELTA_HEDGE":
+    if action in {"DELTA_HEDGE", "FINAL_DELTA_HEDGE"}:
         trade_qty = item.get("trade_etf_qty")
-        direction = _trade_direction(trade_qty)
-        return [
-            (
-                f"DELTA_HEDGE direction={direction} qty={_fmt(trade_qty)} "
-                f"target_hedge_qty={_fmt(item.get('target_hedge_qty'))} "
-                f"current_hedge_qty={_fmt(item.get('current_hedge_qty'))} "
-                f"price={_fmt(item.get('estimated_price'))} "
-                f"underlying={item.get('underlying_order_book_id')} "
-                f"reason={reason}"
-            )
-        ]
-
-    if action == "FINAL_DELTA_HEDGE":
-        trade_qty = item.get("trade_etf_qty")
-        direction = _trade_direction(trade_qty)
-        return [
-            (
-                f"FINAL_DELTA_HEDGE after={item.get('after_actions')} "
-                f"direction={direction} qty={_fmt(trade_qty)} "
-                f"planned_option_delta={_fmt(item.get('planned_option_delta'))} "
-                f"target_hedge_qty={_fmt(item.get('target_hedge_qty'))} "
-                f"current_hedge_qty={_fmt(item.get('current_hedge_qty'))} "
-                f"price={_fmt(item.get('estimated_price'))} "
-                f"underlying={item.get('underlying_order_book_id')} "
-                f"reason={reason}"
-            )
-        ]
+        return [_execution_row(
+            item.get("underlying_order_book_id"),
+            _trade_direction(trade_qty),
+            abs(float(trade_qty or 0.0)),
+            item.get("estimated_price"),
+        )]
 
     if action in {"OPTION_DELTA_HEDGE_SHORT_CALL", "FINAL_OPTION_DELTA_HEDGE_SHORT_CALL"}:
-        return [
-            (
-                f"{action} after={item.get('after_actions')} "
-                f"qty={item.get('call_qty')} call={item.get('call_code')} "
-                f"strike={item.get('strike')} expiry={item.get('expiry')} "
-                f"call_px={_fmt(item.get('estimated_call_price'))} "
-                f"single_delta={_fmt(item.get('single_call_delta'))} "
-                f"hedge_delta={_fmt(item.get('estimated_hedge_delta'))} "
-                f"residual_before={_fmt(item.get('residual_delta_before_option_hedge'))} "
-                f"projected_after={_fmt(item.get('projected_account_delta_after_option_hedge'))} "
-                f"margin={_fmt(item.get('estimated_option_margin'))} "
-                f"cash_effect={_fmt(item.get('estimated_cash_effect'))} "
-                f"reason={reason}"
-            )
+        return [_execution_row(
+            item.get("call_code"),
+            "卖出开仓",
+            item.get("call_qty"),
+            item.get("estimated_call_price"),
+        )]
+    if action in {
+        "GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
+        "FINAL_GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
+    }:
+        rows = [
+            _execution_row(
+                item.get("close_call_code"),
+                "买入平仓",
+                item.get("close_call_qty"),
+                item.get("estimated_close_call_price"),
+            ),
+            _execution_row(
+                item.get("open_call_code"),
+                "卖出开仓",
+                item.get("open_call_qty"),
+                item.get("estimated_open_call_price"),
+            ),
         ]
-
-    if action == "COOLDOWN_BLOCK":
-        return [
-            (
-                f"COOLDOWN_BLOCK side={side} "
-                f"cooldown_left={item.get('cooldown_left')} reason={reason}"
+        if float(item.get("trade_etf_qty", 0.0) or 0.0) > 0:
+            rows.append(
+                _execution_row(
+                    item.get("underlying_order_book_id"),
+                    "买入",
+                    item.get("trade_etf_qty"),
+                    item.get("estimated_price"),
+                )
             )
-        ]
+        return rows
+    return []
 
-    return [f"{prefix}: {reason}"]
+
+def _option_pair_rows(
+    item,
+    direction,
+    call_code_key,
+    put_code_key,
+    call_qty_key,
+    put_qty_key,
+    call_price_key,
+    put_price_key,
+):
+    rows = [
+        _execution_row(
+            item.get(call_code_key),
+            direction,
+            item.get(call_qty_key),
+            item.get(call_price_key),
+        ),
+        _execution_row(
+            item.get(put_code_key),
+            direction,
+            item.get(put_qty_key),
+            item.get(put_price_key),
+        ),
+    ]
+    return [
+        row
+        for row in rows
+        if row["合约代码"] not in {None, ""}
+        and row["数量"] is not None
+        and float(row["数量"]) > 0
+    ]
+
+
+def _execution_row(code, direction, qty, price):
+    return {
+        "合约代码": _display_code(code),
+        "方向": direction,
+        "数量": qty,
+        "执行价格": price,
+    }
+
+
+def _display_code(code):
+    if code is None:
+        return None
+    return str(code).split(".", 1)[0]
 
 
 def _trade_direction(qty):
@@ -160,10 +213,20 @@ def _trade_direction(qty):
         return "NONE"
     qty = float(qty)
     if qty > 0:
-        return "BUY"
+        return "买入"
     if qty < 0:
-        return "SELL"
-    return "NONE"
+        return "卖出"
+    return "无操作"
+
+
+def _fmt_qty(value):
+    if value is None:
+        return "-"
+    try:
+        number = float(value)
+        return str(int(number)) if number.is_integer() else f"{number:.2f}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _fmt(value):

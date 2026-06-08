@@ -35,12 +35,11 @@ def main():
                 ("2", "拉取行情并生成/预览策略信号"),
                 ("3", "导入期权/ETF 持仓成交并自动确认"),
                 ("4", "生成账户报告"),
-                ("5", "查看账户与成交记录"),
-                ("6", "导出成交记录表"),
-                ("7", "修改/作废已确认成交"),
-                ("8", "重建账户状态"),
-                ("9", "账户对账"),
-                ("10", "切换品种/账户"),
+                ("5", "查看当前持仓"),
+                ("6", "查看成交记录"),
+                ("7", "重建账户状态"),
+                ("8", "账户对账"),
+                ("9", "切换品种/账户"),
                 ("0", "退出"),
             ]
         )
@@ -54,16 +53,14 @@ def main():
             elif action == "4":
                 _action_account_report(session)
             elif action == "5":
-                _action_show_account(session)
+                _action_show_positions(session)
             elif action == "6":
-                _action_export_fills(session)
+                _action_show_fills(session)
             elif action == "7":
-                _action_amend_fill(session)
-            elif action == "8":
                 _action_rebuild_account(session)
-            elif action == "9":
+            elif action == "8":
                 _action_reconcile(session)
-            elif action == "10":
+            elif action == "9":
                 session["product"] = _choose_product(session["product"])
                 session["account_id"] = _prompt("账户ID", session["account_id"])
             elif action == "0":
@@ -307,12 +304,15 @@ def _action_account_report(session):
         print(line)
 
 
-def _action_show_account(session):
+def _action_show_positions(session):
+    state = account.load_account(session["product"], account_id=session["account_id"])
+    _print_account_state(state)
+
+
+def _action_show_fills(session):
     limit = _prompt_int_optional("最多显示多少条最新成交，留空则全部")
     active_only = _confirm("只显示有效成交", False)
     table = _confirm("使用统一表格展示成交", True)
-    state = account.load_account(session["product"], account_id=session["account_id"])
-    _print_account_state(state)
     include_voided = not active_only
     if table:
         rows = account.list_fill_table(
@@ -716,6 +716,16 @@ def _print_account_state(state):
                 f"position.{side}={position['call_code']}/{position['put_code']} "
                 f"qty={position['call_qty']}/{position['put_qty']} "
                 f"strike={position['strike']} expiry={position['expiry']}"
+            )
+    if not state.option_hedges:
+        print("option_hedges=None")
+    else:
+        for index, hedge in enumerate(state.option_hedges, start=1):
+            print(
+                f"option_hedge.{index}={hedge.get('order_book_id')} "
+                f"side={hedge.get('side')} qty={hedge.get('qty')} "
+                f"type={hedge.get('option_type')} strike={hedge.get('strike')} "
+                f"expiry={hedge.get('expiry')}"
             )
 
 

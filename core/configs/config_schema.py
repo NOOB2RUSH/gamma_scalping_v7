@@ -53,8 +53,10 @@ class StrategyConfig:
     short_stop_loss_enabled: bool = False
     short_stop_loss_rate: float = 0.2
     enable_delta_hedge: bool = False
+    delta_hedge_tolerance_ratio: float = 0.05
     allow_etf_short_hedge: bool = True
     enable_option_delta_hedge: bool = False
+    option_delta_hedge_gamma_neutral: bool = False
     option_delta_hedge_call_otm_steps: int = 1
 
     # 卖方持仓期间，若持仓合约 call+put 成交量较开仓时明显放大，主动退出。

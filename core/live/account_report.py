@@ -255,6 +255,7 @@ def calculate_live_account_report(
         )
     config = load_product_config(product)
     live_account = account_store.load_account(product, account_id=account_id)
+    reset_at = live_account.reset_at
     report_date_text = str(market["date"].date())
     spot = float(market["signal_row"]["close"])
     report_hedge = _hedge_for_report_date(
@@ -277,6 +278,7 @@ def calculate_live_account_report(
         account_id,
         report_date_text,
         market["chain_df"],
+        not_before=reset_at,
     )
     if holding_rows:
         position_rows = holding_rows
@@ -287,6 +289,7 @@ def calculate_live_account_report(
             product,
             report_date_text,
             market["chain_df"],
+            not_before=reset_at,
         )
         if export_greeks is not None:
             account_greeks = export_greeks
@@ -297,10 +300,13 @@ def calculate_live_account_report(
         report_date_text,
         spot,
         prefer_spot_mark=source in {"akshare", "local"},
+        not_before=reset_at,
     )
     position_rows.extend(hedge_rows)
-    trade_rows = _trade_rows_from_export(product, report_date_text)
-    trade_rows.extend(_security_trade_rows_from_export(product, report_date_text))
+    trade_rows = _trade_rows_from_export(product, report_date_text, not_before=reset_at)
+    trade_rows.extend(
+        _security_trade_rows_from_export(product, report_date_text, not_before=reset_at)
+    )
     daily_fee = _configured_daily_report_fee(
         product,
         account_id,
@@ -960,8 +966,8 @@ def _apply_account_position_mark(position, call_row, put_row, report_date):
     return call_result, put_result
 
 
-def _holding_rows_from_export(product, account_id, report_date, chain_df):
-    path = _latest_export_file("实时持仓", report_date)
+def _holding_rows_from_export(product, account_id, report_date, chain_df, not_before=None):
+    path = _latest_export_file("实时持仓", report_date, not_before=not_before)
     if path is None:
         return []
     df = _read_export_csv(path)
@@ -1014,8 +1020,8 @@ def _holding_rows_from_export(product, account_id, report_date, chain_df):
     return rows
 
 
-def _greeks_from_holding_export(product, report_date, chain_df):
-    path = _latest_export_file("实时持仓", report_date)
+def _greeks_from_holding_export(product, report_date, chain_df, not_before=None):
+    path = _latest_export_file("实时持仓", report_date, not_before=not_before)
     if path is None:
         return None
     df = _read_export_csv(path)
@@ -1128,11 +1134,12 @@ def _hedge_rows_from_account(
     report_date,
     spot,
     prefer_spot_mark=False,
+    not_before=None,
 ):
     if abs(float(hedge.qty or 0.0)) <= 1e-9:
         return []
 
-    export_row = _security_holding_export_row(product, report_date)
+    export_row = _security_holding_export_row(product, report_date, not_before=not_before)
     mark_with_spot = (
         export_row is None
         and prefer_spot_mark
@@ -1221,8 +1228,8 @@ def _can_mark_hedge_with_spot(product, hedge):
     }
 
 
-def _security_holding_export_row(product, report_date):
-    path = _latest_export_file("证券持仓查询", report_date)
+def _security_holding_export_row(product, report_date, not_before=None):
+    path = _latest_export_file("证券持仓查询", report_date, not_before=not_before)
     if path is None:
         return None
     df = _read_export_csv(path)
@@ -1249,20 +1256,20 @@ def _hedge_unrealized_pnl_for_report(product, qty, entry_price, spot, report_dat
     return core.hedge.calc_unrealized_pnl(qty, entry_price, spot)
 
 
-def _trade_rows_from_export(product, report_date):
-    path = _latest_export_file("成交明细", report_date)
+def _trade_rows_from_export(product, report_date, not_before=None):
+    path = _latest_export_file("成交明细", report_date, not_before=not_before)
     if path is not None:
         rows = _trade_rows_from_file(path, product)
         return [row for row in rows if _date8_to_iso(row.get("日期")) == report_date]
-    path = _latest_export_file("成交汇总", report_date)
+    path = _latest_export_file("成交汇总", report_date, not_before=not_before)
     if path is None:
         return []
     rows = _trade_rows_from_summary_file(path, product)
     return [row for row in rows if _date8_to_iso(row.get("日期")) == report_date]
 
 
-def _security_trade_rows_from_export(product, report_date):
-    path = _latest_export_file("证券委托查询", report_date)
+def _security_trade_rows_from_export(product, report_date, not_before=None):
+    path = _latest_export_file("证券委托查询", report_date, not_before=not_before)
     if path is None:
         return []
     df = _read_export_csv(path)
@@ -1308,13 +1315,17 @@ def _security_trade_rows_from_export(product, report_date):
     return rows
 
 
-def _all_trade_rows_from_exports(product):
+def _all_trade_rows_from_exports(product, not_before=None):
     rows = []
     detail_dates = set()
     for path in sorted(_live_hold_dir().glob("成交明细*.csv")):
+        if not _export_file_is_not_before(path, not_before):
+            continue
         rows.extend(_trade_rows_from_file(path, product))
         detail_dates.add(_filename_date(path))
     for path in sorted(_live_hold_dir().glob("成交汇总*.csv")):
+        if not _export_file_is_not_before(path, not_before):
+            continue
         if _filename_date(path) not in detail_dates:
             rows.extend(_trade_rows_from_summary_file(path, product))
     seen = set()
@@ -1384,9 +1395,11 @@ def _trade_rows_from_summary_file(path, product):
     return rows
 
 
-def _all_security_trade_rows_from_exports(product):
+def _all_security_trade_rows_from_exports(product, not_before=None):
     rows = []
     for path in sorted(_live_hold_dir().glob("证券委托查询*.csv")):
+        if not _export_file_is_not_before(path, not_before):
+            continue
         df = _read_export_csv(path)
         target_code = _product_security_code(product)
         for _, item in df.iterrows():
@@ -2373,6 +2386,7 @@ def _backfill_summary_financial_columns(product, account_id, summary_history):
     result = summary_history.copy()
     config = load_product_config(product)
     initial_cash = float(config.backtest.initial_cash)
+    reset_at = account_store.load_account(product, account_id=account_id).reset_at
 
     account_mask = result["账户ID"].astype(str).eq(str(account_id))
     for idx, row in result.loc[account_mask].iterrows():
@@ -2383,8 +2397,18 @@ def _backfill_summary_financial_columns(product, account_id, summary_history):
         if _number(row.get("初始资金")) is None:
             result.at[idx, "初始资金"] = initial_cash
 
-        trade_rows = _trade_rows_from_export(product, str(report_date))
-        trade_rows.extend(_security_trade_rows_from_export(product, str(report_date)))
+        trade_rows = _trade_rows_from_export(
+            product,
+            str(report_date),
+            not_before=reset_at,
+        )
+        trade_rows.extend(
+            _security_trade_rows_from_export(
+                product,
+                str(report_date),
+                not_before=reset_at,
+            )
+        )
 
         if _number(row.get("当日手续费")) is None:
             result.at[idx, "当日手续费"] = _configured_daily_report_fee(
@@ -2453,8 +2477,12 @@ def _configured_cumulative_report_fee(product, account_id, report_date):
     if cutoff is None:
         return 0.0
 
-    option_rows = _all_trade_rows_from_exports(product)
-    security_rows = _all_security_trade_rows_from_exports(product)
+    live_account = account_store.load_account(product, account_id=account_id)
+    option_rows = _all_trade_rows_from_exports(product, not_before=live_account.reset_at)
+    security_rows = _all_security_trade_rows_from_exports(
+        product,
+        not_before=live_account.reset_at,
+    )
     fee = 0.0
     option_trade_dates = set()
     security_trade_dates = set()
@@ -2731,12 +2759,36 @@ def _chain_metadata(chain_df):
     return metadata
 
 
-def _latest_export_file(prefix, report_date=None):
+def _latest_export_file(prefix, report_date=None, not_before=None):
     files = sorted(_live_hold_dir().glob(f"{prefix}*.csv"), key=lambda path: path.stat().st_mtime)
     if report_date is not None:
-        matching = [path for path in files if _filename_date(path) == report_date]
+        matching = [
+            path
+            for path in files
+            if _filename_date(path) == report_date
+            and _export_file_is_not_before(path, not_before)
+        ]
         return matching[-1] if matching else None
+    files = [path for path in files if _export_file_is_not_before(path, not_before)]
     return files[-1] if files else None
+
+
+def _export_file_is_not_before(path, not_before):
+    if not_before is None:
+        return True
+    match = re.search(
+        r"(20\d{2})_(\d{2})_(\d{2})-(\d{2})_(\d{2})_(\d{2})",
+        Path(path).name,
+    )
+    if match is None:
+        return False
+    timestamp = pd.Timestamp(
+        "-".join(match.groups()[:3]) + " " + ":".join(match.groups()[3:])
+    ).tz_localize("Asia/Hong_Kong")
+    cutoff = pd.Timestamp(not_before)
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.tz_localize("UTC")
+    return timestamp.tz_convert("UTC") >= cutoff.tz_convert("UTC")
 
 
 def _live_hold_dir():

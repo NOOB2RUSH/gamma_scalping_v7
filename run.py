@@ -223,7 +223,15 @@ def calc_summary_breakdown(daily_pnl, trades):
     option_fee = 0.0
     option_fee_by_side = {"long": 0.0, "short": 0.0}
     if not trades.empty and "fee" in trades.columns:
-        option_trade_mask = trades["type"].str.contains("straddle", na=False)
+        option_trade_mask = (
+            trades["type"].str.contains("straddle", na=False)
+            | trades["type"].isin(
+                [
+                    "gamma_neutral_option_delta_hedge",
+                    "close_option_delta_hedge",
+                ]
+            )
+        )
         option_fee = trades.loc[option_trade_mask, "fee"].sum()
         if "side" in trades.columns:
             for side in option_fee_by_side:

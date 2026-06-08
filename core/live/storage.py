@@ -49,6 +49,14 @@ def account_report_position_history_path(product, account_id="default"):
     return path / f"{account_id}_position_history.csv"
 
 
+def clear_account_report_history(product, account_id="default"):
+    for path in [
+        account_report_summary_history_path(product, account_id),
+        account_report_position_history_path(product, account_id),
+    ]:
+        path.unlink(missing_ok=True)
+
+
 def output_dir(product):
     path = PROJECT_ROOT / "output" / "live" / product
     path.mkdir(parents=True, exist_ok=True)

@@ -48,6 +48,7 @@ class AccountState:
     option_hedges: list = field(default_factory=list)
     hedge: HedgeState = field(default_factory=HedgeState)
     strategy_state: "StrategyState" = field(default_factory=lambda: StrategyState())
+    reset_at: str | None = None
     updated_at: str | None = None
 
     def to_dict(self):
@@ -59,6 +60,7 @@ class AccountState:
             "option_hedges": self.option_hedges,
             "hedge": self.hedge.to_dict(),
             "strategy_state": self.strategy_state.to_dict(),
+            "reset_at": self.reset_at,
             "updated_at": self.updated_at,
         }
 
@@ -108,6 +110,7 @@ def ensure_schema(conn):
             account_id text primary key,
             product text not null,
             cash real not null,
+            reset_at text,
             updated_at text not null
         );
         create table if not exists option_positions (
@@ -161,6 +164,7 @@ def ensure_schema(conn):
     _ensure_column(conn, "fills", "voided_at", "text")
     _ensure_column(conn, "fills", "void_reason", "text")
     _ensure_column(conn, "fills", "replaces_fill_id", "integer")
+    _ensure_column(conn, "account_state", "reset_at", "text")
     conn.commit()
 
 
@@ -198,14 +202,15 @@ def initialize_account(product, initial_cash, db_path=None, account_id="default"
         now = storage.utc_now_text()
         conn.execute(
             """
-            insert into account_state(account_id, product, cash, updated_at)
-            values (?, ?, ?, ?)
+            insert into account_state(account_id, product, cash, reset_at, updated_at)
+            values (?, ?, ?, ?, ?)
             on conflict(account_id) do update set
                 product=excluded.product,
                 cash=excluded.cash,
+                reset_at=excluded.reset_at,
                 updated_at=excluded.updated_at
             """,
-            (account_id, product, float(initial_cash), now),
+            (account_id, product, float(initial_cash), now, now),
         )
         conn.execute(
             """
@@ -232,6 +237,8 @@ def initialize_account(product, initial_cash, db_path=None, account_id="default"
             ),
         )
         conn.commit()
+    if reset:
+        storage.clear_account_report_history(product, account_id)
     return load_account(product, db_path, account_id)
 
 
@@ -301,6 +308,7 @@ def normalize_fill(fill):
         "close_short_straddle": "close_short_straddle",
         "close_long_straddle": "close_long_straddle",
         "close_straddle": "close_straddle",
+        "rebalance_straddle_legs": "rebalance_straddle_legs",
         "delta_hedge": "delta_hedge",
         "projected_delta_hedge": "delta_hedge",
         "final_delta_hedge": "delta_hedge",
@@ -397,6 +405,7 @@ def _load_account_from_conn(conn, product, account_id):
             last_mark_source_timestamp=hedge_payload.get("last_mark_source_timestamp"),
         ),
         strategy_state=_strategy_state_from_payload(strategy_payload),
+        reset_at=state_row["reset_at"],
         updated_at=state_row["updated_at"],
     )
 
@@ -404,14 +413,21 @@ def _load_account_from_conn(conn, product, account_id):
 def _save_account_to_conn(conn, account, now):
     conn.execute(
         """
-        insert into account_state(account_id, product, cash, updated_at)
-        values (?, ?, ?, ?)
+        insert into account_state(account_id, product, cash, reset_at, updated_at)
+        values (?, ?, ?, ?, ?)
         on conflict(account_id) do update set
             product=excluded.product,
             cash=excluded.cash,
+            reset_at=coalesce(account_state.reset_at, excluded.reset_at),
             updated_at=excluded.updated_at
         """,
-        (account.account_id, account.product, float(account.cash), now),
+        (
+            account.account_id,
+            account.product,
+            float(account.cash),
+            account.reset_at or now,
+            now,
+        ),
     )
     conn.execute(
         "delete from option_positions where account_id = ?",
@@ -516,6 +532,11 @@ def _apply_fill(account, product, fill):
                 _short_cooldown_after_long_iv_high_exit_days(product),
                 fill.get("date"),
             )
+        account.cash += cash_delta
+    elif action == "rebalance_straddle_legs":
+        if side not in account.positions or account.positions.get(side) is None:
+            raise ValueError(f"Cannot rebalance missing straddle side={side}.")
+        account.positions[side] = _position_from_fill(fill, side)
         account.cash += cash_delta
     elif action in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
         hedge = fill.get("hedge", fill)
@@ -848,7 +869,7 @@ def _position_from_fill(fill, side):
     call_qty = int(fill.get("call_qty", fill.get("qty", 0)) or 0)
     put_qty = int(fill.get("put_qty", fill.get("qty", 0)) or 0)
     return {
-        "entry_date": fill.get("date"),
+        "entry_date": fill.get("entry_date", fill.get("date")),
         "call_code": fill["call_code"],
         "put_code": fill["put_code"],
         "strike": float(fill["strike"]),

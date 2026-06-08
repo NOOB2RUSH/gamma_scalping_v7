@@ -35,7 +35,23 @@ def import_holding_file(
         if trade_summary_path is not None
         else pd.DataFrame()
     )
-    codes = [row["order_book_id"] for row in rows]
+    trade_summary_timestamp = _parse_timestamp_from_filename(trade_summary_path)
+    if (
+        trade_summary_timestamp is not None
+        and source_timestamp is not None
+        and trade_summary_timestamp > source_timestamp
+    ):
+        snapshot_rows = _remove_rows_fully_closed_after_snapshot(
+            snapshot_rows,
+            trade_summary,
+        )
+        rows = _remove_rows_fully_closed_after_snapshot(rows, trade_summary)
+    codes = list(
+        {
+            row["order_book_id"]
+            for row in [*rows, *snapshot_rows]
+        }
+    )
     metadata = _load_contract_metadata(config, codes)
 
     warnings = []
@@ -46,6 +62,14 @@ def import_holding_file(
         trade_date,
         str(path),
         warnings,
+    )
+    snapshot_candidates = _build_straddle_candidates(
+        snapshot_rows,
+        metadata,
+        config,
+        trade_date,
+        str(path),
+        [],
     )
     local = account_store.load_account(product, account_id=account_id)
     if not rows and not include_existing and not _local_contains_snapshot_rows(
@@ -66,6 +90,19 @@ def import_holding_file(
             )
     applied = []
     skipped = []
+    local = _apply_existing_position_rebalances(
+        product,
+        account_id,
+        local,
+        snapshot_candidates,
+        trade_summary,
+        trade_summary_path,
+        source_timestamp,
+        dry_run,
+        applied,
+        warnings,
+        config,
+    )
 
     for candidate in candidates:
         if candidate.get("kind") == "option_hedge":
@@ -143,7 +180,20 @@ def import_holding_file(
         applied,
         warnings,
     )
-    _warn_missing_local_positions(local, snapshot_rows, warnings)
+    local = _apply_missing_straddle_closes(
+        product,
+        account_id,
+        local,
+        snapshot_rows,
+        trade_summary,
+        trade_summary_path,
+        trade_date,
+        config,
+        dry_run,
+        applied,
+        warnings,
+    )
+    _warn_missing_local_positions(local, snapshot_rows, warnings, applied)
     return {
         "product": product,
         "account_id": account_id,
@@ -157,6 +207,146 @@ def import_holding_file(
         "applied": applied,
         "skipped": skipped,
         "warnings": warnings,
+    }
+
+
+def _apply_existing_position_rebalances(
+    product,
+    account_id,
+    local,
+    snapshot_candidates,
+    trade_summary,
+    trade_summary_path,
+    source_timestamp,
+    dry_run,
+    applied,
+    warnings,
+    config,
+):
+    summary_by_code = _trade_summary_by_code(trade_summary)
+    for candidate in snapshot_candidates:
+        if candidate.get("kind") != "straddle":
+            continue
+        side = candidate["side"]
+        snapshot_fill = candidate["fill"]
+        existing = local.positions.get(side)
+        if existing is None or _same_position(existing, snapshot_fill):
+            continue
+        if (
+            str(existing.get("call_code")) != str(snapshot_fill.get("call_code"))
+            or str(existing.get("put_code")) != str(snapshot_fill.get("put_code"))
+        ):
+            continue
+        fill = _straddle_leg_rebalance_fill(
+            existing,
+            snapshot_fill,
+            summary_by_code,
+            trade_summary_path,
+            source_timestamp,
+            config,
+        )
+        if fill is None:
+            warnings.append(
+                {
+                    "side": side,
+                    "reason": (
+                        "broker snapshot changed straddle leg quantities, but matching "
+                        "trade summary does not prove the quantity adjustment"
+                    ),
+                    "local_position": existing,
+                    "snapshot_fill": snapshot_fill,
+                }
+            )
+            continue
+        if dry_run:
+            applied.append({"dry_run": True, "fill": fill})
+        else:
+            local = account_store.record_fill(product, fill, account_id=account_id)
+            applied.append({"dry_run": False, "fill": fill})
+    return local
+
+
+def _straddle_leg_rebalance_fill(
+    existing,
+    snapshot_fill,
+    summary_by_code,
+    trade_summary_path,
+    source_timestamp,
+    config,
+):
+    side = str(snapshot_fill.get("side"))
+    multiplier = int(snapshot_fill.get("contract_multiplier", config.vol.contract_multiplier))
+    cash_delta = 0.0
+    total_fee = 0.0
+    adjustments = []
+    for leg in ["call", "put"]:
+        code = str(snapshot_fill.get(f"{leg}_code"))
+        old_qty = int(existing.get(f"{leg}_qty", 0) or 0)
+        new_qty = int(snapshot_fill.get(f"{leg}_qty", 0) or 0)
+        qty_change = new_qty - old_qty
+        if qty_change == 0:
+            continue
+        summary = summary_by_code.get(code)
+        trade = _straddle_leg_trade_from_summary(side, qty_change, summary)
+        if trade is None:
+            return None
+        fee = abs(qty_change) * float(config.backtest.option_fee_per_contract)
+        cash_delta += trade["cash_delta"] * multiplier - fee
+        total_fee += fee
+        adjustments.append(
+            {
+                "leg": leg,
+                "order_book_id": code,
+                "qty_change": qty_change,
+                **trade,
+                "fee": fee,
+            }
+        )
+    if not adjustments:
+        return None
+    if side == "short":
+        cash_delta += (
+            float(existing.get("option_margin", 0.0) or 0.0)
+            - float(snapshot_fill.get("option_margin", 0.0) or 0.0)
+        )
+    return {
+        **snapshot_fill,
+        "action": "rebalance_straddle_legs",
+        "entry_date": existing.get("entry_date"),
+        "cash_delta": cash_delta,
+        "estimated_fee": total_fee,
+        "leg_adjustments": adjustments,
+        "source_timestamp": source_timestamp,
+        "source_file": snapshot_fill.get("source_file"),
+        "trade_source_file": str(trade_summary_path) if trade_summary_path is not None else None,
+        "import_source": "broker_holding_and_trade_summary_leg_rebalance",
+    }
+
+
+def _straddle_leg_trade_from_summary(side, qty_change, summary):
+    if summary is None:
+        return None
+    if side == "short" and qty_change < 0:
+        qty_column, price_column, direction = "买平", "买平均价", "买入平仓"
+        cash_sign = -1.0
+    elif side == "short" and qty_change > 0:
+        qty_column, price_column, direction = "卖开", "卖开均价", "卖出开仓"
+        cash_sign = 1.0
+    elif side == "long" and qty_change < 0:
+        qty_column, price_column, direction = "卖平", "卖平均价", "卖出平仓"
+        cash_sign = 1.0
+    else:
+        qty_column, price_column, direction = "买开", "买开均价", "买入开仓"
+        cash_sign = -1.0
+    qty = int(_number(summary.get(qty_column), 0) or 0)
+    price = _number(summary.get(price_column))
+    if qty < abs(qty_change) or price is None:
+        return None
+    return {
+        "direction": direction,
+        "price": price,
+        "qty": abs(qty_change),
+        "cash_delta": cash_sign * price * abs(qty_change),
     }
 
 
@@ -228,6 +418,126 @@ def _trade_summary_by_code(df):
             continue
         result[code] = row.to_dict()
     return result
+
+
+def _remove_rows_fully_closed_after_snapshot(rows, trade_summary):
+    summary_by_code = _trade_summary_by_code(trade_summary)
+    result = []
+    for row in rows:
+        summary = summary_by_code.get(str(row.get("order_book_id")))
+        side = str(row.get("side") or "")
+        close_column = "买平" if side == "short" else "卖平"
+        close_qty = int(_number(summary.get(close_column), 0) or 0) if summary else 0
+        holding_qty = int(row.get("total_qty", 0) or 0)
+        if holding_qty > 0 and close_qty >= holding_qty:
+            continue
+        result.append(row)
+    return result
+
+
+def _apply_missing_straddle_closes(
+    product,
+    account_id,
+    local,
+    snapshot_rows,
+    trade_summary,
+    trade_summary_path,
+    trade_date,
+    config,
+    dry_run,
+    applied,
+    warnings,
+):
+    snapshot_codes = {str(row["order_book_id"]) for row in snapshot_rows}
+    summary_by_code = _trade_summary_by_code(trade_summary)
+    for side, position in list(local.positions.items()):
+        if position is None:
+            continue
+        call_code = str(position.get("call_code") or "")
+        put_code = str(position.get("put_code") or "")
+        if call_code in snapshot_codes or put_code in snapshot_codes:
+            continue
+        fill = _straddle_close_fill(
+            position,
+            summary_by_code,
+            trade_date,
+            trade_summary_path,
+            config,
+        )
+        if fill is None:
+            warnings.append(
+                {
+                    "side": side,
+                    "reason": (
+                        "local straddle is absent from effective holding snapshot, "
+                        "but matching trade summary does not prove both legs were "
+                        "fully closed"
+                    ),
+                    "local_position": position,
+                }
+            )
+            continue
+        if dry_run:
+            applied.append({"dry_run": True, "fill": fill})
+        else:
+            local = account_store.record_fill(product, fill, account_id=account_id)
+            applied.append({"dry_run": False, "fill": fill})
+    return local
+
+
+def _straddle_close_fill(position, summary_by_code, trade_date, source_file, config):
+    side = str(position.get("side") or "short")
+    close_qty_column = "买平" if side == "short" else "卖平"
+    close_price_column = "买平均价" if side == "short" else "卖平均价"
+    multiplier = int(
+        _number(position.get("contract_multiplier"), config.vol.contract_multiplier)
+        or config.vol.contract_multiplier
+    )
+    legs = []
+    for leg in ["call", "put"]:
+        code = str(position.get(f"{leg}_code") or "")
+        qty = int(position.get(f"{leg}_qty", 0) or 0)
+        summary = summary_by_code.get(code)
+        close_qty = int(_number(summary.get(close_qty_column), 0) or 0) if summary else 0
+        close_price = _number(summary.get(close_price_column)) if summary else None
+        if qty <= 0 or close_qty < qty or close_price is None:
+            return None
+        legs.append(
+            {
+                "leg": leg,
+                "order_book_id": code,
+                "qty": qty,
+                "price": close_price,
+            }
+        )
+
+    fee = sum(item["qty"] for item in legs) * float(config.backtest.option_fee_per_contract)
+    close_value = sum(item["qty"] * item["price"] * multiplier for item in legs)
+    margin_release = float(position.get("option_margin", 0.0) or 0.0) if side == "short" else 0.0
+    cash_delta = close_value - fee if side == "long" else -close_value - fee + margin_release
+    return {
+        "action": f"close_{side}_straddle",
+        "side": side,
+        "date": trade_date,
+        "call_code": position.get("call_code"),
+        "put_code": position.get("put_code"),
+        "call_qty": int(position.get("call_qty", 0) or 0),
+        "put_qty": int(position.get("put_qty", 0) or 0),
+        "call_price": legs[0]["price"],
+        "put_price": legs[1]["price"],
+        "contract_multiplier": multiplier,
+        "fee": fee,
+        "option_margin_release": margin_release,
+        "cash_delta": cash_delta,
+        "leg_closes": legs,
+        "source_timestamp": _parse_timestamp_from_filename(source_file),
+        "import_source": "broker_option_trade_summary",
+        "source_file": str(source_file),
+        "source_limitations": [
+            "option trade summary is aggregated and has no per-fill execution id/time",
+            "configured local option fee is used because broker export fee is unavailable",
+        ],
+    }
 
 
 def _option_hedge_close_fill(hedge, summary, trade_date, source_file, config):
@@ -684,10 +994,17 @@ def _is_newer_mark(fill, position):
     return str(source_timestamp) > str(existing_timestamp)
 
 
-def _warn_missing_local_positions(local, rows, warnings):
+def _warn_missing_local_positions(local, rows, warnings, applied=None):
     snapshot_codes = {row["order_book_id"] for row in rows}
+    closing_sides = {
+        item.get("fill", {}).get("side")
+        for item in (applied or [])
+        if str(item.get("fill", {}).get("action", "")).startswith("close_")
+    }
     for side, position in local.positions.items():
         if position is None:
+            continue
+        if side in closing_sides:
             continue
         if position.get("call_code") not in snapshot_codes and position.get("put_code") not in snapshot_codes:
             warnings.append(
