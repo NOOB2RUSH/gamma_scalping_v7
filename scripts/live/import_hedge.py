@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument(
         "--trade-file",
         default=None,
-        help="Security trade CSV path. Defaults to newest live_hold/证券委托查询_实时成交*.csv.",
+        help="Security order/trade CSV path. Defaults to newest live_hold/证券委托查询*.csv.",
     )
     parser.add_argument("--account-id", default="default")
     parser.add_argument(

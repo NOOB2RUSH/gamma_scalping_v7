@@ -127,6 +127,23 @@ def _format_advice_item(item):
             )
         ]
 
+    if action in {"OPTION_DELTA_HEDGE_SHORT_CALL", "FINAL_OPTION_DELTA_HEDGE_SHORT_CALL"}:
+        return [
+            (
+                f"{action} after={item.get('after_actions')} "
+                f"qty={item.get('call_qty')} call={item.get('call_code')} "
+                f"strike={item.get('strike')} expiry={item.get('expiry')} "
+                f"call_px={_fmt(item.get('estimated_call_price'))} "
+                f"single_delta={_fmt(item.get('single_call_delta'))} "
+                f"hedge_delta={_fmt(item.get('estimated_hedge_delta'))} "
+                f"residual_before={_fmt(item.get('residual_delta_before_option_hedge'))} "
+                f"projected_after={_fmt(item.get('projected_account_delta_after_option_hedge'))} "
+                f"margin={_fmt(item.get('estimated_option_margin'))} "
+                f"cash_effect={_fmt(item.get('estimated_cash_effect'))} "
+                f"reason={reason}"
+            )
+        ]
+
     if action == "COOLDOWN_BLOCK":
         return [
             (

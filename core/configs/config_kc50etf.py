@@ -47,6 +47,9 @@ CONFIG = AppConfig(
         short_stop_loss_enabled=False,
         short_stop_loss_rate=0.40,
         enable_delta_hedge=True,
+        allow_etf_short_hedge=False,
+        enable_option_delta_hedge=True,
+        option_delta_hedge_call_otm_steps=1,
         # 该退出信号依赖估算后的单合约成交量，适合捕捉明显放量，
         # 但不代表真实逐合约成交量的严格放大。
         short_volume_spike_exit_enabled=True,

@@ -72,6 +72,7 @@ def main():
             for sheet_name, path in paths["csv"].items():
                 print(f"account_report_csv[{sheet_name}]={path}")
         print(f"account_report_json={paths['json']}")
+        print(f"account_report_diagnostics={paths['diagnostics']}")
 
     for line in account_report.format_terminal_summary(payload):
         print(line)

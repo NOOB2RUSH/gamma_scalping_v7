@@ -21,17 +21,37 @@ def import_holding_file(
     dry_run=False,
 ):
     config = load_product_config(product)
-    path = _resolve_holding_file(file_path)
+    path = _resolve_holding_file(file_path, date)
     trade_date = date or _parse_date_from_filename(path) or pd.Timestamp.today().strftime(
         "%Y-%m-%d"
     )
+    source_timestamp = _parse_timestamp_from_filename(path)
     raw = _read_holding_csv(path)
     rows = _normalize_rows(raw, include_existing)
+    snapshot_rows = _normalize_rows(raw, True)
+    trade_summary_path = _resolve_trade_summary_file(trade_date)
+    trade_summary = (
+        _read_holding_csv(trade_summary_path)
+        if trade_summary_path is not None
+        else pd.DataFrame()
+    )
     codes = [row["order_book_id"] for row in rows]
     metadata = _load_contract_metadata(config, codes)
 
     warnings = []
-    if not rows and not include_existing:
+    candidates = _build_straddle_candidates(
+        rows,
+        metadata,
+        config,
+        trade_date,
+        str(path),
+        warnings,
+    )
+    local = account_store.load_account(product, account_id=account_id)
+    if not rows and not include_existing and not _local_contains_snapshot_rows(
+        local,
+        snapshot_rows,
+    ):
         existing_qty = _total_positive_holding_qty(raw)
         if existing_qty > 0:
             warnings.append(
@@ -44,19 +64,35 @@ def import_holding_file(
                     "total_positive_holding_qty": existing_qty,
                 }
             )
-    candidates = _build_straddle_candidates(
-        rows,
-        metadata,
-        config,
-        trade_date,
-        str(path),
-        warnings,
-    )
-    local = account_store.load_account(product, account_id=account_id)
     applied = []
     skipped = []
 
     for candidate in candidates:
+        if candidate.get("kind") == "option_hedge":
+            fill = candidate["fill"]
+            existing = _matching_option_hedge(local, fill)
+            if existing is not None:
+                skipped.append(
+                    {
+                        "side": fill.get("side"),
+                        "reason": "local_option_hedge_already_matches_snapshot",
+                        "fill": fill,
+                    }
+                )
+                if _is_newer_mark(fill, existing):
+                    mark_fill = _option_hedge_mark_update_fill(fill, source_timestamp)
+                    if dry_run:
+                        applied.append({"dry_run": True, "fill": mark_fill})
+                    else:
+                        local = account_store.record_fill(product, mark_fill, account_id=account_id)
+                        applied.append({"dry_run": False, "fill": mark_fill})
+            elif dry_run:
+                applied.append({"dry_run": True, "fill": fill})
+            else:
+                local = account_store.record_fill(product, fill, account_id=account_id)
+                applied.append({"dry_run": False, "fill": fill})
+            continue
+
         side = candidate["side"]
         fill = candidate["fill"]
         existing = local.positions.get(side)
@@ -69,6 +105,13 @@ def import_holding_file(
                         "fill": fill,
                     }
                 )
+                if _is_newer_mark(fill, existing):
+                    mark_fill = _mark_update_fill(fill, source_timestamp)
+                    if dry_run:
+                        applied.append({"dry_run": True, "fill": mark_fill})
+                    else:
+                        local = account_store.record_fill(product, mark_fill, account_id=account_id)
+                        applied.append({"dry_run": False, "fill": mark_fill})
                 continue
             warnings.append(
                 {
@@ -87,11 +130,25 @@ def import_holding_file(
         local = account_store.record_fill(product, fill, account_id=account_id)
         applied.append({"dry_run": False, "fill": fill})
 
-    _warn_missing_local_positions(local, rows, warnings)
+    local = _apply_missing_option_hedge_closes(
+        product,
+        account_id,
+        local,
+        snapshot_rows,
+        trade_summary,
+        trade_summary_path,
+        trade_date,
+        config,
+        dry_run,
+        applied,
+        warnings,
+    )
+    _warn_missing_local_positions(local, snapshot_rows, warnings)
     return {
         "product": product,
         "account_id": account_id,
         "file": str(path),
+        "trade_file": str(trade_summary_path) if trade_summary_path is not None else None,
         "trade_date": trade_date,
         "include_existing": include_existing,
         "dry_run": dry_run,
@@ -103,16 +160,153 @@ def import_holding_file(
     }
 
 
-def _resolve_holding_file(file_path):
+def _apply_missing_option_hedge_closes(
+    product,
+    account_id,
+    local,
+    snapshot_rows,
+    trade_summary,
+    trade_summary_path,
+    trade_date,
+    config,
+    dry_run,
+    applied,
+    warnings,
+):
+    snapshot_codes = {str(row["order_book_id"]) for row in snapshot_rows}
+    summary_by_code = _trade_summary_by_code(trade_summary)
+    for hedge in list(getattr(local, "option_hedges", []) or []):
+        code = str(hedge.get("order_book_id") or "")
+        if not code or code in snapshot_codes:
+            continue
+        summary = summary_by_code.get(code)
+        if summary is None:
+            warnings.append(
+                {
+                    "order_book_id": code,
+                    "reason": (
+                        "local option hedge is absent from holding snapshot, but no "
+                        "matching option trade summary was found; close was not applied"
+                    ),
+                }
+            )
+            continue
+        fill = _option_hedge_close_fill(
+            hedge,
+            summary,
+            trade_date,
+            trade_summary_path,
+            config,
+        )
+        if fill is None:
+            warnings.append(
+                {
+                    "order_book_id": code,
+                    "reason": (
+                        "matching option trade summary does not prove a full close; "
+                        "close was not applied"
+                    ),
+                    "trade_summary": summary,
+                }
+            )
+            continue
+        if dry_run:
+            applied.append({"dry_run": True, "fill": fill})
+        else:
+            local = account_store.record_fill(product, fill, account_id=account_id)
+            applied.append({"dry_run": False, "fill": fill})
+    return local
+
+
+def _trade_summary_by_code(df):
+    result = {}
+    if df is None or df.empty or "合约代码" not in df.columns:
+        return result
+    for _, row in df.iterrows():
+        code = str(row.get("合约代码", "")).strip()
+        if not code or code == "全部":
+            continue
+        result[code] = row.to_dict()
+    return result
+
+
+def _option_hedge_close_fill(hedge, summary, trade_date, source_file, config):
+    side = str(hedge.get("side") or "long")
+    qty_column = "卖平" if side == "long" else "买平"
+    price_column = "卖平均价" if side == "long" else "买平均价"
+    close_qty = int(_number(summary.get(qty_column), 0) or 0)
+    position_qty = int(_number(hedge.get("qty"), 0) or 0)
+    close_price = _number(summary.get(price_column))
+    if position_qty <= 0 or close_qty != position_qty or close_price is None:
+        return None
+
+    multiplier = int(
+        _number(hedge.get("contract_multiplier"), config.vol.contract_multiplier)
+        or config.vol.contract_multiplier
+    )
+    fee = close_qty * float(config.backtest.option_fee_per_contract)
+    close_value = close_price * close_qty * multiplier
+    margin_release = float(hedge.get("option_margin", 0.0) or 0.0) if side == "short" else 0.0
+    cash_delta = close_value - fee if side == "long" else -close_value - fee + margin_release
+    return {
+        "action": "close_option_hedge",
+        "side": side,
+        "option_hedge_type": hedge.get("option_hedge_type"),
+        "option_type": hedge.get("option_type"),
+        "date": trade_date,
+        "order_book_id": hedge.get("order_book_id"),
+        "call_code": (
+            hedge.get("call_code") or hedge.get("order_book_id")
+            if hedge.get("option_type") == "c"
+            else None
+        ),
+        "put_code": (
+            hedge.get("put_code") or hedge.get("order_book_id")
+            if hedge.get("option_type") == "p"
+            else None
+        ),
+        "qty": close_qty,
+        "call_qty": close_qty if hedge.get("option_type") == "c" else 0,
+        "put_qty": close_qty if hedge.get("option_type") == "p" else 0,
+        "price": close_price,
+        "close_price": close_price,
+        "contract_multiplier": multiplier,
+        "fee": fee,
+        "realized_pnl": _number(summary.get("平仓盈亏")),
+        "cash_delta": cash_delta,
+        "source_timestamp": _parse_timestamp_from_filename(source_file),
+        "import_source": "broker_option_trade_summary",
+        "source_file": str(source_file),
+        "source_limitations": [
+            "option trade summary is aggregated and has no per-fill execution id/time",
+            "configured local option fee is used because broker export fee is unavailable",
+        ],
+    }
+
+
+def _resolve_holding_file(file_path, report_date=None):
     if file_path is not None:
         return Path(file_path)
     files = sorted(
         Path("live_hold").glob("实时持仓*.csv"),
         key=lambda item: item.stat().st_mtime,
     )
+    if report_date is not None:
+        files = [item for item in files if _parse_date_from_filename(item) == report_date]
     if not files:
-        raise FileNotFoundError("No holding CSV found under live_hold/实时持仓*.csv.")
+        suffix = f" for date {report_date}" if report_date is not None else ""
+        raise FileNotFoundError(f"No holding CSV found under live_hold/实时持仓*.csv{suffix}.")
     return files[-1]
+
+
+def _resolve_trade_summary_file(report_date=None):
+    files = sorted(
+        Path("live_hold").glob("成交汇总*.csv"),
+        key=lambda item: item.stat().st_mtime,
+    )
+    if report_date is not None:
+        files = [item for item in files if _parse_date_from_filename(item) == report_date]
+    return files[-1] if files else None
 
 
 def _read_holding_csv(path):
@@ -224,15 +418,25 @@ def _build_straddle_candidates(rows, metadata, config, trade_date, source_file, 
         }
 
     by_side = {}
+    option_hedge_candidates = []
     for key, legs in grouped.items():
         side, strike, expiry = key
         if "call" not in legs or "put" not in legs:
-            warnings.append(
+            leg_name, leg_payload = next(iter(legs.items()))
+            option_hedge_candidates.append(
                 {
+                    "kind": "option_hedge",
                     "side": side,
-                    "strike": strike,
-                    "expiry": expiry,
-                    "reason": "unpaired option holding; live account currently supports straddle pairs only",
+                    "fill": _single_leg_candidate_to_fill(
+                        side,
+                        strike,
+                        expiry,
+                        leg_name,
+                        leg_payload,
+                        config,
+                        trade_date,
+                        source_file,
+                    ),
                 }
             )
             continue
@@ -252,6 +456,7 @@ def _build_straddle_candidates(rows, metadata, config, trade_date, source_file, 
         strike, expiry, legs = pairs[0]
         candidates.append(
             {
+                "kind": "straddle",
                 "side": side,
                 "fill": _candidate_to_fill(
                     side,
@@ -264,6 +469,7 @@ def _build_straddle_candidates(rows, metadata, config, trade_date, source_file, 
                 ),
             }
         )
+    candidates.extend(option_hedge_candidates)
     return candidates
 
 
@@ -302,6 +508,8 @@ def _candidate_to_fill(side, strike, expiry, legs, config, trade_date, source_fi
         "put_qty": put_qty,
         "entry_call_price": entry_call_price,
         "entry_put_price": entry_put_price,
+        "last_call_price": float(call["latest_price"]),
+        "last_put_price": float(put["latest_price"]),
         "entry_call_volume": None,
         "entry_put_volume": None,
         "entry_total_volume": None,
@@ -311,6 +519,7 @@ def _candidate_to_fill(side, strike, expiry, legs, config, trade_date, source_fi
         "option_margin": margin if side == "short" else 0.0,
         "last_option_value": latest_value,
         "cash_delta": cash_delta,
+        "source_timestamp": _parse_timestamp_from_filename(source_file),
         "import_source": "broker_holding_snapshot",
         "source_file": source_file,
         "source_broker_account": call.get("broker_account") or put.get("broker_account"),
@@ -322,6 +531,67 @@ def _candidate_to_fill(side, strike, expiry, legs, config, trade_date, source_fi
     }
 
 
+def _single_leg_candidate_to_fill(
+    side,
+    strike,
+    expiry,
+    leg_name,
+    leg_payload,
+    config,
+    trade_date,
+    source_file,
+):
+    row = leg_payload["row"]
+    meta = leg_payload["meta"]
+    multiplier = meta["contract_multiplier"]
+    qty = int(row["qty"])
+    entry_price = float(row["entry_price"])
+    latest_price = float(row["latest_price"])
+    entry_value = entry_price * qty * multiplier
+    latest_value = latest_price * qty * multiplier
+    fee = qty * config.backtest.option_fee_per_contract
+    margin = float(row["margin"] or 0.0)
+    cash_delta = entry_value - fee - margin if side == "short" else -entry_value - fee
+    call_code = row["order_book_id"] if leg_name == "call" else None
+    put_code = row["order_book_id"] if leg_name == "put" else None
+    return {
+        "action": "open_option_hedge",
+        "side": side,
+        "option_hedge_type": f"{side}_{leg_name}",
+        "option_type": "c" if leg_name == "call" else "p",
+        "date": trade_date,
+        "order_book_id": row["order_book_id"],
+        "call_code": call_code,
+        "put_code": put_code,
+        "strike": strike,
+        "expiry": expiry,
+        "qty": qty,
+        "call_qty": qty if leg_name == "call" else 0,
+        "put_qty": qty if leg_name == "put" else 0,
+        "entry_price": entry_price,
+        "entry_call_price": entry_price if leg_name == "call" else None,
+        "entry_put_price": entry_price if leg_name == "put" else None,
+        "last_price": latest_price,
+        "last_call_price": latest_price if leg_name == "call" else None,
+        "last_put_price": latest_price if leg_name == "put" else None,
+        "contract_multiplier": multiplier,
+        "contract_symbol": meta.get("contract_symbol"),
+        "entry_option_value": entry_value,
+        "option_margin": margin if side == "short" else 0.0,
+        "last_option_value": -latest_value if side == "short" else latest_value,
+        "cash_delta": cash_delta,
+        "source_timestamp": _parse_timestamp_from_filename(source_file),
+        "import_source": "broker_holding_snapshot",
+        "source_file": source_file,
+        "source_broker_account": row.get("broker_account"),
+        "source_limitations": [
+            "single-leg option hedge inferred from unpaired broker holding row",
+            "holding snapshot has no per-fill execution id/time",
+            "cash_delta is estimated from open average, configured fee, and occupied margin",
+        ],
+    }
+
+
 def _same_position(position, fill):
     return (
         str(position.get("call_code")) == str(fill.get("call_code"))
@@ -329,6 +599,89 @@ def _same_position(position, fill):
         and int(position.get("call_qty", 0) or 0) == int(fill.get("call_qty", 0) or 0)
         and int(position.get("put_qty", 0) or 0) == int(fill.get("put_qty", 0) or 0)
     )
+
+
+def _matching_option_hedge(local, fill):
+    code = fill.get("order_book_id") or fill.get("call_code") or fill.get("put_code")
+    side = fill.get("side")
+    for hedge in getattr(local, "option_hedges", []) or []:
+        if str(hedge.get("order_book_id")) != str(code):
+            continue
+        if str(hedge.get("side")) != str(side):
+            continue
+        if int(hedge.get("qty", 0) or 0) != int(fill.get("qty", 0) or 0):
+            continue
+        return hedge
+    return None
+
+
+def _local_contains_snapshot_rows(local, rows):
+    local_qty = {}
+    for position in local.positions.values():
+        if position is None:
+            continue
+        local_qty[str(position.get("call_code"))] = int(position.get("call_qty", 0) or 0)
+        local_qty[str(position.get("put_code"))] = int(position.get("put_qty", 0) or 0)
+    for hedge in getattr(local, "option_hedges", []) or []:
+        local_qty[str(hedge.get("order_book_id"))] = int(hedge.get("qty", 0) or 0)
+    return all(
+        local_qty.get(str(row.get("order_book_id"))) == int(row.get("total_qty", 0) or 0)
+        for row in rows
+    )
+
+
+def _mark_update_fill(fill, source_timestamp):
+    return {
+        "action": "option_mark_update",
+        "side": fill["side"],
+        "date": fill["date"],
+        "call_code": fill["call_code"],
+        "put_code": fill["put_code"],
+        "call_qty": fill["call_qty"],
+        "put_qty": fill["put_qty"],
+        "last_call_price": fill.get("last_call_price"),
+        "last_put_price": fill.get("last_put_price"),
+        "last_option_value": fill.get("last_option_value"),
+        "option_margin": fill.get("option_margin"),
+        "cash_delta": 0.0,
+        "source_file": fill.get("source_file"),
+        "source_timestamp": source_timestamp or fill.get("source_timestamp"),
+        "import_source": "broker_holding_mark_snapshot",
+    }
+
+
+def _option_hedge_mark_update_fill(fill, source_timestamp):
+    return {
+        "action": "option_hedge_mark_update",
+        "side": fill["side"],
+        "date": fill["date"],
+        "order_book_id": fill["order_book_id"],
+        "option_type": fill.get("option_type"),
+        "call_code": fill.get("call_code"),
+        "put_code": fill.get("put_code"),
+        "qty": fill["qty"],
+        "call_qty": fill.get("call_qty"),
+        "put_qty": fill.get("put_qty"),
+        "last_price": fill.get("last_price"),
+        "last_call_price": fill.get("last_call_price"),
+        "last_put_price": fill.get("last_put_price"),
+        "last_option_value": fill.get("last_option_value"),
+        "option_margin": fill.get("option_margin"),
+        "cash_delta": 0.0,
+        "source_file": fill.get("source_file"),
+        "source_timestamp": source_timestamp or fill.get("source_timestamp"),
+        "import_source": "broker_holding_mark_snapshot",
+    }
+
+
+def _is_newer_mark(fill, position):
+    source_timestamp = fill.get("source_timestamp")
+    if source_timestamp is None:
+        return True
+    existing_timestamp = position.get("last_mark_source_timestamp")
+    if existing_timestamp is None:
+        return True
+    return str(source_timestamp) > str(existing_timestamp)
 
 
 def _warn_missing_local_positions(local, rows, warnings):
@@ -351,6 +704,17 @@ def _parse_date_from_filename(path):
     if match:
         return "-".join(match.groups())
     return None
+
+
+def _parse_timestamp_from_filename(path):
+    match = re.search(
+        r"(20\d{2})_(\d{2})_(\d{2})-(\d{2})_(\d{2})_(\d{2})",
+        str(path),
+    )
+    if not match:
+        return None
+    year, month, day, hour, minute, second = match.groups()
+    return f"{year}-{month}-{day}T{hour}:{minute}:{second}"
 
 
 def _number(value, default=None):

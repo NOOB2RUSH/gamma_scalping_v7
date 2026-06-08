@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import math
-import os
-import time
+from copy import deepcopy
 from pathlib import Path
 
 import pandas as pd
@@ -13,23 +12,21 @@ from . import storage
 from .runtime import load_product_config
 
 
-def generate_signal(product, account_id="default", date=None, quote_snapshot=None, read_only=True):
+def generate_signal(product, account_id="default", date=None, quote_snapshot=None):
     config = load_product_config(product)
     live_account = account_store.load_account(product, account_id=account_id)
     market = _load_market_context(
         config,
         date,
         quote_snapshot=quote_snapshot,
-        persist_feature_history=False,
     )
 
     feature_row = market["signal_row"]
     spot = float(feature_row["close"])
     chain_df = market["chain_df"]
     atm = core.vol_engine.select_atm_from_chain(chain_df, spot)
-    state_changed = _refresh_strategy_state(
-        config,
-        live_account,
+    signal_state = _strategy_state_for_signal(
+        live_account.strategy_state,
         market["signals"],
         market["date"],
     )
@@ -52,13 +49,24 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
             market["date"],
             atm,
             spot,
-            live_account.strategy_state,
+            signal_state,
             config,
         )
         strategy_advice.extend(side_advice)
         if greeks is not None:
             position_greeks.append(greeks)
             position_greeks_by_side[side] = greeks
+        if option_value is not None:
+            position_values.append(option_value)
+
+    for index, hedge_position in enumerate(getattr(live_account, "option_hedges", []) or []):
+        greeks, option_value = _option_hedge_greeks_and_value(
+            hedge_position,
+            chain_df,
+        )
+        if greeks is not None:
+            position_greeks.append(greeks)
+            position_greeks_by_side[f"option_hedge:{index}"] = greeks
         if option_value is not None:
             position_values.append(option_value)
 
@@ -69,7 +77,7 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
                 feature_row,
                 atm,
                 spot,
-                live_account.strategy_state,
+                signal_state,
             )
         )
 
@@ -105,12 +113,11 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
         "planned_account_greeks": planned_greeks,
         "account_delta_after_hedge": account_greeks["delta"] + live_account.hedge.qty,
         "estimated_option_value": sum(position_values),
-        "strategy_state": live_account.strategy_state.to_dict(),
+        "strategy_state": signal_state.to_dict(),
         "advice": advice,
         "data_warning": {
             **market["data_warning"],
             "read_only_signal": True,
-            "state_changed_in_memory": state_changed,
         },
     }
 
@@ -121,11 +128,10 @@ def preview_signal(product, account_id="default", date=None, quote_snapshot=None
         account_id=account_id,
         date=date,
         quote_snapshot=quote_snapshot,
-        read_only=True,
     )
 
 
-def _load_market_context(config, date, quote_snapshot=None, persist_feature_history=True):
+def _load_market_context(config, date, quote_snapshot=None):
     start = config.backtest.start
     end = config.backtest.end if date is None else date
     etf_by_date = core.data_loader.load_etf_series(start, end)
@@ -174,7 +180,6 @@ def _load_market_context(config, date, quote_snapshot=None, persist_feature_hist
             trading_calendar,
             start,
             latest_date,
-            persist=persist_feature_history,
         )
         seeded_history = True
 
@@ -183,7 +188,6 @@ def _load_market_context(config, date, quote_snapshot=None, persist_feature_hist
         history,
         latest_features,
         latest_date,
-        persist=persist_feature_history,
     )
     signals = core.strategy.build_signals(features)
     if latest_date not in signals.index:
@@ -198,7 +202,6 @@ def _load_market_context(config, date, quote_snapshot=None, persist_feature_hist
             "latest_signal_date": str(latest_date.date()),
             "mode": data_mode,
             "seeded_feature_history": seeded_history,
-            "read_only": not persist_feature_history,
         },
     }
 
@@ -265,29 +268,8 @@ def _load_feature_history(product):
     return history.sort_index()
 
 
-def _save_feature_history(product, features):
-    path = storage.feature_history_path(product)
-    payload = features.reset_index()
-    if "index" in payload.columns and "date" not in payload.columns:
-        payload = payload.rename(columns={"index": "date"})
-    tmp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
-    payload.to_parquet(tmp_path, index=False)
-    for attempt in range(5):
-        try:
-            tmp_path.replace(path)
-            return
-        except PermissionError:
-            if attempt == 4:
-                raise
-            time.sleep(0.2)
-
-
-def _seed_feature_history(config, etf_by_date, trading_calendar, start, latest_date, persist=True):
-    """Build the rolling live feature store once.
-
-    This may use the slower historical cache on the first live run. Subsequent
-    ticks update only the latest row in `state/live/<product>/feature_history`.
-    """
+def _seed_feature_history(config, etf_by_date, trading_calendar, start, latest_date):
+    """Build the rolling feature frame in memory when no live history exists."""
     opt_by_date = core.data_loader.load_opt_series(start, latest_date)
     hedge_by_date = core.data_loader.load_hedge_series(start, latest_date)
     opt_by_date = core.data_loader.attach_underlying_prices(opt_by_date, hedge_by_date)
@@ -306,20 +288,16 @@ def _seed_feature_history(config, etf_by_date, trading_calendar, start, latest_d
         start,
         latest_date,
     )
-    if persist:
-        _save_feature_history(config.data.product, features)
     return features
 
 
-def _merge_latest_features(product, history, latest_features, latest_date, persist=True):
+def _merge_latest_features(product, history, latest_features, latest_date):
     latest_features = latest_features.copy()
     latest_features.index = pd.to_datetime(latest_features.index)
     latest_row = latest_features.loc[[latest_date]]
     history = history[history.index != latest_date]
     combined = pd.concat([history, latest_row], axis=0).sort_index()
     combined = _refresh_signal_columns(combined)
-    if persist:
-        _save_feature_history(product, combined)
     return combined
 
 
@@ -347,11 +325,9 @@ def _refresh_signal_columns(features):
     return features
 
 
-def _refresh_strategy_state(config, live_account, features, latest_date):
-    strategy_state = live_account.strategy_state
-    before = strategy_state.to_dict()
+def _strategy_state_for_signal(strategy_state, features, latest_date):
+    strategy_state = deepcopy(strategy_state)
     latest_date = pd.Timestamp(latest_date).normalize()
-    last_signal_date = _date_or_none(strategy_state.last_signal_date)
     trading_dates = pd.DatetimeIndex(pd.to_datetime(features.index)).normalize()
 
     for side in account_store.POSITION_SIDES:
@@ -366,22 +342,7 @@ def _refresh_strategy_state(config, live_account, features, latest_date):
             strategy_state.cooldown_total_days[side] = 0
             strategy_state.cooldown_started_date[side] = None
 
-        position = live_account.positions.get(side)
-        if position is None:
-            strategy_state.strike_mismatch_days[side] = 0
-            continue
-
-        _update_strike_mismatch_days(
-            strategy_state,
-            side,
-            position,
-            features,
-            latest_date,
-            last_signal_date,
-        )
-
-    strategy_state.last_signal_date = str(latest_date.date())
-    return before != strategy_state.to_dict()
+    return strategy_state
 
 
 def _cooldown_left_for_date(strategy_state, side, latest_date, trading_dates):
@@ -399,38 +360,6 @@ def _cooldown_left_for_date(strategy_state, side, latest_date, trading_dates):
         ((trading_dates > started_date) & (trading_dates < latest_date)).sum()
     )
     return max(total_days - completed_after_start, 0)
-
-
-def _update_strike_mismatch_days(
-    strategy_state,
-    side,
-    position,
-    features,
-    latest_date,
-    last_signal_date,
-):
-    if last_signal_date is not None and latest_date <= last_signal_date:
-        return
-
-    start_date = last_signal_date
-    if start_date is None:
-        start_date = _date_or_none(position.get("entry_date"))
-
-    indexed = features.copy()
-    indexed.index = pd.DatetimeIndex(pd.to_datetime(indexed.index)).normalize()
-    if start_date is not None:
-        rows = indexed[(indexed.index > start_date) & (indexed.index <= latest_date)]
-    else:
-        rows = indexed[indexed.index <= latest_date].tail(1)
-
-    for _, row in rows.iterrows():
-        atm_strike = row.get("atm_strike", pd.NA)
-        if pd.notna(atm_strike) and _strike_differs(position.get("strike"), atm_strike):
-            strategy_state.strike_mismatch_days[side] = (
-                int(strategy_state.strike_mismatch_days.get(side, 0) or 0) + 1
-            )
-        else:
-            strategy_state.strike_mismatch_days[side] = 0
 
 
 def _date_or_none(value):
@@ -454,7 +383,14 @@ def _strike_differs(left, right):
         return True
 
 
-def _historical_strike_mismatch(product, side, position, signals, latest_date):
+def _historical_strike_mismatch(
+    product,
+    side,
+    position,
+    signals,
+    latest_date,
+    current_atm_strike=None,
+):
     latest_date = pd.Timestamp(latest_date).normalize()
     entry_date = _date_or_none(position.get("entry_date"))
     if entry_date is None:
@@ -462,42 +398,39 @@ def _historical_strike_mismatch(product, side, position, signals, latest_date):
             f"Cannot evaluate roll mismatch for {side}: current position has no entry_date."
         )
 
-    indexed = signals.copy()
-    indexed.index = pd.DatetimeIndex(pd.to_datetime(indexed.index)).normalize()
-    trading_dates = pd.DatetimeIndex(sorted(set(indexed.index)))
-    dates = [
-        date
-        for date in trading_dates
-        if entry_date <= date <= latest_date
-    ]
+    snapshots = _holding_snapshot_files_by_date()
+    snapshot_dates = sorted(
+        pd.Timestamp(date_text).normalize()
+        for date_text in snapshots
+        if entry_date <= pd.Timestamp(date_text).normalize() <= latest_date
+    )
+    if not snapshot_dates:
+        raise ValueError(
+            "Cannot evaluate roll mismatch: no broker option holding snapshot "
+            f"between entry_date={entry_date.date()} and signal_date={latest_date.date()}. "
+            "Expected live_hold/实时持仓*.csv. No strategy_state fallback is used."
+        )
+    latest_snapshot_date = snapshot_dates[-1]
+
+    dates = snapshot_dates
     if not dates:
         raise ValueError(
-            f"Cannot evaluate roll mismatch for {side}: no signal rows between "
-            f"{entry_date.date()} and {latest_date.date()}."
+            f"Cannot evaluate roll mismatch for {side}: no holding snapshots between "
+            f"{entry_date.date()} and {latest_snapshot_date.date()}."
         )
 
-    snapshots = _holding_snapshot_files_by_date()
     consecutive = 0
     trace = []
     for date in dates:
         date_text = str(date.date())
         path = snapshots.get(date_text)
-        if path is None:
-            raise ValueError(
-                "Missing broker option holding snapshot for roll mismatch check: "
-                f"date={date_text}, expected live_hold/实时持仓*.csv. "
-                "No strategy_state fallback is used."
-            )
-
-        row = indexed.loc[date]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[-1]
-        atm_strike = row.get("atm_strike", pd.NA)
-        if pd.isna(atm_strike):
-            raise ValueError(
-                "Missing ATM strike for roll mismatch check: "
-                f"date={date_text}. No strategy_state fallback is used."
-            )
+        atm_strike, atm_source = _atm_strike_for_roll_check(
+            product,
+            signals,
+            date,
+            latest_date,
+            current_atm_strike,
+        )
 
         if not _holding_snapshot_contains_position(path, position, side):
             raise ValueError(
@@ -516,12 +449,73 @@ def _historical_strike_mismatch(product, side, position, signals, latest_date):
                 "holding_file": str(path),
                 "position_strike": float(position.get("strike")),
                 "atm_strike": float(atm_strike),
+                "atm_source": atm_source,
                 "mismatch": bool(differs),
                 "consecutive_mismatch_days": int(consecutive),
             }
         )
 
-    return {"days": int(consecutive), "trace": trace}
+    return {
+        "days": int(consecutive),
+        "trace": trace,
+        "latest_holding_snapshot_date": str(latest_snapshot_date.date()),
+        "signal_date": str(latest_date.date()),
+        "snapshot_lag_days": int((latest_date - latest_snapshot_date).days),
+    }
+
+
+def _atm_strike_for_roll_check(
+    product,
+    signals,
+    date,
+    latest_date,
+    current_atm_strike=None,
+):
+    date = pd.Timestamp(date).normalize()
+    latest_date = pd.Timestamp(latest_date).normalize()
+    if date == latest_date and current_atm_strike is not None and not pd.isna(current_atm_strike):
+        return float(current_atm_strike), "current_signal_row"
+
+    indexed = signals.copy()
+    indexed.index = pd.DatetimeIndex(pd.to_datetime(indexed.index)).normalize()
+    if date in indexed.index:
+        row = indexed.loc[date]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        atm_strike = row.get("atm_strike", pd.NA)
+        if not pd.isna(atm_strike):
+            return float(atm_strike), "signal_history"
+
+    try:
+        etf_by_date = core.data_loader.load_etf_series(date, date)
+        opt_by_date = core.data_loader.load_opt_series(date, date)
+        try:
+            hedge_by_date = core.data_loader.load_hedge_series(date, date)
+        except Exception:
+            hedge_by_date = None
+        opt_by_date = core.data_loader.attach_underlying_prices(opt_by_date, hedge_by_date)
+        trading_calendar = core.data_loader.load_etf_trading_calendar()
+        chain_df = _build_latest_enriched_chain(
+            etf_by_date,
+            opt_by_date,
+            trading_calendar,
+            date,
+        )
+        spot = float(etf_by_date[date]["close"].iloc[-1])
+        atm = core.vol_engine.select_atm_from_chain(chain_df, spot)
+    except Exception as exc:
+        raise ValueError(
+            "Missing ATM strike for roll mismatch check: "
+            f"date={date.date()}, cannot build from signal history or daily market data: {exc}. "
+            "No strategy_state fallback is used."
+        ) from exc
+
+    if atm is None or pd.isna(atm.get("strike")):
+        raise ValueError(
+            "Missing ATM strike for roll mismatch check: "
+            f"date={date.date()}, no valid ATM pair. No strategy_state fallback is used."
+        )
+    return float(atm["strike"]), "daily_market_data"
 
 
 def _holding_snapshot_files_by_date():
@@ -806,6 +800,7 @@ def _roll_payload(
         position,
         signals,
         latest_date,
+        current_atm_strike=feature_atm_strike,
     )
     mismatch_days = mismatch["days"]
     strike_roll_ready = (
@@ -831,6 +826,8 @@ def _roll_payload(
             "strike_mismatch_days": mismatch_days,
             "strike_mismatch_days_source": "broker_holding_history",
             "strike_mismatch_trace": mismatch["trace"],
+            "latest_holding_snapshot_date": mismatch["latest_holding_snapshot_date"],
+            "snapshot_lag_days": mismatch["snapshot_lag_days"],
             "target_strike": None,
             "target_expiry": None,
         }
@@ -846,6 +843,8 @@ def _roll_payload(
         "strike_mismatch_days": mismatch_days,
         "strike_mismatch_days_source": "broker_holding_history",
         "strike_mismatch_trace": mismatch["trace"],
+        "latest_holding_snapshot_date": mismatch["latest_holding_snapshot_date"],
+        "snapshot_lag_days": mismatch["snapshot_lag_days"],
         "target_call_code": target_atm["call"]["order_book_id"],
         "target_put_code": target_atm["put"]["order_book_id"],
         "target_strike": float(target_atm["strike"]),
@@ -861,6 +860,46 @@ def _entry_target_qty(feature_row, max_qty, side):
     if side == "short":
         return core.strategy.calc_short_entry_target_qty(feature_row, max_qty)
     return core.strategy.calc_entry_target_qty(feature_row, max_qty)
+
+
+def _option_hedge_greeks_and_value(position, chain_df):
+    code = position.get("order_book_id") or position.get("call_code") or position.get("put_code")
+    if code is None:
+        return None, None
+    try:
+        row = _chain_row(chain_df, code)
+    except IndexError:
+        return None, None
+
+    qty = int(position.get("qty", position.get("call_qty", position.get("put_qty", 0))) or 0)
+    if qty <= 0:
+        return None, None
+    multiplier = float(position.get("contract_multiplier", row.get("contract_multiplier", 10000)) or 10000)
+    direction = -1.0 if str(position.get("side", "short")).lower() == "short" else 1.0
+    scale = direction * qty * multiplier
+    value = float(row.get("mid", 0.0) or 0.0) * qty * multiplier
+    if direction < 0:
+        value = -value
+    option_type = str(position.get("option_type") or row.get("option_type") or "").lower()
+    prefix = "call" if option_type == "c" else "put" if option_type == "p" else "leg"
+    greeks = {
+        "delta": float(row.get("delta", 0.0) or 0.0) * scale,
+        "gamma": float(row.get("gamma", 0.0) or 0.0) * scale,
+        "vega": float(row.get("vega", 0.0) or 0.0) * scale,
+        "theta": float(row.get("theta", 0.0) or 0.0) * scale,
+        "call_iv": row.get("iv") if prefix == "call" else 0.0,
+        "put_iv": row.get("iv") if prefix == "put" else 0.0,
+        "position_iv": row.get("iv"),
+        "call_delta": float(row.get("delta", 0.0) or 0.0) * scale if prefix == "call" else 0.0,
+        "put_delta": float(row.get("delta", 0.0) or 0.0) * scale if prefix == "put" else 0.0,
+        "call_gamma": float(row.get("gamma", 0.0) or 0.0) * scale if prefix == "call" else 0.0,
+        "put_gamma": float(row.get("gamma", 0.0) or 0.0) * scale if prefix == "put" else 0.0,
+        "call_vega": float(row.get("vega", 0.0) or 0.0) * scale if prefix == "call" else 0.0,
+        "put_vega": float(row.get("vega", 0.0) or 0.0) * scale if prefix == "put" else 0.0,
+        "call_theta": float(row.get("theta", 0.0) or 0.0) * scale if prefix == "call" else 0.0,
+        "put_theta": float(row.get("theta", 0.0) or 0.0) * scale if prefix == "put" else 0.0,
+    }
+    return greeks, value
 
 
 def _build_execution_plan(
@@ -881,7 +920,7 @@ def _build_execution_plan(
         and _is_option_execution_action(item.get("action"))
     ]
     if not option_actions:
-        plan.extend(_hedge_advice(config, live_account, account_greeks, spot, atm))
+        plan.extend(_hedge_advice(config, live_account, account_greeks, spot, chain_df, atm))
         return plan, account_greeks
 
     planned_greeks = _project_greeks_after_plan(
@@ -901,8 +940,7 @@ def _build_execution_plan(
         chain_df,
         atm,
     )
-    if final_hedge is not None:
-        plan.append(final_hedge)
+    plan.extend(final_hedge)
     return plan, planned_greeks
 
 
@@ -967,39 +1005,18 @@ def _planned_leg_fields(item):
     return None
 
 
-def _hedge_advice(config, live_account, greeks, spot, atm):
-    if not config.strategy.enable_delta_hedge:
-        return []
-    option_delta = float(greeks["delta"])
-    account_delta = option_delta + live_account.hedge.qty
-    tolerance = max(1.0, abs(option_delta) * 0.05)
-    if abs(account_delta) <= tolerance:
-        return []
-
-    target_qty = -option_delta
-    trade_qty = target_qty - live_account.hedge.qty
-    underlying_order_book_id = None
-    if atm is not None:
-        underlying_order_book_id = atm.get("underlying_order_book_id")
-        if underlying_order_book_id is None:
-            underlying_order_book_id = _projected_underlying_id(
-                atm.get("call"),
-                atm.get("put"),
-            )
-    return [
-        {
-            "action": "DELTA_HEDGE",
-            "priority": "action",
-            "reason": "Account delta exceeds tolerance.",
-            "option_delta": option_delta,
-            "current_hedge_qty": live_account.hedge.qty,
-            "account_delta": account_delta,
-            "target_hedge_qty": target_qty,
-            "trade_etf_qty": trade_qty,
-            "estimated_price": spot,
-            "underlying_order_book_id": underlying_order_book_id,
-        }
-    ]
+def _hedge_advice(config, live_account, greeks, spot, chain_df, atm):
+    return _delta_hedge_plan(
+        config,
+        live_account,
+        greeks,
+        spot,
+        chain_df,
+        atm,
+        action="DELTA_HEDGE",
+        option_action="OPTION_DELTA_HEDGE_SHORT_CALL",
+        reason="Account delta exceeds tolerance.",
+    )
 
 
 def _final_hedge_advice(
@@ -1012,40 +1029,334 @@ def _final_hedge_advice(
     atm,
 ):
     if not config.strategy.enable_delta_hedge:
-        return None
+        return []
 
     planned_option_delta = float(planned_greeks["delta"])
     planned_account_delta = planned_option_delta + live_account.hedge.qty
     tolerance = max(1.0, abs(planned_option_delta) * 0.05)
     if abs(planned_account_delta) <= tolerance:
-        return None
+        return []
 
-    target_qty = -planned_option_delta
-    trade_qty = target_qty - live_account.hedge.qty
-    return {
-        "action": "FINAL_DELTA_HEDGE",
-        "priority": "action",
-        "reason": (
+    plan = _delta_hedge_plan(
+        config,
+        live_account,
+        planned_greeks,
+        spot,
+        chain_df,
+        atm,
+        action="FINAL_DELTA_HEDGE",
+        option_action="FINAL_OPTION_DELTA_HEDGE_SHORT_CALL",
+        reason=(
             "After executing the option plan, projected account delta exceeds "
             "tolerance."
         ),
-        "after_actions": [item.get("action") for item in option_actions],
-        "planned_option_delta": planned_option_delta,
-        "current_hedge_qty": live_account.hedge.qty,
-        "planned_account_delta": planned_account_delta,
-        "target_hedge_qty": target_qty,
-        "trade_etf_qty": trade_qty,
-        "estimated_price": spot,
-        "underlying_order_book_id": _underlying_id_after_plan(
+        after_actions=[item.get("action") for item in option_actions],
+        underlying_order_book_id=_underlying_id_after_plan(
             option_actions,
             chain_df,
             atm,
         ),
-        "planned_account_gamma": planned_greeks["gamma"],
-        "planned_account_vega": planned_greeks["vega"],
-        "planned_account_theta": planned_greeks["theta"],
-        "hedge_tolerance": tolerance,
+        exclude_call_codes=_planned_call_codes(option_actions),
+    )
+    for item in plan:
+        item.setdefault("planned_account_gamma", planned_greeks["gamma"])
+        item.setdefault("planned_account_vega", planned_greeks["vega"])
+        item.setdefault("planned_account_theta", planned_greeks["theta"])
+        item.setdefault("hedge_tolerance", tolerance)
+    return plan
+
+
+def _delta_hedge_plan(
+    config,
+    live_account,
+    greeks,
+    spot,
+    chain_df,
+    atm,
+    action,
+    option_action,
+    reason,
+    after_actions=None,
+    underlying_order_book_id=None,
+    exclude_call_codes=None,
+):
+    if not config.strategy.enable_delta_hedge:
+        return []
+
+    option_delta = float(greeks["delta"])
+    current_hedge_qty = float(live_account.hedge.qty or 0.0)
+    account_delta = option_delta + current_hedge_qty
+    tolerance = max(1.0, abs(option_delta) * 0.05)
+    if abs(account_delta) <= tolerance:
+        return []
+
+    target_qty = -option_delta
+    if underlying_order_book_id is None:
+        underlying_order_book_id = _underlying_id_from_atm(atm)
+
+    if getattr(config.strategy, "allow_etf_short_hedge", True) or target_qty >= 0:
+        return [
+            _etf_hedge_item(
+                action,
+                reason,
+                option_delta,
+                current_hedge_qty,
+                account_delta,
+                target_qty,
+                target_qty - current_hedge_qty,
+                spot,
+                underlying_order_book_id,
+                after_actions=after_actions,
+            )
+        ]
+
+    plan = []
+    etf_target_qty = 0.0
+    etf_trade_qty = etf_target_qty - current_hedge_qty
+    if abs(etf_trade_qty) > 1e-9:
+        plan.append(
+            _etf_hedge_item(
+                action,
+                (
+                    f"{reason} ETF short hedge is disabled; reduce ETF hedge "
+                    "before using option delta hedge."
+                ),
+                option_delta,
+                current_hedge_qty,
+                account_delta,
+                etf_target_qty,
+                etf_trade_qty,
+                spot,
+                underlying_order_book_id,
+                after_actions=after_actions,
+            )
+        )
+
+    residual_delta = option_delta + etf_target_qty
+    if abs(residual_delta) <= tolerance:
+        return plan
+    if residual_delta < 0:
+        plan.append(
+            {
+                "action": "DATA_WARNING",
+                "priority": "warning",
+                "reason": (
+                    "ETF short hedge is disabled and residual delta is negative; "
+                    "short-call hedge cannot add positive delta."
+                ),
+                "residual_delta": residual_delta,
+                "after_actions": after_actions,
+            }
+        )
+        return plan
+    if not getattr(config.strategy, "enable_option_delta_hedge", False):
+        plan.append(
+            {
+                "action": "DATA_WARNING",
+                "priority": "warning",
+                "reason": (
+                    "ETF short hedge is disabled and option delta hedge is not enabled."
+                ),
+                "residual_delta": residual_delta,
+                "after_actions": after_actions,
+            }
+        )
+        return plan
+
+    call_row = _select_otm_call_for_delta_hedge(
+        config,
+        chain_df,
+        spot,
+        atm,
+        exclude_call_codes=_existing_call_codes(live_account) | set(exclude_call_codes or []),
+    )
+    if call_row is None:
+        plan.append(
+            {
+                "action": "DATA_WARNING",
+                "priority": "warning",
+                "reason": "No valid OTM call found for option delta hedge.",
+                "residual_delta": residual_delta,
+                "after_actions": after_actions,
+            }
+        )
+        return plan
+
+    plan.append(
+        _short_call_delta_hedge_item(
+            config,
+            option_action,
+            reason,
+            call_row,
+            residual_delta,
+            spot,
+            underlying_order_book_id,
+            after_actions=after_actions,
+            current_hedge_qty=etf_target_qty,
+            option_delta=option_delta,
+        )
+    )
+    return plan
+
+
+def _etf_hedge_item(
+    action,
+    reason,
+    option_delta,
+    current_hedge_qty,
+    account_delta,
+    target_qty,
+    trade_qty,
+    spot,
+    underlying_order_book_id,
+    after_actions=None,
+):
+    item = {
+        "action": action,
+        "priority": "action",
+        "reason": reason,
+        "option_delta": option_delta,
+        "current_hedge_qty": current_hedge_qty,
+        "account_delta": account_delta,
+        "target_hedge_qty": target_qty,
+        "trade_etf_qty": trade_qty,
+        "estimated_price": spot,
+        "underlying_order_book_id": underlying_order_book_id,
     }
+    if action.startswith("FINAL_"):
+        item["planned_option_delta"] = option_delta
+        item["planned_account_delta"] = account_delta
+    if after_actions is not None:
+        item["after_actions"] = after_actions
+    return item
+
+
+def _short_call_delta_hedge_item(
+    config,
+    action,
+    reason,
+    call_row,
+    residual_delta,
+    spot,
+    underlying_order_book_id,
+    after_actions=None,
+    current_hedge_qty=0.0,
+    option_delta=0.0,
+):
+    raw_delta = float(call_row.get("delta"))
+    multiplier = float(call_row.get("contract_multiplier", config.vol.contract_multiplier))
+    hedge_delta_per_contract = -raw_delta * multiplier
+    qty = int(math.ceil(residual_delta / abs(hedge_delta_per_contract)))
+    hedge_delta = hedge_delta_per_contract * qty
+    estimated_price = float(call_row.get("mid"))
+    fee = core.position.calc_option_fee(qty, 0, config.backtest.option_fee_per_contract)
+    margin = core.position.margin_call(
+        float(spot),
+        float(call_row.get("strike_price")),
+        estimated_price,
+        multiplier,
+    ) * qty
+    cash_effect = estimated_price * qty * multiplier - fee - margin
+    item = {
+        "action": action,
+        "priority": "action",
+        "side": "short",
+        "reason": reason,
+        "option_hedge_type": "short_otm_call",
+        "call_code": call_row.get("order_book_id"),
+        "put_code": None,
+        "strike": float(call_row.get("strike_price")),
+        "expiry": str(pd.Timestamp(call_row.get("maturity_date")).date()),
+        "call_qty": qty,
+        "put_qty": 0,
+        "estimated_call_price": estimated_price,
+        "estimated_put_price": None,
+        "single_call_delta": -raw_delta,
+        "hedge_delta_per_contract": hedge_delta_per_contract,
+        "estimated_hedge_delta": hedge_delta,
+        "residual_delta_before_option_hedge": residual_delta,
+        "projected_account_delta_after_option_hedge": residual_delta + hedge_delta,
+        "option_delta": option_delta,
+        "current_hedge_qty": current_hedge_qty,
+        "target_hedge_qty": current_hedge_qty,
+        "trade_etf_qty": 0.0,
+        "estimated_fee": fee,
+        "estimated_option_margin": margin,
+        "estimated_cash_effect": cash_effect,
+        "underlying_order_book_id": underlying_order_book_id or call_row.get("underlying_order_book_id"),
+        "contract_symbol": call_row.get("contract_symbol"),
+        "contract_multiplier": multiplier,
+    }
+    if action.startswith("FINAL_"):
+        item["planned_option_delta"] = option_delta
+        item["planned_account_delta"] = option_delta + current_hedge_qty
+    if after_actions is not None:
+        item["after_actions"] = after_actions
+    return item
+
+
+def _select_otm_call_for_delta_hedge(config, chain_df, spot, atm, exclude_call_codes=None):
+    if chain_df is None or chain_df.empty:
+        return None
+    calls = chain_df.copy()
+    calls = calls[calls["option_type"].astype(str).str.lower().eq("c")]
+    calls = calls[calls["contract_multiplier"] == config.vol.contract_multiplier]
+    min_strike = float(spot)
+    if atm is not None and atm.get("strike") is not None and not pd.isna(atm.get("strike")):
+        min_strike = max(min_strike, float(atm.get("strike")))
+    calls = calls[pd.to_numeric(calls["strike_price"], errors="coerce") > min_strike]
+    if exclude_call_codes:
+        calls = calls[~calls["order_book_id"].astype(str).isin({str(code) for code in exclude_call_codes})]
+    calls = calls[pd.to_numeric(calls["delta"], errors="coerce") > 0]
+    calls = calls[pd.to_numeric(calls["mid"], errors="coerce") > 0]
+    if calls.empty:
+        return None
+
+    if atm is not None and atm.get("expiry") is not None:
+        expiry = pd.Timestamp(atm.get("expiry")).normalize()
+        same_expiry = calls[pd.to_datetime(calls["maturity_date"]).dt.normalize().eq(expiry)]
+        if not same_expiry.empty:
+            calls = same_expiry
+
+    calls = calls.sort_values(["strike_price", "maturity_date"])
+    steps = max(1, int(getattr(config.strategy, "option_delta_hedge_call_otm_steps", 1) or 1))
+    index = min(steps - 1, len(calls) - 1)
+    return calls.iloc[index]
+
+
+def _existing_call_codes(live_account):
+    codes = set()
+    for position in live_account.positions.values():
+        if position is not None and position.get("call_code") is not None:
+            codes.add(str(position.get("call_code")))
+    for position in getattr(live_account, "option_hedges", []) or []:
+        option_type = str(position.get("option_type") or "").lower()
+        if option_type == "c" and position.get("order_book_id") is not None:
+            codes.add(str(position.get("order_book_id")))
+        if position.get("call_code") is not None:
+            codes.add(str(position.get("call_code")))
+    return codes
+
+
+def _planned_call_codes(option_actions):
+    codes = set()
+    for item in option_actions or []:
+        leg_fields = _planned_leg_fields(item)
+        if leg_fields is None:
+            continue
+        call_code, _, _, _ = leg_fields
+        if call_code is not None:
+            codes.add(str(call_code))
+    return codes
+
+
+def _underlying_id_from_atm(atm):
+    if atm is None:
+        return None
+    underlying_order_book_id = atm.get("underlying_order_book_id")
+    if underlying_order_book_id is not None:
+        return underlying_order_book_id
+    return _projected_underlying_id(atm.get("call"), atm.get("put"))
 
 
 def _underlying_id_after_plan(option_actions, chain_df, atm):
