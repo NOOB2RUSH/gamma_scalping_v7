@@ -386,6 +386,17 @@ def print_summary(daily_pnl, trades):
     print("\n=== 损益分解 ===")
     total_pnl = stats["total_pnl"]
     total_before_fee = breakdown["total_before_fee"]
+    total_margin = daily_pnl["option_margin"] + daily_pnl["hedge_margin"]
+    max_margin_to_nav = (
+        daily_pnl["margin_to_nav_ratio"].max()
+        if "margin_to_nav_ratio" in daily_pnl.columns
+        else (total_margin / daily_pnl["nav"]).max()
+    )
+    margin_limit_breach_days = (
+        int(daily_pnl["margin_limit_breach"].sum())
+        if "margin_limit_breach" in daily_pnl.columns
+        else 0
+    )
     print_breakdown_item("Delta PnL", breakdown["delta"], total_before_fee)
     print_breakdown_item("Gamma PnL", breakdown["gamma"], total_before_fee)
     print_breakdown_item("Vega PnL", breakdown["vega"], total_before_fee)
@@ -498,6 +509,17 @@ def save_summary_files(output_dir, daily_pnl, trades):
     liquidity_stats = calc_liquidity_warning_stats(trades)
     total_pnl = stats["total_pnl"]
     total_before_fee = breakdown["total_before_fee"]
+    total_margin = daily_pnl["option_margin"] + daily_pnl["hedge_margin"]
+    max_margin_to_nav = (
+        daily_pnl["margin_to_nav_ratio"].max()
+        if "margin_to_nav_ratio" in daily_pnl.columns
+        else (total_margin / daily_pnl["nav"]).max()
+    )
+    margin_limit_breach_days = (
+        int(daily_pnl["margin_limit_breach"].sum())
+        if "margin_limit_breach" in daily_pnl.columns
+        else 0
+    )
 
     lines = [
         "=== 回测概要 ===",
@@ -517,6 +539,9 @@ def save_summary_files(output_dir, daily_pnl, trades):
         ),
         f"最大期权保证金: {format_money(daily_pnl['option_margin'].max())}",
         f"最大 ETF 保证金: {format_money(daily_pnl['hedge_margin'].max())}",
+        f"最大合计保证金: {format_money(total_margin.max())}",
+        f"最大保证金/净值: {format_pct(max_margin_to_nav)}",
+        f"保证金占用超限天数: {margin_limit_breach_days}",
         f"最低现金: {format_money(stats['min_cash'])}",
         f"爆仓预警天数（现金<0）: {stats['cash_negative_days']}",
         "",
@@ -622,6 +647,9 @@ def save_summary_files(output_dir, daily_pnl, trades):
         ("end_date", stats["end_date"]),
         ("max_option_margin", daily_pnl["option_margin"].max()),
         ("max_etf_margin", daily_pnl["hedge_margin"].max()),
+        ("max_total_margin", total_margin.max()),
+        ("max_margin_to_nav_ratio", max_margin_to_nav),
+        ("margin_limit_breach_days", margin_limit_breach_days),
         ("min_cash", stats["min_cash"]),
         ("cash_negative_days", stats["cash_negative_days"]),
         ("delta_pnl", breakdown["delta"]),
