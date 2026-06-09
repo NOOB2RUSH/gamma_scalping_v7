@@ -41,6 +41,7 @@ SUMMARY_COLUMNS = [
     "对冲单日盈亏",
     "ETF单日盈亏",
     "总单日盈亏",
+    "净单日盈亏",
     "持仓盈亏",
     "交易盈亏",
     "当日盯市交易盈亏",
@@ -90,7 +91,8 @@ DEFAULT_SUMMARY_REPORT_COLUMNS = [
     "当日手续费",
     "期权单日盈亏",
     "ETF单日盈亏",
-    "总单日盈亏",
+    "总单日盈亏(手续费前)",
+    "净单日盈亏",
     "账户Delta",
     "账户Gamma",
     "账户Vega",
@@ -108,7 +110,8 @@ DIAGNOSE_SUMMARY_REPORT_COLUMNS = [
     "当日手续费",
     "期权单日盈亏",
     "ETF单日盈亏",
-    "总单日盈亏",
+    "总单日盈亏(手续费前)",
+    "净单日盈亏",
     "持仓盈亏",
     "交易盈亏",
     "当日盯市交易盈亏",
@@ -183,12 +186,27 @@ INTERNAL_RECONCILIATION_COLUMNS = {
 DIAGNOSTIC_REPORT_COLUMNS = [
     "日期",
     "账户ID",
-    "总单日盈亏",
+    "券商总单日盈亏变化",
     "单日GreeksPnL",
     "Greeks解释残差",
     "GreeksPnL口径",
     "GreeksPnL说明",
     "GreeksPnL路径节点数",
+]
+
+DAILY_GREEKS_PNL_COLUMNS = [
+    "期权单日DeltaPnL",
+    "期权单日GammaPnL",
+    "期权单日VegaPnL",
+    "期权单日ThetaPnL",
+    "期权单日GreeksPnL",
+    "对冲单日DeltaPnL",
+    "对冲单日GreeksPnL",
+    "单日DeltaPnL",
+    "单日GammaPnL",
+    "单日VegaPnL",
+    "单日ThetaPnL",
+    "单日GreeksPnL",
 ]
 
 POSITION_COLUMNS = [
@@ -503,6 +521,7 @@ def persist_account_report_history(product, account_id, payload):
         payload["position_history"],
         product=product,
     )
+    _apply_current_pnl_decomposition_to_history(payload)
     payload["summary_history"].to_csv(summary_path, index=False, encoding="utf-8-sig")
     _refresh_current_summary_from_history(payload)
     return payload
@@ -591,7 +610,8 @@ def format_terminal_summary(payload, mode="default"):
         (
             f"期权单日盈亏={_fmt(pnl_decomposition['option_daily_pnl'])} "
             f"ETF单日盈亏={_fmt(pnl_decomposition['etf_daily_pnl'])} "
-            f"总单日盈亏={_fmt(pnl_decomposition['daily_pnl_decomposition'])} "
+            f"总单日盈亏(手续费前)={_fmt(pnl_decomposition['daily_pnl_decomposition'])} "
+            f"净单日盈亏={_fmt(_net_daily_pnl(pnl_decomposition['daily_pnl_decomposition'], summary.get('当日手续费')))} "
             f"当日手续费={_fmt(summary.get('当日手续费'))}"
         ),
         (
@@ -619,7 +639,7 @@ def format_terminal_summary(payload, mode="default"):
                     f"当日盈亏分解合计={_fmt(pnl_decomposition['daily_pnl_decomposition'])}"
                 ),
                 (
-                    f"券商差分总单日盈亏={_fmt(summary.get('券商总单日盈亏变化'))} "
+                    f"券商差分总单日盈亏={_fmt(_broker_daily_pnl(summary))} "
                     f"对账差额={_fmt(_broker_reconciliation_difference(summary, pnl_decomposition))}"
                 ),
             ]
@@ -692,6 +712,10 @@ def _summary_report_frame(
         "总单日盈亏",
         "券商总单日盈亏变化",
     )
+    frame["净单日盈亏"] = pd.to_numeric(
+        frame["总单日盈亏"],
+        errors="coerce",
+    ) - pd.to_numeric(frame.get("当日手续费"), errors="coerce").fillna(0.0)
     if isinstance(position_report, pd.DataFrame) and not position_report.empty:
         report_date = str(report_date)
         current_mask = frame["日期"].astype(str).eq(report_date)
@@ -709,6 +733,10 @@ def _summary_report_frame(
         frame.loc[current_mask, "期权单日盈亏"] = totals["option_daily_pnl"]
         frame.loc[current_mask, "ETF单日盈亏"] = totals["etf_daily_pnl"]
         frame.loc[current_mask, "总单日盈亏"] = totals["daily_pnl_decomposition"]
+        frame.loc[current_mask, "净单日盈亏"] = _net_daily_pnl(
+            totals["daily_pnl_decomposition"],
+            frame.loc[current_mask, "当日手续费"],
+        )
         frame.loc[current_mask, "持仓盈亏"] = totals["holding_pnl"]
         frame.loc[current_mask, "交易盈亏"] = totals["realized_cost_pnl"]
         frame.loc[current_mask, "当日盯市交易盈亏"] = totals[
@@ -720,6 +748,7 @@ def _summary_report_frame(
         frame.loc[current_mask, "当日盈亏对账差额"] = (
             broker_total - totals["daily_pnl_decomposition"]
         )
+    frame["总单日盈亏(手续费前)"] = frame["总单日盈亏"]
     return frame.reindex(columns=report_columns)
 
 
@@ -731,6 +760,10 @@ def _apply_current_pnl_decomposition(payload):
             "期权单日盈亏": totals["option_daily_pnl"],
             "ETF单日盈亏": totals["etf_daily_pnl"],
             "总单日盈亏": totals["daily_pnl_decomposition"],
+            "净单日盈亏": _net_daily_pnl(
+                totals["daily_pnl_decomposition"],
+                payload["summary"].get("当日手续费"),
+            ),
             "持仓盈亏": totals["holding_pnl"],
             "交易盈亏": totals["realized_cost_pnl"],
             "当日盯市交易盈亏": totals["mark_to_market_trade_pnl"],
@@ -789,6 +822,50 @@ def _sum_numeric_column(frame, column):
     return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).sum())
 
 
+def _net_daily_pnl(gross_pnl, daily_fee):
+    if isinstance(daily_fee, pd.Series):
+        return float(gross_pnl) - pd.to_numeric(
+            daily_fee,
+            errors="coerce",
+        ).fillna(0.0)
+    return float(gross_pnl) - float(_number(daily_fee) or 0.0)
+
+
+def _apply_current_pnl_decomposition_to_history(payload):
+    history = payload.get("summary_history")
+    if history is None or history.empty:
+        return
+    mask = (
+        history["日期"].astype(str).eq(str(payload["date"]))
+        & history["账户ID"].astype(str).eq(str(payload["account_id"]))
+    )
+    if not mask.any():
+        return
+
+    totals = _position_pnl_totals(_position_report_frame(payload))
+    broker_total = _broker_daily_pnl(history.loc[mask].iloc[-1].to_dict())
+    values = {
+        "期权单日盈亏": totals["option_daily_pnl"],
+        "ETF单日盈亏": totals["etf_daily_pnl"],
+        "总单日盈亏": totals["daily_pnl_decomposition"],
+        "净单日盈亏": _net_daily_pnl(
+            totals["daily_pnl_decomposition"],
+            history.loc[mask, "当日手续费"],
+        ),
+        "持仓盈亏": totals["holding_pnl"],
+        "交易盈亏": totals["realized_cost_pnl"],
+        "当日盯市交易盈亏": totals["mark_to_market_trade_pnl"],
+        "当日盈亏分解合计": totals["daily_pnl_decomposition"],
+        "当日盈亏对账差额": (
+            None
+            if broker_total is None
+            else broker_total - totals["daily_pnl_decomposition"]
+        ),
+    }
+    for column, value in values.items():
+        history.loc[mask, column] = value
+
+
 def _validate_report_mode(mode):
     if mode not in REPORT_MODES:
         raise ValueError("mode must be one of: default, diagnose")
@@ -826,7 +903,7 @@ def _diagnostic_report_frame(payload):
     if "GreeksPnL说明" in frame.columns:
         actual = actual.mask(frame["GreeksPnL说明"].astype(str).eq("first_history_row"))
     greeks = pd.to_numeric(frame.get("单日GreeksPnL"), errors="coerce")
-    frame["总单日盈亏"] = actual
+    frame["券商总单日盈亏变化"] = actual
     frame["Greeks解释残差"] = actual - greeks
     return frame.reindex(columns=DIAGNOSTIC_REPORT_COLUMNS)
 
@@ -1956,6 +2033,9 @@ def _add_summary_greeks_pnl(summary_history, position_history=None, product=None
         product,
         freq="5min",
     )
+    unavailable = result["GreeksPnL说明"].astype(str).eq("first_history_row")
+    result.loc[unavailable, DAILY_GREEKS_PNL_COLUMNS] = np.nan
+    result.loc[unavailable, "GreeksPnL口径"] = "unavailable"
     result = result.sort_values(["日期", "账户ID"]).reset_index(drop=True)
     return result.reindex(columns=SUMMARY_COLUMNS)
 
@@ -3429,7 +3509,7 @@ def _plain_table(rows, columns):
 
 
 def _fmt(value):
-    if value is None:
+    if value is None or pd.isna(value):
         return ""
     if isinstance(value, float):
         return f"{value:.6f}"
