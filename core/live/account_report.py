@@ -336,6 +336,11 @@ def calculate_live_account_report(
     hedge_latest_price = (
         _number(hedge_rows[0].get("最新价")) if hedge_rows else None
     )
+    hedge_entry_price = (
+        _number(hedge_rows[0].get("持仓均价"))
+        if hedge_rows
+        else _number(report_hedge.entry_price)
+    )
     hedge_mark_price_type = _hedge_mark_price_type(report_date_text)
     hedge_unrealized_pnl = (
         _number(hedge_rows[0].get("浮动盈亏")) if hedge_rows else 0.0
@@ -363,7 +368,7 @@ def calculate_live_account_report(
         "期权市值": option_value,
         "期权保证金": option_margin,
         "对冲持仓": report_hedge.qty,
-        "对冲成本": report_hedge.entry_price,
+        "对冲成本": hedge_entry_price,
         "对冲最新价": hedge_latest_price,
         "对冲估值价": hedge_latest_price,
         "对冲估值价类型": hedge_mark_price_type,
@@ -1280,6 +1285,25 @@ def _holding_rows_from_export(product, account_id, report_date, chain_df, not_be
         meta = chain_meta.get(code, {})
         side = _side_from_holding(item)
         qty = _number(item.get("总持仓"))
+        holding_cost = _number(item.get("持仓均价"))
+        latest_price = _number(meta.get("mid"))
+        if latest_price is None:
+            latest_price = _number(item.get("最新价"))
+        multiplier = _number(meta.get("contract_multiplier"))
+        if multiplier is None:
+            multiplier = _contract_multiplier(product)
+        direction = -1.0 if side == "short" else 1.0
+        market_value = _number(item.get("期权市值"))
+        floating_pnl = _number(item.get("浮动盈亏"))
+        if latest_price is not None and qty is not None and multiplier is not None:
+            market_value = direction * latest_price * qty * multiplier
+            if holding_cost is not None:
+                floating_pnl = (
+                    direction
+                    * (latest_price - holding_cost)
+                    * qty
+                    * multiplier
+                )
         single_delta = _single_option_delta_from_chain(meta, side)
         rows.append(
             {
@@ -1295,13 +1319,13 @@ def _holding_rows_from_export(product, account_id, report_date, chain_df, not_be
                 "今开仓": _number(item.get("今开仓")),
                 "今平仓": _number(item.get("今平仓")),
                 "可平量": _number(item.get("可平量")),
-                "最新价": _number(item.get("最新价")),
-                "持仓均价": _number(item.get("持仓均价")),
+                "最新价": latest_price,
+                "持仓均价": holding_cost,
                 "开仓均价": _number(item.get("开仓均价")),
-                "期权市值": _number(item.get("期权市值")),
+                "期权市值": market_value,
                 "占用保证金": _number(item.get("占用保证金")),
-                "持仓盈亏": _number(item.get("持仓盈亏")),
-                "浮动盈亏": _number(item.get("浮动盈亏")),
+                "持仓盈亏": floating_pnl,
+                "浮动盈亏": floating_pnl,
                 "行权价": meta.get("strike_price"),
                 "到期日": meta.get("maturity_date"),
                 "剩余天数": meta.get("dte"),
@@ -1462,14 +1486,22 @@ def _hedge_rows_from_account(
         market_value = hedge.last_market_value
     if market_value is None:
         market_value = qty * latest_price
-    if export_row is not None:
+    entry_price = _hedge_open_cost_for_report(
+        product,
+        account_id,
+        report_date,
+    )
+    if entry_price is None:
+        entry_price = hedge.entry_price
+    floating_pnl = None
+    if (_number(entry_price) or 0.0) > 0:
+        floating_pnl = core.hedge.calc_unrealized_pnl(qty, entry_price, latest_price)
+    elif export_row is not None:
         floating_pnl = _number(export_row.get("浮动盈亏"))
-    elif mark_with_spot:
-        floating_pnl = None
-    else:
+    elif not mark_with_spot:
         floating_pnl = hedge.last_unrealized_pnl
     if floating_pnl is None:
-        floating_pnl = core.hedge.calc_unrealized_pnl(qty, hedge.entry_price, latest_price)
+        floating_pnl = 0.0
     security_code = (
         _security_code(export_row.get("证券代码"))
         if export_row is not None
@@ -1495,8 +1527,8 @@ def _hedge_rows_from_account(
             "今平仓": None,
             "可平量": _number(export_row.get("可用数量")) if export_row is not None else None,
             "最新价": latest_price,
-            "持仓均价": hedge.entry_price,
-            "开仓均价": hedge.entry_price,
+            "持仓均价": entry_price,
+            "开仓均价": entry_price,
             "期权市值": market_value,
             "占用保证金": hedge.margin,
             "持仓盈亏": floating_pnl,
@@ -2905,6 +2937,66 @@ def _cumulative_hedge_realized_pnl_for_report(product, account_id, report_date):
             avg_cost = fill_cost
 
     return realized
+
+
+def _hedge_open_cost_for_report(product, account_id, report_date):
+    cutoff = _date_or_none(report_date)
+    if cutoff is None:
+        return None
+
+    qty = 0.0
+    avg_cost = 0.0
+    fills = account_store.list_fills(
+        product,
+        account_id=account_id,
+        include_voided=False,
+    )
+    for row in fills:
+        fill = account_store.normalize_fill(row["payload"])
+        if fill.get("action") not in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
+            continue
+        fill_date = _date_or_none(fill.get("date"))
+        if fill_date is None or fill_date > cutoff:
+            continue
+
+        trades = _hedge_fill_trade_events(fill)
+        if not trades:
+            fill_qty = _number(fill.get("qty", fill.get("new_etf_qty")))
+            fill_cost = _number(fill.get("entry_price"))
+            if fill_qty is not None:
+                qty = fill_qty
+            if fill_cost is not None and qty > 0:
+                avg_cost = fill_cost
+            if qty <= 1e-9:
+                qty = 0.0
+                avg_cost = 0.0
+            continue
+
+        for trade in trades:
+            signed_qty = _number(trade.get("signed_qty")) or 0.0
+            price = _number(trade.get("price"))
+            if abs(signed_qty) <= 1e-9 or price is None:
+                continue
+            if signed_qty > 0:
+                new_qty = qty + signed_qty
+                avg_cost = (
+                    ((qty * avg_cost) + (signed_qty * price)) / new_qty
+                    if new_qty > 1e-9
+                    else 0.0
+                )
+                qty = new_qty
+            else:
+                qty -= min(abs(signed_qty), max(qty, 0.0))
+                if qty <= 1e-9:
+                    qty = 0.0
+                    avg_cost = 0.0
+
+        target_qty = _number(fill.get("qty", fill.get("new_etf_qty")))
+        if target_qty is not None and abs(target_qty - qty) > 1e-6:
+            qty = target_qty
+            avg_cost = _number(fill.get("entry_price")) or avg_cost
+
+    return avg_cost if qty > 1e-9 and avg_cost > 0 else None
 
 
 def _hedge_fill_trade_events(fill):
