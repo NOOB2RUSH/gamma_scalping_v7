@@ -2709,6 +2709,7 @@ def _refresh_current_summary_from_history(payload):
     )
     if mask.any():
         payload["summary"] = history.loc[mask].iloc[-1].to_dict()
+        _apply_current_pnl_decomposition(payload)
 
 
 def _backfill_summary_financial_columns(product, account_id, summary_history):
