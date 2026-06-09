@@ -284,6 +284,7 @@ def _action_account_report(session):
     source = _prompt_choice("行情源", ["akshare", "local", "none"], "akshare")
     date = _prompt_optional("日期，留空则最新")
     output_format = _prompt_choice("输出格式", ["excel", "csv", "both"], "excel")
+    report_mode = _prompt_choice("报告模式", ["default", "diagnose"], "default")
     persist_history = _confirm("更新累计账户/持仓历史", True)
     write_files = _confirm("写出报告文件", True)
     payload = account_report.build_live_account_report(
@@ -298,9 +299,10 @@ def _action_account_report(session):
             session["product"],
             payload,
             output_format=output_format,
+            mode=report_mode,
         )
         _print_report_paths(paths)
-    for line in account_report.format_terminal_summary(payload):
+    for line in account_report.format_terminal_summary(payload, mode=report_mode):
         print(line)
 
 

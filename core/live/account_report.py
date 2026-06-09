@@ -82,7 +82,22 @@ SUMMARY_COLUMNS = [
     "GreeksPnL路径节点数",
 ]
 
-SUMMARY_REPORT_COLUMNS = [
+REPORT_MODES = {"default", "diagnose"}
+
+DEFAULT_SUMMARY_REPORT_COLUMNS = [
+    "日期",
+    "估算权益",
+    "当日手续费",
+    "期权单日盈亏",
+    "ETF单日盈亏",
+    "总单日盈亏",
+    "账户Delta",
+    "账户Gamma",
+    "账户Vega",
+    "账户Theta",
+]
+
+DIAGNOSE_SUMMARY_REPORT_COLUMNS = [
     "日期",
     "估算权益",
     "当日手续费",
@@ -104,7 +119,22 @@ SUMMARY_REPORT_COLUMNS = [
     "单日ThetaPnL",
 ]
 
-POSITION_REPORT_COLUMNS = [
+DEFAULT_POSITION_REPORT_COLUMNS = [
+    "日期",
+    "合约代码",
+    "合约名称",
+    "交易方向",
+    "总持仓张数",
+    "今日变化",
+    "最新价",
+    "持仓均价",
+    "持仓盈亏",
+    "到期日",
+    "IV",
+    "单张Delta",
+]
+
+DIAGNOSE_POSITION_REPORT_COLUMNS = [
     "日期",
     "合约代码",
     "合约名称",
@@ -124,6 +154,32 @@ POSITION_REPORT_COLUMNS = [
     "单张Vega",
     "单张Theta",
 ]
+
+INTERNAL_RECONCILIATION_COLUMNS = {
+    "持仓盈亏",
+    "交易盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
+    "当日盈亏对账差额",
+    "券商期权单日盈亏变化",
+    "券商对冲单日盈亏变化",
+    "券商总单日盈亏变化",
+    "期权单日DeltaPnL",
+    "期权单日GammaPnL",
+    "期权单日VegaPnL",
+    "期权单日ThetaPnL",
+    "期权单日GreeksPnL",
+    "对冲单日DeltaPnL",
+    "对冲单日GreeksPnL",
+    "单日DeltaPnL",
+    "单日GammaPnL",
+    "单日VegaPnL",
+    "单日ThetaPnL",
+    "单日GreeksPnL",
+    "GreeksPnL口径",
+    "GreeksPnL说明",
+    "GreeksPnL路径节点数",
+}
 
 DIAGNOSTIC_REPORT_COLUMNS = [
     "日期",
@@ -453,17 +509,19 @@ def persist_account_report_history(product, account_id, payload):
     return payload
 
 
-def write_live_account_report(product, payload, output_format="excel"):
+def write_live_account_report(product, payload, output_format="excel", mode="default"):
+    _validate_report_mode(mode)
     stamp = storage.local_now_stamp()
     out_dir = storage.output_dir(product)
-    frames = _report_frames(payload)
+    frames = _report_frames(payload, mode=mode)
     paths = {}
+    name_suffix = "_diagnose" if mode == "diagnose" else ""
 
     if output_format not in {"excel", "csv", "both"}:
         raise ValueError("output_format must be one of: excel, csv, both")
 
     if output_format in {"excel", "both"}:
-        excel_path = out_dir / f"{stamp}_account_report.xlsx"
+        excel_path = out_dir / f"{stamp}_account_report{name_suffix}.xlsx"
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             for sheet_name, frame in frames.items():
                 frame.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -477,42 +535,55 @@ def write_live_account_report(product, payload, output_format="excel"):
             "当日交易记录": "trades",
         }
         for sheet_name, frame in frames.items():
-            csv_path = out_dir / f"{stamp}_account_report_{csv_names[sheet_name]}.csv"
+            csv_path = out_dir / (
+                f"{stamp}_account_report{name_suffix}_{csv_names[sheet_name]}.csv"
+            )
             frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
             csv_paths[sheet_name] = csv_path
         paths["csv"] = csv_paths
 
-    json_path = out_dir / f"{stamp}_account_report.json"
-    storage.write_json(json_path, _json_payload(payload))
+    json_path = out_dir / f"{stamp}_account_report{name_suffix}.json"
+    storage.write_json(json_path, _json_payload(payload, mode=mode))
     paths["json"] = json_path
-    diagnostics_path = out_dir / f"{stamp}_account_report_diagnostics.csv"
-    _diagnostic_report_frame(payload).to_csv(
-        diagnostics_path,
-        index=False,
-        encoding="utf-8-sig",
-    )
-    paths["diagnostics"] = diagnostics_path
+    if mode == "diagnose":
+        diagnostics_path = out_dir / f"{stamp}_account_report_diagnostics.csv"
+        _diagnostic_report_frame(payload).to_csv(
+            diagnostics_path,
+            index=False,
+            encoding="utf-8-sig",
+        )
+        paths["diagnostics"] = diagnostics_path
     return paths
 
 
-def _json_payload(payload):
+def _json_payload(payload, mode="default"):
+    _validate_report_mode(mode)
     result = dict(payload)
     result.pop("current_chain_metadata", None)
     for key in ["summary_history", "position_history"]:
         value = result.get(key)
         if isinstance(value, pd.DataFrame):
             result[key] = value.to_dict("records")
+    if mode == "default":
+        result["summary"] = _without_internal_reconciliation_fields(
+            result.get("summary")
+        )
+        result["summary_history"] = [
+            _without_internal_reconciliation_fields(row)
+            for row in result.get("summary_history", [])
+        ]
     return result
 
 
-def format_terminal_summary(payload):
+def format_terminal_summary(payload, mode="default"):
+    _validate_report_mode(mode)
     summary = payload["summary"]
     position_report = _position_report_frame(payload)
     pnl_decomposition = _position_pnl_totals(position_report)
     lines = [
         (
             f"账户报告={payload['product']}/{payload['account_id']} "
-            f"日期={payload['date']} 标的价格={_fmt(payload['spot'])}"
+            f"模式={mode} 日期={payload['date']} 标的价格={_fmt(payload['spot'])}"
         ),
         (
             f"现金={_fmt(summary['现金'])} "
@@ -525,32 +596,36 @@ def format_terminal_summary(payload):
             f"当日手续费={_fmt(summary.get('当日手续费'))}"
         ),
         (
-            f"持仓盈亏={_fmt(pnl_decomposition['holding_pnl'])} "
-            f"交易盈亏(成本口径)={_fmt(pnl_decomposition['realized_cost_pnl'])} "
-            f"当日盯市交易盈亏={_fmt(pnl_decomposition['mark_to_market_trade_pnl'])} "
-            f"当日盈亏分解合计={_fmt(pnl_decomposition['daily_pnl_decomposition'])}"
-        ),
-        (
-            f"券商差分总单日盈亏={_fmt(summary.get('券商总单日盈亏变化'))} "
-            f"对账差额={_fmt((_number(summary.get('券商总单日盈亏变化')) or 0.0) - pnl_decomposition['daily_pnl_decomposition'])}"
-        ),
-        (
             f"账户Delta={_fmt(summary['账户Delta'])} "
             f"Gamma={_fmt(summary['账户Gamma'])} "
             f"Vega={_fmt(summary['账户Vega'])} "
             f"Theta={_fmt(summary['账户Theta'])} "
             f"持仓IV={_fmt(summary['持仓IV'])}"
         ),
-        (
-            f"单日GreeksPnL={_fmt(summary.get('单日GreeksPnL'))} "
-            f"Delta={_fmt(summary.get('单日DeltaPnL'))} "
-            f"Gamma={_fmt(summary.get('单日GammaPnL'))} "
-            f"Vega={_fmt(summary.get('单日VegaPnL'))} "
-            f"Theta={_fmt(summary.get('单日ThetaPnL'))}"
-        ),
-        "",
-        "持仓记录",
     ]
+    if mode == "diagnose":
+        lines.extend(
+            [
+                (
+                    f"持仓盈亏={_fmt(pnl_decomposition['holding_pnl'])} "
+                    f"交易盈亏(成本口径)={_fmt(pnl_decomposition['realized_cost_pnl'])} "
+                    f"当日盯市交易盈亏={_fmt(pnl_decomposition['mark_to_market_trade_pnl'])} "
+                    f"当日盈亏分解合计={_fmt(pnl_decomposition['daily_pnl_decomposition'])}"
+                ),
+                (
+                    f"券商差分总单日盈亏={_fmt(summary.get('券商总单日盈亏变化'))} "
+                    f"对账差额={_fmt(_broker_reconciliation_difference(summary, pnl_decomposition))}"
+                ),
+                (
+                    f"单日GreeksPnL={_fmt(summary.get('单日GreeksPnL'))} "
+                    f"Delta={_fmt(summary.get('单日DeltaPnL'))} "
+                    f"Gamma={_fmt(summary.get('单日GammaPnL'))} "
+                    f"Vega={_fmt(summary.get('单日VegaPnL'))} "
+                    f"Theta={_fmt(summary.get('单日ThetaPnL'))}"
+                ),
+            ]
+        )
+    lines.extend(["", "持仓记录"])
     lines.extend(
         _plain_table(
             position_report.to_dict("records"),
@@ -567,22 +642,41 @@ def format_terminal_summary(payload):
     return lines
 
 
-def _report_frames(payload):
+def _report_frames(payload, mode="default"):
+    _validate_report_mode(mode)
     position_report = _position_report_frame(payload)
     return {
         "账户总体情况": _summary_report_frame(
             payload["summary_history"],
             position_report=position_report,
             report_date=payload.get("date"),
+            mode=mode,
         ),
-        "持仓记录": position_report,
+        "持仓记录": position_report.reindex(
+            columns=(
+                DIAGNOSE_POSITION_REPORT_COLUMNS
+                if mode == "diagnose"
+                else DEFAULT_POSITION_REPORT_COLUMNS
+            )
+        ),
         "当日交易记录": _frame(payload["trade_rows"], TRADE_COLUMNS),
     }
 
 
-def _summary_report_frame(summary_history, position_report=None, report_date=None):
+def _summary_report_frame(
+    summary_history,
+    position_report=None,
+    report_date=None,
+    mode="default",
+):
+    _validate_report_mode(mode)
+    report_columns = (
+        DIAGNOSE_SUMMARY_REPORT_COLUMNS
+        if mode == "diagnose"
+        else DEFAULT_SUMMARY_REPORT_COLUMNS
+    )
     if summary_history is None:
-        return pd.DataFrame(columns=SUMMARY_REPORT_COLUMNS)
+        return pd.DataFrame(columns=report_columns)
     frame = summary_history.copy()
     frame["期权单日盈亏"] = _prefer_numeric_column(
         frame,
@@ -604,9 +698,15 @@ def _summary_report_frame(summary_history, position_report=None, report_date=Non
         current_mask = frame["日期"].astype(str).eq(report_date)
         totals = _position_pnl_totals(position_report)
         broker_total = pd.to_numeric(
-            frame.loc[current_mask, "总单日盈亏"],
+            frame.loc[current_mask, "券商总单日盈亏变化"],
             errors="coerce",
         )
+        if "GreeksPnL说明" in frame.columns:
+            first_history_mask = frame.loc[
+                current_mask,
+                "GreeksPnL说明",
+            ].astype(str).eq("first_history_row")
+            broker_total = broker_total.mask(first_history_mask)
         frame.loc[current_mask, "期权单日盈亏"] = totals["option_daily_pnl"]
         frame.loc[current_mask, "ETF单日盈亏"] = totals["etf_daily_pnl"]
         frame.loc[current_mask, "总单日盈亏"] = totals["daily_pnl_decomposition"]
@@ -621,12 +721,12 @@ def _summary_report_frame(summary_history, position_report=None, report_date=Non
         frame.loc[current_mask, "当日盈亏对账差额"] = (
             broker_total - totals["daily_pnl_decomposition"]
         )
-    return frame.reindex(columns=SUMMARY_REPORT_COLUMNS)
+    return frame.reindex(columns=report_columns)
 
 
 def _apply_current_pnl_decomposition(payload):
     totals = _position_pnl_totals(_position_report_frame(payload))
-    broker_total = _number(payload["summary"].get("券商总单日盈亏变化"))
+    broker_total = _broker_daily_pnl(payload["summary"])
     payload["summary"].update(
         {
             "期权单日盈亏": totals["option_daily_pnl"],
@@ -690,12 +790,42 @@ def _sum_numeric_column(frame, column):
     return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).sum())
 
 
+def _validate_report_mode(mode):
+    if mode not in REPORT_MODES:
+        raise ValueError("mode must be one of: default, diagnose")
+
+
+def _without_internal_reconciliation_fields(row):
+    if not isinstance(row, dict):
+        return row
+    return {
+        key: value
+        for key, value in row.items()
+        if key not in INTERNAL_RECONCILIATION_COLUMNS
+    }
+
+
+def _broker_reconciliation_difference(summary, pnl_decomposition):
+    broker_total = _broker_daily_pnl(summary)
+    if broker_total is None:
+        return None
+    return broker_total - pnl_decomposition["daily_pnl_decomposition"]
+
+
+def _broker_daily_pnl(summary):
+    if str(summary.get("GreeksPnL说明") or "") == "first_history_row":
+        return None
+    return _number(summary.get("券商总单日盈亏变化"))
+
+
 def _diagnostic_report_frame(payload):
     history = payload.get("summary_history")
     if history is None:
         return pd.DataFrame(columns=DIAGNOSTIC_REPORT_COLUMNS)
     frame = history.copy()
     actual = pd.to_numeric(frame.get("券商总单日盈亏变化"), errors="coerce")
+    if "GreeksPnL说明" in frame.columns:
+        actual = actual.mask(frame["GreeksPnL说明"].astype(str).eq("first_history_row"))
     greeks = pd.to_numeric(frame.get("单日GreeksPnL"), errors="coerce")
     frame["总单日盈亏"] = actual
     frame["Greeks解释残差"] = actual - greeks
@@ -707,7 +837,7 @@ def _position_report_frame(payload):
     if not isinstance(history, pd.DataFrame):
         history = _frame(payload.get("position_rows", []), POSITION_COLUMNS)
     if history.empty:
-        return pd.DataFrame(columns=POSITION_REPORT_COLUMNS)
+        return pd.DataFrame(columns=DIAGNOSE_POSITION_REPORT_COLUMNS)
 
     report_date = str(payload["date"])
     dates = history["日期"].astype(str)
@@ -752,7 +882,7 @@ def _position_report_frame(payload):
                 trade_rows,
             )
         )
-    return pd.DataFrame(rows, columns=POSITION_REPORT_COLUMNS)
+    return pd.DataFrame(rows, columns=DIAGNOSE_POSITION_REPORT_COLUMNS)
 
 
 def _position_report_row(payload, code, current_rows, previous_rows, trade_rows):

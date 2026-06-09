@@ -42,6 +42,12 @@ def parse_args():
         default="excel",
         help="Report file format. CSV writes one file per section.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["default", "diagnose"],
+        default="default",
+        help="default shows operator essentials; diagnose includes internal reconciliation fields.",
+    )
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
@@ -57,7 +63,14 @@ def main():
         persist_history=not args.no_history,
     )
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        print(
+            json.dumps(
+                account_report._json_payload(payload, mode=args.mode),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
         return
 
     if not args.no_write:
@@ -65,6 +78,7 @@ def main():
             args.product,
             payload,
             output_format=args.format,
+            mode=args.mode,
         )
         if "excel" in paths:
             print(f"account_report_excel={paths['excel']}")
@@ -72,9 +86,10 @@ def main():
             for sheet_name, path in paths["csv"].items():
                 print(f"account_report_csv[{sheet_name}]={path}")
         print(f"account_report_json={paths['json']}")
-        print(f"account_report_diagnostics={paths['diagnostics']}")
+        if "diagnostics" in paths:
+            print(f"account_report_diagnostics={paths['diagnostics']}")
 
-    for line in account_report.format_terminal_summary(payload):
+    for line in account_report.format_terminal_summary(payload, mode=args.mode):
         print(line)
 
 
