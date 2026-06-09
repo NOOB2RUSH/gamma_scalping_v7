@@ -66,6 +66,14 @@ def _advice_execution_rows(item):
     action = item.get("action", "")
     side = item.get("side")
 
+    if action == "CLOSE_OPTION_HEDGE":
+        return [_execution_row(
+            item.get("order_book_id"),
+            "买入平仓" if side == "short" else "卖出平仓",
+            item.get("qty"),
+            item.get("estimated_price"),
+        )]
+
     if action.startswith("OPEN_"):
         return _option_pair_rows(
             item,

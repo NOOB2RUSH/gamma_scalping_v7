@@ -1100,6 +1100,36 @@ def _delta_hedge_plan(
     if abs(account_delta) <= tolerance:
         return []
 
+    if getattr(live_account, "option_hedges", None):
+        close_items, core_greeks = _close_existing_option_hedge_plan(
+            live_account,
+            chain_df,
+            greeks,
+        )
+        account_without_option_hedges = deepcopy(live_account)
+        account_without_option_hedges.option_hedges = []
+        next_after_actions = [
+            *(after_actions or []),
+            *[item["action"] for item in close_items],
+        ]
+        return [
+            *close_items,
+            *_delta_hedge_plan(
+                config,
+                account_without_option_hedges,
+                core_greeks,
+                spot,
+                chain_df,
+                atm,
+                action=action,
+                option_action=option_action,
+                reason=reason,
+                after_actions=next_after_actions,
+                underlying_order_book_id=underlying_order_book_id,
+                exclude_call_codes=exclude_call_codes,
+            ),
+        ]
+
     target_qty = -option_delta
     if underlying_order_book_id is None:
         underlying_order_book_id = _underlying_id_from_atm(atm)
@@ -1175,7 +1205,7 @@ def _delta_hedge_plan(
 
     if getattr(config.strategy, "option_delta_hedge_combination_enabled", False):
         combination_item = None
-        if not after_actions:
+        if _can_plan_option_delta_hedge_after(after_actions):
             combination_item = _option_delta_hedge_combination_item(
                 config,
                 live_account,
@@ -1240,6 +1270,45 @@ def _delta_hedge_plan(
         )
     )
     return plan
+
+
+def _can_plan_option_delta_hedge_after(after_actions):
+    return not after_actions or all(
+        action == "CLOSE_OPTION_HEDGE" for action in after_actions
+    )
+
+
+def _close_existing_option_hedge_plan(live_account, chain_df, account_greeks):
+    close_items = []
+    core_greeks = deepcopy(account_greeks)
+    for hedge_position in getattr(live_account, "option_hedges", []) or []:
+        hedge_greeks, _ = _option_hedge_greeks_and_value(hedge_position, chain_df)
+        if hedge_greeks is not None:
+            for key in core.backtester.NUMERIC_GREEK_KEYS:
+                core_greeks[key] = float(core_greeks.get(key, 0.0) or 0.0) - float(
+                    hedge_greeks.get(key, 0.0) or 0.0
+                )
+        try:
+            row = _chain_row(chain_df, hedge_position.get("order_book_id"))
+            price = float(row.get("mid"))
+        except (IndexError, TypeError, ValueError):
+            price = float(hedge_position.get("last_price", 0.0) or 0.0)
+        close_items.append(
+            {
+                "action": "CLOSE_OPTION_HEDGE",
+                "priority": "action",
+                "reason": (
+                    "Close the existing option delta hedge before recalculating "
+                    "the next account hedge."
+                ),
+                "order_book_id": hedge_position.get("order_book_id"),
+                "side": hedge_position.get("side", "short"),
+                "qty": int(hedge_position.get("qty", 0) or 0),
+                "estimated_price": price,
+            }
+        )
+
+    return close_items, core_greeks
 
 
 def _option_delta_hedge_combination_item(

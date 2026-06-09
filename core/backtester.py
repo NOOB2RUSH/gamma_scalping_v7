@@ -2058,6 +2058,20 @@ class BacktestEngine:
         if target_qty is None and abs(account_delta) <= tolerance:
             return
 
+        if target_qty is None and state.option_hedges and day is not None:
+            self._close_option_delta_hedges(date, state, day)
+            self._update_day_aggregates(day, state)
+            greeks = day["greeks"]
+            option_delta = float(greeks["delta"])
+            account_delta = option_delta + float(state.hedge_etf_qty)
+            tolerance = max(
+                1.0,
+                abs(option_delta)
+                * self.config.get("delta_hedge_tolerance_ratio", 0.05),
+            )
+            if abs(account_delta) <= tolerance:
+                return
+
         projected_target_qty = -option_delta if target_qty is None else float(target_qty)
         if (
             self.config.get("allow_etf_short_hedge", True)
