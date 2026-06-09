@@ -138,6 +138,7 @@ def execute_delta_hedge(
     underlying_order_book_id=None,
     current_price=None,
     current_underlying_order_book_id=None,
+    daily_volume=None,
 ):
     """把 ETF 对冲仓位调整到目标数量，并记录交易和手续费。"""
     if etf_fee_rate is None:
@@ -207,6 +208,17 @@ def execute_delta_hedge(
         fee_notional += abs(hedge_etf_qty - old_qty) * spot
 
     trade_qty = hedge_etf_qty - old_qty
+    liquidity_trade_qty = (
+        abs(old_qty) + abs(hedge_etf_qty)
+        if underlying_changed
+        else abs(trade_qty)
+    )
+    liquidity_ratio = CONFIG.backtest.liquidity_warning_volume_ratio
+    liquidity_limit_qty = (
+        float(daily_volume) * liquidity_ratio
+        if daily_volume is not None and pd.notna(daily_volume)
+        else None
+    )
     etf_fee = fee_notional * etf_fee_rate
     cash -= etf_fee
     new_underlying = underlying_order_book_id if hedge_etf_qty != 0 else None
@@ -224,6 +236,25 @@ def execute_delta_hedge(
             "price": spot,
             "hedge_pnl": hedge_pnl,
             "fee": etf_fee,
+            "liquidity_warning_ratio": liquidity_ratio,
+            "liquidity_check_available": liquidity_limit_qty is not None,
+            "liquidity_warning": (
+                liquidity_trade_qty > liquidity_limit_qty
+                if liquidity_limit_qty is not None
+                else False
+            ),
+            "liquidity_warning_legs": (
+                "etf"
+                if liquidity_limit_qty is not None
+                and liquidity_trade_qty > liquidity_limit_qty
+                else ""
+            ),
+            "liquidity_volume_missing_legs": (
+                "" if liquidity_limit_qty is not None else "etf"
+            ),
+            "etf_volume": daily_volume,
+            "etf_liquidity_trade_qty": liquidity_trade_qty,
+            "etf_liquidity_limit_qty": liquidity_limit_qty,
         }
     )
     return cash, hedge_etf_qty, hedge_entry_price, hedge_margin, new_underlying
@@ -1379,6 +1410,21 @@ class BacktestEngine:
             raise ValueError(f"{date} 缺少 hedge 标的 {underlying_order_book_id}")
         return float(rows.iloc[0]["close"])
 
+    def _get_hedge_volume(self, date, underlying_order_book_id):
+        if self.hedge_by_date is None:
+            return None
+        hedge_df = self.hedge_by_date.get(pd.Timestamp(date))
+        if hedge_df is None or hedge_df.empty or "volume" not in hedge_df.columns:
+            return None
+        if underlying_order_book_id is None and len(hedge_df) == 1:
+            return float(hedge_df.iloc[0]["volume"])
+        rows = hedge_df[
+            hedge_df["order_book_id"].astype(str) == str(underlying_order_book_id)
+        ]
+        if rows.empty:
+            return None
+        return float(rows.iloc[0]["volume"])
+
     def _active_hedge_underlying_order_book_id(self, state):
         ids = {
             position.get("underlying_order_book_id")
@@ -1560,6 +1606,11 @@ class BacktestEngine:
                 spot,
             ),
             current_underlying_order_book_id=state.hedge_underlying_order_book_id,
+            daily_volume=self._get_hedge_volume(
+                date,
+                target_underlying_order_book_id
+                or state.hedge_underlying_order_book_id,
+            ),
         )
         if day is not None and len(state.trades) > trade_count:
             day["daily_etf_fee"] += state.trades[-1].get("fee", 0.0)
@@ -1958,6 +2009,11 @@ class BacktestEngine:
                 "open_call_qty": open_qty,
                 "open_call_price": open_price,
                 "option_margin": margin,
+                **opt_position.build_single_leg_liquidity_fields(
+                    open_row,
+                    open_qty,
+                    leg_name="call",
+                ),
                 "delta_effect": solution["delta_effect"],
                 "gamma_effect": solution["gamma_effect"],
                 "projected_option_delta": solution["projected_delta"],

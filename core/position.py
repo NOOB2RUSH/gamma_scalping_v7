@@ -206,6 +206,32 @@ def _build_liquidity_fields(call_row=None, put_row=None, call_qty=0, put_qty=0):
     return fields
 
 
+def build_single_leg_liquidity_fields(row, qty, leg_name="call"):
+    """Build the standard liquidity-warning fields for a single option leg."""
+    if leg_name not in {"call", "put"}:
+        raise ValueError(f"unsupported option leg: {leg_name}")
+
+    fields = _build_liquidity_fields()
+    fields["liquidity_check_available"] = row is not None
+    if row is None:
+        fields["liquidity_volume_missing_legs"] = leg_name
+        return fields
+
+    volume = _get_row_value(row, "volume")
+    fields[f"{leg_name}_volume"] = volume
+    if not _is_valid_number(volume):
+        fields["liquidity_volume_missing_legs"] = leg_name
+        return fields
+
+    limit_qty = float(volume) * fields["liquidity_warning_ratio"]
+    warning = abs(qty) > limit_qty
+    fields[f"{leg_name}_liquidity_limit_qty"] = limit_qty
+    fields[f"{leg_name}_liquidity_warning"] = warning
+    fields["liquidity_warning"] = warning
+    fields["liquidity_warning_legs"] = leg_name if warning else ""
+    return fields
+
+
 def has_short_volume_spike(position, call_row, put_row):
     """卖方持仓成交量放大止损：当前持仓合约成交量较开仓时显著放大。"""
     if not CONFIG.strategy.short_volume_spike_exit_enabled:
