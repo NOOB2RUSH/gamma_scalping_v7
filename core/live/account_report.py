@@ -91,7 +91,6 @@ DEFAULT_SUMMARY_REPORT_COLUMNS = [
     "期权单日盈亏",
     "ETF单日盈亏",
     "总单日盈亏",
-    "交易盈亏",
     "账户Delta",
     "账户Gamma",
     "账户Vega",
@@ -593,7 +592,6 @@ def format_terminal_summary(payload, mode="default"):
             f"期权单日盈亏={_fmt(pnl_decomposition['option_daily_pnl'])} "
             f"ETF单日盈亏={_fmt(pnl_decomposition['etf_daily_pnl'])} "
             f"总单日盈亏={_fmt(pnl_decomposition['daily_pnl_decomposition'])} "
-            f"交易盈亏={_fmt(pnl_decomposition['realized_cost_pnl'])} "
             f"当日手续费={_fmt(summary.get('当日手续费'))}"
         ),
         (
