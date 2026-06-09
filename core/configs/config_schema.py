@@ -13,6 +13,8 @@ class BacktestConfig:
     etf_fee_rate: float = 0.00005
     option_fee_per_contract: float = 2.0
     liquidity_warning_volume_ratio: float = 0.005
+    proportional_position_sizing_enabled: bool = False
+    position_sizing_base_nav: float = 1_000_000.0
     dynamic_position_control_enabled: bool = False
     max_margin_to_nav_ratio: float = 0.80
 

@@ -868,6 +868,17 @@ class BacktestEngine:
         """按方向读取每腿张数；跨式组合默认 call/put 等量。"""
         return self.config[f"{side}_qty"]
 
+    def _proportional_side_max_qty(self, day, state, side):
+        base_qty = self._side_max_qty(side)
+        if not self.config.get("proportional_position_sizing_enabled", False):
+            return base_qty
+
+        base_nav = float(self.config["position_sizing_base_nav"])
+        if base_nav <= 0:
+            raise ValueError("position_sizing_base_nav must be positive")
+        nav = max(0.0, float(self._current_nav_and_margin(day, state)[0]))
+        return int(base_qty * nav // base_nav)
+
     def _dynamic_target_qty(self, day, state, atm, requested_qty, side, replacing_side=None):
         if not self.config.get("dynamic_position_control_enabled", False):
             return requested_qty
@@ -927,7 +938,7 @@ class BacktestEngine:
 
         target_qty = self._entry_target_qty(
             day["feature_row"],
-            self._side_max_qty(side),
+            self._proportional_side_max_qty(day, state, side),
             side,
         )
         return target_qty > 0
@@ -957,12 +968,12 @@ class BacktestEngine:
 
         call_qty = self._entry_target_qty(
             day["feature_row"],
-            self._side_max_qty(side),
+            self._proportional_side_max_qty(day, state, side),
             side,
         )
         put_qty = self._entry_target_qty(
             day["feature_row"],
-            self._side_max_qty(side),
+            self._proportional_side_max_qty(day, state, side),
             side,
         )
         call_qty = put_qty = self._dynamic_target_qty(
@@ -1081,12 +1092,12 @@ class BacktestEngine:
 
         call_qty = self._entry_target_qty(
             day["feature_row"],
-            self._side_max_qty(side),
+            self._proportional_side_max_qty(day, state, side),
             side,
         )
         put_qty = self._entry_target_qty(
             day["feature_row"],
-            self._side_max_qty(side),
+            self._proportional_side_max_qty(day, state, side),
             side,
         )
         call_qty = put_qty = self._dynamic_target_qty(
@@ -2359,6 +2370,10 @@ def _backtest_config(
         "dynamic_position_control_enabled": (
             CONFIG.backtest.dynamic_position_control_enabled
         ),
+        "proportional_position_sizing_enabled": (
+            CONFIG.backtest.proportional_position_sizing_enabled
+        ),
+        "position_sizing_base_nav": CONFIG.backtest.position_sizing_base_nav,
         "max_margin_to_nav_ratio": CONFIG.backtest.max_margin_to_nav_ratio,
     }
 
