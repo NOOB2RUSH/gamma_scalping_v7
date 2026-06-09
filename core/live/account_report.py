@@ -39,7 +39,13 @@ SUMMARY_COLUMNS = [
     "当日手续费",
     "期权单日盈亏",
     "对冲单日盈亏",
+    "ETF单日盈亏",
     "总单日盈亏",
+    "持仓盈亏",
+    "交易盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
+    "当日盈亏对账差额",
     "券商期权单日盈亏变化",
     "券商对冲单日盈亏变化",
     "券商总单日盈亏变化",
@@ -83,6 +89,11 @@ SUMMARY_REPORT_COLUMNS = [
     "期权单日盈亏",
     "ETF单日盈亏",
     "总单日盈亏",
+    "持仓盈亏",
+    "交易盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
+    "当日盈亏对账差额",
     "账户Delta",
     "账户Gamma",
     "账户Vega",
@@ -104,6 +115,8 @@ POSITION_REPORT_COLUMNS = [
     "持仓均价",
     "持仓盈亏",
     "交易盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
     "到期日",
     "IV",
     "单张Delta",
@@ -202,6 +215,11 @@ def build_live_account_report(
     if persist_history:
         persist_account_report_history(product, account_id, payload)
     else:
+        payload["position_history"] = pd.DataFrame(
+            payload.get("position_rows", []),
+            columns=POSITION_COLUMNS,
+        )
+        _apply_current_pnl_decomposition(payload)
         payload["summary_history"] = _add_summary_greeks_pnl(
             pd.DataFrame(
                 [payload["summary"]],
@@ -210,10 +228,6 @@ def build_live_account_report(
             product=product,
         )
         _refresh_current_summary_from_history(payload)
-        payload["position_history"] = pd.DataFrame(
-            payload.get("position_rows", []),
-            columns=POSITION_COLUMNS,
-        )
     return payload
 
 
@@ -412,6 +426,7 @@ def persist_account_report_history(product, account_id, payload):
         product=product,
     )
     payload["position_history"].to_csv(position_path, index=False, encoding="utf-8-sig")
+    _apply_current_pnl_decomposition(payload)
     payload["summary_history"] = _update_history_csv(
         summary_path,
         [payload["summary"]],
@@ -487,6 +502,8 @@ def _json_payload(payload):
 
 def format_terminal_summary(payload):
     summary = payload["summary"]
+    position_report = _position_report_frame(payload)
+    pnl_decomposition = _position_pnl_totals(position_report)
     lines = [
         (
             f"账户报告={payload['product']}/{payload['account_id']} "
@@ -497,10 +514,20 @@ def format_terminal_summary(payload):
             f"估算权益={_fmt(summary['估算权益'])}"
         ),
         (
-            f"期权单日盈亏={_fmt(summary.get('券商期权单日盈亏变化'))} "
-            f"ETF单日盈亏={_fmt(summary.get('券商对冲单日盈亏变化'))} "
-            f"总单日盈亏={_fmt(summary.get('券商总单日盈亏变化'))} "
+            f"期权单日盈亏={_fmt(pnl_decomposition['option_daily_pnl'])} "
+            f"ETF单日盈亏={_fmt(pnl_decomposition['etf_daily_pnl'])} "
+            f"总单日盈亏={_fmt(pnl_decomposition['daily_pnl_decomposition'])} "
             f"当日手续费={_fmt(summary.get('当日手续费'))}"
+        ),
+        (
+            f"持仓盈亏={_fmt(pnl_decomposition['holding_pnl'])} "
+            f"交易盈亏(成本口径)={_fmt(pnl_decomposition['realized_cost_pnl'])} "
+            f"当日盯市交易盈亏={_fmt(pnl_decomposition['mark_to_market_trade_pnl'])} "
+            f"当日盈亏分解合计={_fmt(pnl_decomposition['daily_pnl_decomposition'])}"
+        ),
+        (
+            f"券商差分总单日盈亏={_fmt(summary.get('券商总单日盈亏变化'))} "
+            f"对账差额={_fmt((_number(summary.get('券商总单日盈亏变化')) or 0.0) - pnl_decomposition['daily_pnl_decomposition'])}"
         ),
         (
             f"账户Delta={_fmt(summary['账户Delta'])} "
@@ -521,7 +548,7 @@ def format_terminal_summary(payload):
     ]
     lines.extend(
         _plain_table(
-            _position_report_frame(payload).to_dict("records"),
+            position_report.to_dict("records"),
             ["交易方向", "合约代码", "合约名称", "总持仓张数", "今日变化", "最新价", "持仓均价", "IV", "单张Delta"],
         )
     )
@@ -536,21 +563,126 @@ def format_terminal_summary(payload):
 
 
 def _report_frames(payload):
+    position_report = _position_report_frame(payload)
     return {
-        "账户总体情况": _summary_report_frame(payload["summary_history"]),
-        "持仓记录": _position_report_frame(payload),
+        "账户总体情况": _summary_report_frame(
+            payload["summary_history"],
+            position_report=position_report,
+            report_date=payload.get("date"),
+        ),
+        "持仓记录": position_report,
         "当日交易记录": _frame(payload["trade_rows"], TRADE_COLUMNS),
     }
 
 
-def _summary_report_frame(summary_history):
+def _summary_report_frame(summary_history, position_report=None, report_date=None):
     if summary_history is None:
         return pd.DataFrame(columns=SUMMARY_REPORT_COLUMNS)
     frame = summary_history.copy()
-    frame["期权单日盈亏"] = frame.get("券商期权单日盈亏变化")
-    frame["ETF单日盈亏"] = frame.get("券商对冲单日盈亏变化")
-    frame["总单日盈亏"] = frame.get("券商总单日盈亏变化")
+    frame["期权单日盈亏"] = _prefer_numeric_column(
+        frame,
+        "期权单日盈亏",
+        "券商期权单日盈亏变化",
+    )
+    frame["ETF单日盈亏"] = _prefer_numeric_column(
+        frame,
+        "ETF单日盈亏",
+        "券商对冲单日盈亏变化",
+    )
+    frame["总单日盈亏"] = _prefer_numeric_column(
+        frame,
+        "总单日盈亏",
+        "券商总单日盈亏变化",
+    )
+    if isinstance(position_report, pd.DataFrame) and not position_report.empty:
+        report_date = str(report_date)
+        current_mask = frame["日期"].astype(str).eq(report_date)
+        totals = _position_pnl_totals(position_report)
+        broker_total = pd.to_numeric(
+            frame.loc[current_mask, "总单日盈亏"],
+            errors="coerce",
+        )
+        frame.loc[current_mask, "期权单日盈亏"] = totals["option_daily_pnl"]
+        frame.loc[current_mask, "ETF单日盈亏"] = totals["etf_daily_pnl"]
+        frame.loc[current_mask, "总单日盈亏"] = totals["daily_pnl_decomposition"]
+        frame.loc[current_mask, "持仓盈亏"] = totals["holding_pnl"]
+        frame.loc[current_mask, "交易盈亏"] = totals["realized_cost_pnl"]
+        frame.loc[current_mask, "当日盯市交易盈亏"] = totals[
+            "mark_to_market_trade_pnl"
+        ]
+        frame.loc[current_mask, "当日盈亏分解合计"] = totals[
+            "daily_pnl_decomposition"
+        ]
+        frame.loc[current_mask, "当日盈亏对账差额"] = (
+            broker_total - totals["daily_pnl_decomposition"]
+        )
     return frame.reindex(columns=SUMMARY_REPORT_COLUMNS)
+
+
+def _apply_current_pnl_decomposition(payload):
+    totals = _position_pnl_totals(_position_report_frame(payload))
+    broker_total = _number(payload["summary"].get("券商总单日盈亏变化"))
+    payload["summary"].update(
+        {
+            "期权单日盈亏": totals["option_daily_pnl"],
+            "ETF单日盈亏": totals["etf_daily_pnl"],
+            "总单日盈亏": totals["daily_pnl_decomposition"],
+            "持仓盈亏": totals["holding_pnl"],
+            "交易盈亏": totals["realized_cost_pnl"],
+            "当日盯市交易盈亏": totals["mark_to_market_trade_pnl"],
+            "当日盈亏分解合计": totals["daily_pnl_decomposition"],
+            "当日盈亏对账差额": (
+                None
+                if broker_total is None
+                else broker_total - totals["daily_pnl_decomposition"]
+            ),
+        }
+    )
+    return totals
+
+
+def _prefer_numeric_column(frame, preferred, fallback):
+    preferred_values = (
+        pd.to_numeric(frame[preferred], errors="coerce")
+        if preferred in frame.columns
+        else pd.Series(np.nan, index=frame.index)
+    )
+    fallback_values = (
+        pd.to_numeric(frame[fallback], errors="coerce")
+        if fallback in frame.columns
+        else pd.Series(np.nan, index=frame.index)
+    )
+    return preferred_values.combine_first(fallback_values)
+
+
+def _position_pnl_totals(position_report):
+    holding_pnl = _sum_numeric_column(position_report, "持仓盈亏")
+    realized_cost_pnl = _sum_numeric_column(position_report, "交易盈亏")
+    mark_to_market_trade_pnl = _sum_numeric_column(
+        position_report,
+        "当日盯市交易盈亏",
+    )
+    daily_by_row = (
+        pd.to_numeric(position_report.get("当日盈亏分解合计"), errors="coerce")
+        .fillna(0.0)
+    )
+    option_mask = position_report.get("到期日").notna()
+    option_daily_pnl = float(daily_by_row.loc[option_mask].sum())
+    etf_daily_pnl = float(daily_by_row.loc[~option_mask].sum())
+    return {
+        "holding_pnl": holding_pnl,
+        "realized_cost_pnl": realized_cost_pnl,
+        "mark_to_market_trade_pnl": mark_to_market_trade_pnl,
+        "daily_pnl_decomposition": holding_pnl + mark_to_market_trade_pnl,
+        "option_daily_pnl": option_daily_pnl,
+        "etf_daily_pnl": etf_daily_pnl,
+    }
+
+
+def _sum_numeric_column(frame, column):
+    if column not in frame.columns:
+        return 0.0
+    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).sum())
 
 
 def _diagnostic_report_frame(payload):
@@ -646,6 +778,20 @@ def _position_report_row(payload, code, current_rows, previous_rows, trade_rows)
     holding_cost = _weighted_position_value(cost_rows, "持仓均价")
     if holding_cost is None:
         holding_cost = _weighted_trade_open_price(trade_rows)
+    multiplier = _number(metadata.get("contract_multiplier")) if is_option else 1.0
+    pnl_breakdown = _daily_position_pnl_breakdown(
+        current_qty=current_qty,
+        current_side=side,
+        current_price=latest_price,
+        previous_qty=previous_qty,
+        previous_side=_first_value(previous_rows, "方向"),
+        previous_price=_first_value(previous_rows, "最新价"),
+        previous_cost=_weighted_position_value(previous_rows, "持仓均价"),
+        trade_rows=trade_rows,
+        multiplier=multiplier or 1.0,
+    )
+    if pnl_breakdown["ending_cost"] is not None and current_qty != 0:
+        holding_cost = pnl_breakdown["ending_cost"]
     contract_name = metadata.get("contract_symbol")
     if contract_name is None:
         contract_name = _first_value(current_rows, "合约名称")
@@ -674,8 +820,10 @@ def _position_report_row(payload, code, current_rows, previous_rows, trade_rows)
         "今日变化": current_qty - previous_qty,
         "最新价": latest_price,
         "持仓均价": holding_cost,
-        "持仓盈亏": None,
-        "交易盈亏": None,
+        "持仓盈亏": pnl_breakdown["holding_pnl"],
+        "交易盈亏": pnl_breakdown["realized_cost_pnl"],
+        "当日盯市交易盈亏": pnl_breakdown["mark_to_market_trade_pnl"],
+        "当日盈亏分解合计": pnl_breakdown["daily_pnl_decomposition"],
         "到期日": metadata.get("maturity_date") if is_option else None,
         "IV": metadata.get("iv") if is_option else None,
         "单张Delta": single_delta,
@@ -683,6 +831,158 @@ def _position_report_row(payload, code, current_rows, previous_rows, trade_rows)
         "单张Vega": single_vega,
         "单张Theta": single_theta,
     }
+
+
+def _daily_position_pnl_breakdown(
+    current_qty,
+    current_side,
+    current_price,
+    previous_qty,
+    previous_side,
+    previous_price,
+    previous_cost,
+    trade_rows,
+    multiplier,
+):
+    current_price = _number(current_price)
+    previous_price = _number(previous_price)
+    previous_cost = _number(previous_cost)
+    multiplier = float(_number(multiplier) or 1.0)
+    old_signed_qty = _signed_position_qty(previous_qty, previous_side)
+    total_signed_qty = old_signed_qty
+    total_cost = previous_cost
+    new_signed_qty = 0.0
+    new_cost = None
+    realized_cost_pnl = 0.0
+    mark_to_market_trade_pnl = 0.0
+
+    for trade in sorted(trade_rows, key=_trade_sort_key):
+        trade_qty = float(_number(trade.get("成交数量")) or 0.0)
+        trade_price = _number(trade.get("成交价格"))
+        trade_signed_qty = _trade_signed_position_qty(trade)
+        if trade_qty <= 0 or trade_price is None or trade_signed_qty == 0:
+            continue
+
+        if total_signed_qty != 0 and total_signed_qty * trade_signed_qty < 0:
+            close_qty = min(abs(total_signed_qty), abs(trade_signed_qty))
+            if total_cost is not None:
+                realized_cost_pnl += (
+                    close_qty
+                    * (trade_price - total_cost)
+                    * np.sign(total_signed_qty)
+                    * multiplier
+                )
+
+            remaining_close = close_qty
+            if old_signed_qty != 0 and old_signed_qty * trade_signed_qty < 0:
+                old_close = min(abs(old_signed_qty), remaining_close)
+                if previous_price is not None:
+                    mark_to_market_trade_pnl += (
+                        old_close
+                        * (trade_price - previous_price)
+                        * np.sign(old_signed_qty)
+                        * multiplier
+                    )
+                old_signed_qty -= np.sign(old_signed_qty) * old_close
+                remaining_close -= old_close
+            if (
+                remaining_close > 0
+                and new_signed_qty != 0
+                and new_signed_qty * trade_signed_qty < 0
+            ):
+                new_close = min(abs(new_signed_qty), remaining_close)
+                if new_cost is not None:
+                    mark_to_market_trade_pnl += (
+                        new_close
+                        * (trade_price - new_cost)
+                        * np.sign(new_signed_qty)
+                        * multiplier
+                    )
+                new_signed_qty -= np.sign(new_signed_qty) * new_close
+
+            total_signed_qty -= np.sign(total_signed_qty) * close_qty
+            trade_signed_qty += np.sign(trade_signed_qty) * -close_qty
+            if abs(total_signed_qty) <= 1e-9:
+                total_signed_qty = 0.0
+                total_cost = None
+            if abs(new_signed_qty) <= 1e-9:
+                new_signed_qty = 0.0
+                new_cost = None
+
+        if abs(trade_signed_qty) > 1e-9:
+            total_cost = _weighted_signed_cost(
+                total_signed_qty,
+                total_cost,
+                trade_signed_qty,
+                trade_price,
+            )
+            total_signed_qty += trade_signed_qty
+            new_cost = _weighted_signed_cost(
+                new_signed_qty,
+                new_cost,
+                trade_signed_qty,
+                trade_price,
+            )
+            new_signed_qty += trade_signed_qty
+
+    holding_pnl = 0.0
+    if current_price is not None:
+        if old_signed_qty != 0 and previous_price is not None:
+            holding_pnl += (
+                abs(old_signed_qty)
+                * (current_price - previous_price)
+                * np.sign(old_signed_qty)
+                * multiplier
+            )
+        if new_signed_qty != 0 and new_cost is not None:
+            holding_pnl += (
+                abs(new_signed_qty)
+                * (current_price - new_cost)
+                * np.sign(new_signed_qty)
+                * multiplier
+            )
+
+    expected_signed_qty = _signed_position_qty(current_qty, current_side)
+    ending_cost = total_cost if abs(total_signed_qty - expected_signed_qty) <= 1e-6 else None
+    return {
+        "holding_pnl": holding_pnl,
+        "realized_cost_pnl": realized_cost_pnl,
+        "mark_to_market_trade_pnl": mark_to_market_trade_pnl,
+        "daily_pnl_decomposition": holding_pnl + mark_to_market_trade_pnl,
+        "ending_cost": ending_cost,
+    }
+
+
+def _signed_position_qty(qty, side):
+    qty = float(_number(qty) or 0.0)
+    return -abs(qty) if str(side or "").lower() == "short" else qty
+
+
+def _trade_signed_position_qty(trade):
+    qty = float(_number(trade.get("成交数量")) or 0.0)
+    return -qty if "卖" in str(trade.get("买卖") or "") else qty
+
+
+def _weighted_signed_cost(current_qty, current_cost, added_qty, added_price):
+    if abs(added_qty) <= 1e-9:
+        return current_cost
+    if abs(current_qty) <= 1e-9 or current_cost is None:
+        return float(added_price)
+    if current_qty * added_qty <= 0:
+        return current_cost
+    return (
+        abs(current_qty) * float(current_cost) + abs(added_qty) * float(added_price)
+    ) / (abs(current_qty) + abs(added_qty))
+
+
+def _trade_sort_key(row):
+    return str(
+        row.get("成交时间(日)")
+        or row.get("成交时间")
+        or row.get("报单时间")
+        or row.get("成交编号")
+        or ""
+    )
 
 
 def _rows_total_qty(rows):

@@ -82,16 +82,27 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
         )
 
     account_greeks = core.backtester.combine_greeks(position_greeks)
-    advice, planned_greeks = _build_execution_plan(
+    capacity_item = _live_capacity_reduction_item(
         config,
         live_account,
         chain_df,
         spot,
-        atm,
-        strategy_advice,
-        account_greeks,
-        position_greeks_by_side,
+        reason="Current live account cash or margin capacity is too tight.",
     )
+    if capacity_item is not None:
+        advice = [capacity_item]
+        planned_greeks = account_greeks
+    else:
+        advice, planned_greeks = _build_execution_plan(
+            config,
+            live_account,
+            chain_df,
+            spot,
+            atm,
+            strategy_advice,
+            account_greeks,
+            position_greeks_by_side,
+        )
 
     if not advice:
         advice.append(
@@ -927,6 +938,38 @@ def _build_execution_plan(
         plan.extend(_hedge_advice(config, live_account, account_greeks, spot, chain_df, atm))
         return plan, account_greeks
 
+    projected_cash = _projected_cash_after_option_actions(
+        config,
+        live_account,
+        option_actions,
+        chain_df,
+        spot,
+    )
+    min_cash = float(config.backtest.min_cash_reserve)
+    if projected_cash is not None and projected_cash < min_cash:
+        reduction_item = _live_capacity_reduction_item(
+            config,
+            live_account,
+            chain_df,
+            spot,
+            required_cash_relief=min_cash - projected_cash,
+            reason=(
+                "Reduce the short straddle before the planned main-position action "
+                "would breach the live cash reserve."
+            ),
+        )
+        if reduction_item is not None:
+            return [reduction_item], account_greeks
+        return [
+            {
+                "action": "DATA_WARNING",
+                "priority": "warning",
+                "reason": "Planned main-position action would breach the live cash reserve.",
+                "projected_cash": projected_cash,
+                "min_cash_reserve": min_cash,
+            }
+        ], account_greeks
+
     planned_greeks = _project_greeks_after_plan(
         option_actions,
         chain_df,
@@ -934,6 +977,11 @@ def _build_execution_plan(
     )
     if planned_greeks is None:
         return plan, account_greeks
+    if any(
+        str(item.get("action") or "").startswith(("OPEN_", "ROLL_"))
+        for item in option_actions
+    ):
+        return plan, planned_greeks
 
     final_hedge = _final_hedge_advice(
         config,
@@ -946,6 +994,231 @@ def _build_execution_plan(
     )
     plan.extend(final_hedge)
     return plan, planned_greeks
+
+
+def _projected_cash_after_option_actions(
+    config,
+    live_account,
+    option_actions,
+    chain_df,
+    spot,
+):
+    cash = float(live_account.cash)
+    for item in option_actions:
+        action = str(item.get("action") or "")
+        cash_effect = item.get("estimated_cash_effect")
+        if cash_effect is not None:
+            cash += float(cash_effect)
+            continue
+        if not action.startswith("ROLL_"):
+            continue
+        side = item.get("side")
+        current = live_account.positions.get(side)
+        if current is None:
+            return None
+        current_value = (
+            float(item.get("estimated_current_call_price", 0.0) or 0.0)
+            * int(item.get("current_call_qty", 0) or 0)
+            + float(item.get("estimated_current_put_price", 0.0) or 0.0)
+            * int(item.get("current_put_qty", 0) or 0)
+        ) * float(current.get("contract_multiplier", config.vol.contract_multiplier))
+        close_fee = core.position.calc_option_fee(
+            int(item.get("current_call_qty", 0) or 0),
+            int(item.get("current_put_qty", 0) or 0),
+            config.backtest.option_fee_per_contract,
+        )
+        cash += (
+            float(current.get("option_margin", 0.0) or 0.0)
+            - current_value
+            - close_fee
+            if side == "short"
+            else current_value - close_fee
+        )
+        try:
+            call_row = _chain_row(chain_df, item.get("target_call_code"))
+            put_row = _chain_row(chain_df, item.get("target_put_code"))
+        except IndexError:
+            return None
+        target_atm = {
+            "call": call_row,
+            "put": put_row,
+            "strike": float(call_row.get("strike_price")),
+        }
+        target_position = core.position.open_straddle(
+            pd.Timestamp.now(),
+            target_atm,
+            int(item.get("target_call_qty", 0) or 0),
+            int(item.get("target_put_qty", 0) or 0),
+            side=side,
+            spot=spot,
+        )
+        target_value = core.position.value(target_position, call_row, put_row)
+        open_fee = core.position.calc_option_fee(
+            target_position["call_qty"],
+            target_position["put_qty"],
+            config.backtest.option_fee_per_contract,
+        )
+        cash += (
+            target_value - open_fee - target_position["option_margin"]
+            if side == "short"
+            else -target_value - open_fee
+        )
+    return cash
+
+
+def _live_capacity_reduction_item(
+    config,
+    live_account,
+    chain_df,
+    spot,
+    required_cash_relief=0.0,
+    reason=None,
+):
+    short_position = live_account.positions.get("short")
+    if short_position is None:
+        return None
+    try:
+        call_row, put_row = core.vol_engine.resolve_position_pair(
+            short_position,
+            chain_df,
+        )
+    except IndexError:
+        return None
+
+    current_qty = min(
+        int(short_position.get("call_qty", 0) or 0),
+        int(short_position.get("put_qty", 0) or 0),
+    )
+    if current_qty <= 0:
+        return None
+
+    capacity = _live_account_capacity(config, live_account, chain_df, spot)
+    min_cash = float(config.backtest.min_cash_reserve)
+    cash_shortfall = max(
+        0.0,
+        min_cash - float(live_account.cash),
+        float(required_cash_relief),
+    )
+    margin_limit = max(
+        0.0,
+        capacity["nav"] * float(config.backtest.max_margin_to_nav_ratio),
+    )
+    margin_excess = max(0.0, capacity["total_margin"] - margin_limit)
+    if cash_shortfall <= 1e-6 and margin_excess <= 1e-6:
+        return None
+
+    option_margin = float(short_position.get("option_margin", 0.0) or 0.0)
+    margin_relief_per_contract = option_margin / current_qty
+    multiplier = float(
+        short_position.get(
+            "contract_multiplier",
+            call_row.get("contract_multiplier", config.vol.contract_multiplier),
+        )
+        or config.vol.contract_multiplier
+    )
+    close_cost_per_contract = (
+        float(call_row.get("mid", 0.0) or 0.0)
+        + float(put_row.get("mid", 0.0) or 0.0)
+    ) * multiplier + core.position.calc_option_fee(
+        1,
+        1,
+        config.backtest.option_fee_per_contract,
+    )
+    cash_relief_per_contract = margin_relief_per_contract - close_cost_per_contract
+    close_for_cash = (
+        int(math.ceil(cash_shortfall / cash_relief_per_contract))
+        if cash_shortfall > 0 and cash_relief_per_contract > 0
+        else 0
+    )
+    close_for_margin = (
+        int(math.ceil(margin_excess / margin_relief_per_contract))
+        if margin_excess > 0 and margin_relief_per_contract > 0
+        else 0
+    )
+    close_qty = min(current_qty, max(close_for_cash, close_for_margin))
+    if close_qty <= 0:
+        return {
+            "action": "DATA_WARNING",
+            "priority": "warning",
+            "reason": (
+                "Live account capacity is tight, but reducing the current short "
+                "straddle would not release enough cash or margin."
+            ),
+            "cash": float(live_account.cash),
+            "min_cash_reserve": min_cash,
+            "total_margin": capacity["total_margin"],
+            "margin_limit": margin_limit,
+        }
+
+    target_qty = current_qty - close_qty
+    estimated_cash_effect = cash_relief_per_contract * close_qty
+    return {
+        "action": "REDUCE_SHORT_STRADDLE_FOR_CAPACITY",
+        "priority": "action",
+        "side": "short",
+        "reason": reason or "Reduce the short straddle to restore live account capacity.",
+        "call_code": short_position.get("call_code"),
+        "put_code": short_position.get("put_code"),
+        "call_qty": close_qty,
+        "put_qty": close_qty,
+        "current_call_qty": current_qty,
+        "current_put_qty": current_qty,
+        "target_call_qty": target_qty,
+        "target_put_qty": target_qty,
+        "estimated_call_price": float(call_row.get("mid")),
+        "estimated_put_price": float(put_row.get("mid")),
+        "estimated_fee": core.position.calc_option_fee(
+            close_qty,
+            close_qty,
+            config.backtest.option_fee_per_contract,
+        ),
+        "estimated_cash_effect": estimated_cash_effect,
+        "cash_before": float(live_account.cash),
+        "projected_cash_after": float(live_account.cash) + estimated_cash_effect,
+        "min_cash_reserve": min_cash,
+        "margin_before": capacity["total_margin"],
+        "projected_margin_after": capacity["total_margin"]
+        - margin_relief_per_contract * close_qty,
+        "margin_limit": margin_limit,
+        "requires_import_and_rerun": True,
+    }
+
+
+def _live_account_capacity(config, live_account, chain_df, spot):
+    option_value = 0.0
+    option_margin = 0.0
+    for side, position in live_account.positions.items():
+        if position is None:
+            continue
+        option_margin += float(position.get("option_margin", 0.0) or 0.0)
+        try:
+            call_row, put_row = core.vol_engine.resolve_position_pair(position, chain_df)
+        except IndexError:
+            continue
+        option_value += core.position.signed_value(position, call_row, put_row)
+    for hedge_position in getattr(live_account, "option_hedges", []) or []:
+        _, value = _option_hedge_greeks_and_value(hedge_position, chain_df)
+        option_value += float(value or 0.0)
+        option_margin += float(hedge_position.get("option_margin", 0.0) or 0.0)
+
+    hedge_margin = float(live_account.hedge.margin or 0.0)
+    hedge_price = float(live_account.hedge.latest_price or spot)
+    hedge_pnl = core.hedge.calc_unrealized_pnl(
+        float(live_account.hedge.qty or 0.0),
+        float(live_account.hedge.entry_price or 0.0),
+        hedge_price,
+    )
+    total_margin = option_margin + hedge_margin
+    nav = (
+        float(live_account.cash)
+        + option_value
+        + total_margin
+        + hedge_pnl
+    )
+    return {
+        "nav": nav,
+        "total_margin": total_margin,
+    }
 
 
 def _is_option_execution_action(action):
@@ -1135,6 +1408,34 @@ def _delta_hedge_plan(
         underlying_order_book_id = _underlying_id_from_atm(atm)
 
     if getattr(config.strategy, "allow_etf_short_hedge", True) or target_qty >= 0:
+        trade_qty = target_qty - current_hedge_qty
+        projected_cash = float(live_account.cash) - max(0.0, trade_qty) * float(
+            spot
+        ) * (1.0 + float(config.backtest.etf_fee_rate))
+        min_cash = float(config.backtest.min_cash_reserve)
+        if projected_cash < min_cash:
+            reduction_item = _live_capacity_reduction_item(
+                config,
+                live_account,
+                chain_df,
+                spot,
+                required_cash_relief=min_cash - projected_cash,
+                reason=(
+                    "Reduce the short straddle before the planned ETF delta hedge "
+                    "would breach the live cash reserve."
+                ),
+            )
+            if reduction_item is not None:
+                return [reduction_item]
+            return [
+                {
+                    "action": "DATA_WARNING",
+                    "priority": "warning",
+                    "reason": "Planned ETF delta hedge would breach the live cash reserve.",
+                    "projected_cash": projected_cash,
+                    "min_cash_reserve": min_cash,
+                }
+            ]
         return [
             _etf_hedge_item(
                 action,
@@ -1219,6 +1520,8 @@ def _delta_hedge_plan(
                 final=action.startswith("FINAL_"),
             )
         if combination_item is not None:
+            if combination_item.get("action") == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
+                return [combination_item]
             plan.append(combination_item)
         else:
             plan.append(
@@ -1385,6 +1688,72 @@ def _option_delta_hedge_combination_item(
         ) * int(leg["qty"])
         for leg in open_legs
     )
+    open_value = sum(
+        float(leg["row"].get("mid"))
+        * int(leg["qty"])
+        * float(
+            leg["row"].get(
+                "contract_multiplier",
+                config.vol.contract_multiplier,
+            )
+        )
+        for leg in open_legs
+    )
+    close_value = (
+        close_price
+        * int(close_qty)
+        * float(source["row"].get("contract_multiplier", config.vol.contract_multiplier))
+    )
+    close_margin_release = core.position.margin_call(
+        float(spot),
+        float(source["row"].get("strike_price")),
+        close_price,
+        float(source["row"].get("contract_multiplier", config.vol.contract_multiplier)),
+    ) * int(close_qty)
+    etf_correction_cost = float(best["etf_buy_qty"]) * float(spot) * (
+        1.0 + float(config.backtest.etf_fee_rate)
+    )
+    estimated_cash_effect = (
+        close_margin_release
+        + open_value
+        - close_value
+        - fee
+        - margin
+        - etf_correction_cost
+    )
+    etf_reduction_cash_effect = max(0.0, float(live_account.hedge.qty or 0.0)) * float(
+        spot
+    ) * (1.0 - float(config.backtest.etf_fee_rate))
+    projected_cash = (
+        float(live_account.cash)
+        + etf_reduction_cash_effect
+        + estimated_cash_effect
+    )
+    min_cash = float(config.backtest.min_cash_reserve)
+    if projected_cash < min_cash:
+        reduction_item = _live_capacity_reduction_item(
+            config,
+            live_account,
+            chain_df,
+            spot,
+            required_cash_relief=min_cash - projected_cash,
+            reason=(
+                "Reduce the short straddle before the planned option-combination "
+                "delta hedge would breach the live cash reserve."
+            ),
+        )
+        if reduction_item is not None:
+            return reduction_item
+        return {
+            "action": "DATA_WARNING",
+            "priority": "warning",
+            "reason": (
+                "Planned option-combination delta hedge would breach the live "
+                "cash reserve."
+            ),
+            "projected_cash": projected_cash,
+            "min_cash_reserve": min_cash,
+        }
     item = {
         "action": (
             "FINAL_OPTION_DELTA_HEDGE_COMBINATION"
@@ -1430,6 +1799,12 @@ def _option_delta_hedge_combination_item(
         "estimated_price": float(spot),
         "estimated_fee": fee,
         "estimated_option_margin": margin,
+        "estimated_close_margin_release": close_margin_release,
+        "estimated_cash_effect": estimated_cash_effect,
+        "preceding_etf_reduction_cash_effect": etf_reduction_cash_effect,
+        "estimated_etf_correction_cost": etf_correction_cost,
+        "projected_cash_after": projected_cash,
+        "min_cash_reserve": min_cash,
         "open_liquidity_capacity": sum(
             int(leg["liquidity_capacity"]) for leg in open_legs
         ),

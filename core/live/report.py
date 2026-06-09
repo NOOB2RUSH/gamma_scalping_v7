@@ -74,6 +74,18 @@ def _advice_execution_rows(item):
             item.get("estimated_price"),
         )]
 
+    if action == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
+        return _option_pair_rows(
+            item,
+            "买入平仓",
+            "call_code",
+            "put_code",
+            "call_qty",
+            "put_qty",
+            "estimated_call_price",
+            "estimated_put_price",
+        )
+
     if action.startswith("OPEN_"):
         return _option_pair_rows(
             item,

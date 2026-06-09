@@ -252,8 +252,15 @@ def solve_liquid_call_delta_hedge(source, open_rows, residual_delta):
     if close_delta <= 0 or close_gamma <= 0 or multiplier <= 0:
         return None
 
+    unique_rows = {}
+    for index, row in enumerate(open_rows):
+        code = str(_get_row_value(row, "order_book_id") or f"row:{index}")
+        current = unique_rows.get(code)
+        if current is None or liquidity_capacity(row) > liquidity_capacity(current):
+            unique_rows[code] = row
+
     candidates = []
-    for row in open_rows:
+    for row in unique_rows.values():
         delta = float(_get_row_value(row, "delta") or 0.0)
         gamma = float(_get_row_value(row, "gamma") or 0.0)
         capacity = liquidity_capacity(row)
