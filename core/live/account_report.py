@@ -91,6 +91,7 @@ DEFAULT_SUMMARY_REPORT_COLUMNS = [
     "期权单日盈亏",
     "ETF单日盈亏",
     "总单日盈亏",
+    "交易盈亏",
     "账户Delta",
     "账户Gamma",
     "账户Vega",
@@ -135,6 +136,7 @@ DEFAULT_POSITION_REPORT_COLUMNS = [
     "最新价",
     "持仓均价",
     "持仓盈亏",
+    "交易盈亏",
     "到期日",
     "IV",
 ]
@@ -161,7 +163,6 @@ DIAGNOSE_POSITION_REPORT_COLUMNS = [
 
 INTERNAL_RECONCILIATION_COLUMNS = {
     "持仓盈亏",
-    "交易盈亏",
     "当日盯市交易盈亏",
     "当日盈亏分解合计",
     "当日盈亏对账差额",
@@ -592,6 +593,7 @@ def format_terminal_summary(payload, mode="default"):
             f"期权单日盈亏={_fmt(pnl_decomposition['option_daily_pnl'])} "
             f"ETF单日盈亏={_fmt(pnl_decomposition['etf_daily_pnl'])} "
             f"总单日盈亏={_fmt(pnl_decomposition['daily_pnl_decomposition'])} "
+            f"交易盈亏={_fmt(pnl_decomposition['realized_cost_pnl'])} "
             f"当日手续费={_fmt(summary.get('当日手续费'))}"
         ),
         (
