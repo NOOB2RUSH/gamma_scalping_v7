@@ -1725,36 +1725,50 @@ class BacktestEngine:
         )
         return True
 
+    def _projected_margin_after_delta_hedge(self, day, state):
+        core_option_margin = sum(
+            opt_position.margin_value(position)
+            for position in state.positions.values()
+            if position is not None
+        )
+        core_greeks = combine_greeks(
+            [day["side_records"][side]["greeks"] for side in POSITION_SIDES]
+        )
+        projected_hedge_margin = abs(float(core_greeks["delta"])) * float(day["spot"])
+        return core_option_margin + projected_hedge_margin
+
     def _enforce_margin_limit(self, day, state):
         if not self.config.get("dynamic_position_control_enabled", False):
             return
         ratio_limit = float(self.config["max_margin_to_nav_ratio"])
+        self._update_day_aggregates(day, state)
+        nav, total_margin = self._current_nav_and_margin(day, state)
+        if nav > 0 and total_margin <= nav * ratio_limit + 1e-6:
+            return
+
+        # Auxiliary option hedges are replanned after the core position reaches its
+        # final size. Keep the ETF hedge in place so margin enforcement does not
+        # repeatedly sell and repurchase the full hedge within the same day.
+        if state.option_hedges:
+            self._close_option_delta_hedges(day["date"], state, day)
+
         for _ in range(50):
             self._update_day_aggregates(day, state)
             nav, total_margin = self._current_nav_and_margin(day, state)
-            if nav > 0 and total_margin <= nav * ratio_limit + 1e-6:
-                return
-
-            if state.option_hedges:
-                self._close_option_delta_hedges(day["date"], state, day)
-            if abs(state.hedge_etf_qty) > 1e-9:
-                self._execute_etf_target(
-                    day["date"],
-                    day["spot"],
-                    state,
-                    day,
-                    day["greeks"],
-                    0.0,
-                    "dynamic_reduce_hedge",
-                )
-            self._update_day_aggregates(day, state)
-            nav, total_margin = self._current_nav_and_margin(day, state)
-            if nav > 0 and total_margin <= nav * ratio_limit + 1e-6:
+            projected_margin = self._projected_margin_after_delta_hedge(day, state)
+            margin_limit = nav * ratio_limit
+            if nav > 0 and projected_margin <= margin_limit + 1e-6:
                 self._hedge_to(day["date"], day["spot"], state, day, day["greeks"])
                 self._update_day_aggregates(day, state)
                 nav, total_margin = self._current_nav_and_margin(day, state)
                 if nav > 0 and total_margin <= nav * ratio_limit + 1e-6:
                     return
+
+            if state.option_hedges:
+                self._close_option_delta_hedges(day["date"], state, day)
+                self._update_day_aggregates(day, state)
+                nav, total_margin = self._current_nav_and_margin(day, state)
+                projected_margin = self._projected_margin_after_delta_hedge(day, state)
 
             candidates = [
                 (opt_position.margin_value(position), side, position)
@@ -1767,12 +1781,16 @@ class BacktestEngine:
             current_qty = min(int(position["call_qty"]), int(position["put_qty"]))
             if current_qty <= 0:
                 return
-            scale = max(0.0, min(0.99, (nav * ratio_limit) / max(total_margin, 1.0)))
+            scale = max(
+                0.0,
+                min(
+                    0.99,
+                    (nav * ratio_limit) / max(total_margin, projected_margin, 1.0),
+                ),
+            )
             target_qty = min(current_qty - 1, int(math.floor(current_qty * scale)))
             if not self._reduce_position_for_margin(day, state, side, target_qty):
                 return
-            self._update_day_aggregates(day, state)
-            self._hedge_to(day["date"], day["spot"], state, day, day["greeks"])
 
         nav, total_margin = self._current_nav_and_margin(day, state)
         state.trades.append(

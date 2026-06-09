@@ -34,7 +34,7 @@ CONFIG = AppConfig(
         # 科创50ETF 期权单合约历史成交量不是交易所逐合约原始数据，
         # 而是用 Sina 合约活跃度按上交所认购/认沽总量校准后的估算值。
         # 因此成交量预警只适合作为粗略流动性提示，不宜视为精确成交约束。
-        liquidity_warning_volume_ratio=0.005,
+        liquidity_warning_volume_ratio=0.01,
     ),
     strategy=StrategyConfig(
         enable_long_straddle=True,
