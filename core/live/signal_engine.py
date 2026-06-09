@@ -1173,10 +1173,10 @@ def _delta_hedge_plan(
         )
         return plan
 
-    if getattr(config.strategy, "option_delta_hedge_gamma_neutral", False):
-        gamma_neutral_item = None
+    if getattr(config.strategy, "option_delta_hedge_combination_enabled", False):
+        combination_item = None
         if not after_actions:
-            gamma_neutral_item = _gamma_neutral_option_delta_hedge_item(
+            combination_item = _option_delta_hedge_combination_item(
                 config,
                 live_account,
                 chain_df,
@@ -1188,15 +1188,15 @@ def _delta_hedge_plan(
                 option_delta=option_delta,
                 final=action.startswith("FINAL_"),
             )
-        if gamma_neutral_item is not None:
-            plan.append(gamma_neutral_item)
+        if combination_item is not None:
+            plan.append(combination_item)
         else:
             plan.append(
                 {
                     "action": "DATA_WARNING",
                     "priority": "warning",
                     "reason": (
-                        "Gamma-neutral option delta hedge is not feasible with "
+                        "No liquid lightly-ITM option delta hedge is feasible with "
                         "current short-call inventory and listed call contracts, "
                         "or the core option position is already changing in this plan."
                     ),
@@ -1242,7 +1242,7 @@ def _delta_hedge_plan(
     return plan
 
 
-def _gamma_neutral_option_delta_hedge_item(
+def _option_delta_hedge_combination_item(
     config,
     live_account,
     chain_df,
@@ -1254,7 +1254,6 @@ def _gamma_neutral_option_delta_hedge_item(
     option_delta=0.0,
     final=False,
 ):
-    target_delta_effect = -float(residual_delta)
     sources = _short_call_close_sources(live_account, chain_df)
     if not sources:
         return None
@@ -1281,68 +1280,74 @@ def _gamma_neutral_option_delta_hedge_item(
             )
         ]
         same_expiry = _light_itm_call_candidates(config, same_expiry, spot)
-        for _, open_row in same_expiry.iterrows():
-            if str(open_row.get("order_book_id")) == source_code:
-                continue
-            if float(open_row.get("contract_multiplier")) != float(
-                source_row.get("contract_multiplier")
-            ):
-                continue
-            solution = _integer_gamma_neutral_call_solution(
-                source,
-                open_row,
-                target_delta_effect,
-                max_etf_correction=max(1.0, abs(residual_delta) * 0.05),
+        same_expiry = same_expiry[
+            ~same_expiry["order_book_id"].astype(str).eq(source_code)
+            & (
+                pd.to_numeric(same_expiry["contract_multiplier"], errors="coerce")
+                == float(source_row.get("contract_multiplier"))
             )
-            if solution is None:
-                continue
-            score = (
-                abs(solution["gamma_effect"]) * float(spot)
-                + solution["etf_buy_qty"]
-                + solution["close_qty"] * 1e-3
-            )
-            if best is None or score < best["score"]:
-                best = {
-                    **solution,
-                    "score": score,
-                    "source": source,
-                    "open_row": open_row,
-                }
+        ]
+        solution = core.position.solve_liquid_call_delta_hedge(
+            source,
+            [row for _, row in same_expiry.iterrows()],
+            residual_delta,
+        )
+        if solution is not None and (best is None or solution["score"] < best["score"]):
+            best = {
+                **solution,
+                "source": source,
+            }
     if best is None:
         return None
 
     source = best["source"]
-    open_row = best["open_row"]
-    open_qty = best["open_qty"]
+    open_legs = best["open_legs"]
+    primary_open_row = open_legs[0]["row"]
+    open_qty = int(best["open_qty"])
     close_qty = best["close_qty"]
-    multiplier = float(open_row.get("contract_multiplier", config.vol.contract_multiplier))
-    open_price = float(open_row.get("mid"))
     close_price = float(source["row"].get("mid"))
     fee = core.position.calc_option_fee(open_qty + close_qty, 0, config.backtest.option_fee_per_contract)
-    margin = core.position.margin_call(
-        float(spot),
-        float(open_row.get("strike_price")),
-        open_price,
-        multiplier,
-    ) * open_qty
+    margin = sum(
+        core.position.margin_call(
+            float(spot),
+            float(leg["row"].get("strike_price")),
+            float(leg["row"].get("mid")),
+            float(leg["row"].get("contract_multiplier", config.vol.contract_multiplier)),
+        ) * int(leg["qty"])
+        for leg in open_legs
+    )
     item = {
         "action": (
-            "FINAL_GAMMA_NEUTRAL_OPTION_DELTA_HEDGE"
+            "FINAL_OPTION_DELTA_HEDGE_COMBINATION"
             if final
-            else "GAMMA_NEUTRAL_OPTION_DELTA_HEDGE"
+            else "OPTION_DELTA_HEDGE_COMBINATION"
         ),
         "priority": "action",
         "side": "short",
-        "reason": "Offset account delta while keeping option gamma approximately unchanged.",
+        "reason": (
+            "Use liquid lightly-ITM calls to minimize account delta, then minimize "
+            "the resulting gamma change."
+        ),
         "close_source": source["kind"],
         "close_call_code": source["row"].get("order_book_id"),
         "close_call_qty": close_qty,
         "estimated_close_call_price": close_price,
-        "open_call_code": open_row.get("order_book_id"),
+        "open_call_code": primary_open_row.get("order_book_id"),
         "open_call_qty": open_qty,
-        "estimated_open_call_price": open_price,
-        "open_strike": float(open_row.get("strike_price")),
-        "open_expiry": str(pd.Timestamp(open_row.get("maturity_date")).date()),
+        "estimated_open_call_price": float(primary_open_row.get("mid")),
+        "open_strike": float(primary_open_row.get("strike_price")),
+        "open_expiry": str(pd.Timestamp(primary_open_row.get("maturity_date")).date()),
+        "open_legs": [
+            {
+                "order_book_id": leg["row"].get("order_book_id"),
+                "qty": int(leg["qty"]),
+                "estimated_price": float(leg["row"].get("mid")),
+                "strike": float(leg["row"].get("strike_price")),
+                "volume": float(leg["row"].get("volume")),
+                "liquidity_capacity": int(leg["liquidity_capacity"]),
+            }
+            for leg in open_legs
+        ],
         "estimated_delta_effect": best["delta_effect"],
         "estimated_gamma_effect": best["gamma_effect"],
         "residual_delta_before_option_hedge": residual_delta,
@@ -1356,6 +1361,13 @@ def _gamma_neutral_option_delta_hedge_item(
         "estimated_price": float(spot),
         "estimated_fee": fee,
         "estimated_option_margin": margin,
+        "open_liquidity_capacity": sum(
+            int(leg["liquidity_capacity"]) for leg in open_legs
+        ),
+        "close_liquidity_capacity": best["close_liquidity_capacity"],
+        "solver_priority": "liquidity_then_delta_then_gamma",
+        "delta_neutral_achieved": best["delta_neutral_achieved"],
+        "liquidity_capacity_exhausted": best["liquidity_capacity_exhausted"],
         "underlying_order_book_id": underlying_order_book_id,
     }
     if after_actions is not None:
@@ -1395,82 +1407,6 @@ def _short_call_close_sources(live_account, chain_df):
         except IndexError:
             pass
     return sources
-
-
-def _integer_gamma_neutral_call_solution(
-    source,
-    open_row,
-    target_delta_effect,
-    max_etf_correction=None,
-):
-    close_delta = float(source["row"].get("delta", 0.0) or 0.0)
-    close_gamma = float(source["row"].get("gamma", 0.0) or 0.0)
-    open_delta = float(open_row.get("delta", 0.0) or 0.0)
-    open_gamma = float(open_row.get("gamma", 0.0) or 0.0)
-    multiplier = float(open_row.get("contract_multiplier", 10000) or 10000)
-    if close_gamma <= 0 or open_gamma <= 0:
-        return None
-    denominator = close_delta * open_gamma / close_gamma - open_delta
-    if abs(denominator) <= 1e-12:
-        return None
-    continuous_open_qty = (target_delta_effect / multiplier) / denominator
-    if continuous_open_qty <= 0:
-        return None
-
-    best = None
-    open_centers = {max(1, int(math.floor(continuous_open_qty))), max(1, int(math.ceil(continuous_open_qty)))}
-    for center in list(open_centers):
-        open_centers.update(
-            {
-                max(1, center - 4),
-                max(1, center - 3),
-                max(1, center - 2),
-                max(1, center - 1),
-                center + 1,
-                center + 2,
-                center + 3,
-                center + 4,
-            }
-        )
-    for open_qty in sorted(open_centers):
-        continuous_close_qty = open_qty * open_gamma / close_gamma
-        close_candidates = {
-            max(1, int(math.floor(continuous_close_qty))),
-            max(1, int(math.ceil(continuous_close_qty))),
-        }
-        for close_qty in close_candidates:
-            # Keep both original straddle legs present so broker snapshots can
-            # continue to identify and synchronize the core pair.
-            if close_qty >= int(source["max_qty"]):
-                continue
-            delta_effect = multiplier * (close_qty * close_delta - open_qty * open_delta)
-            gamma_effect = multiplier * (close_qty * close_gamma - open_qty * open_gamma)
-            projected_delta = -target_delta_effect + delta_effect
-            if max_etf_correction is not None:
-                if projected_delta > 0 or abs(projected_delta) > max_etf_correction:
-                    continue
-                etf_buy_qty = float(math.ceil(-projected_delta))
-            else:
-                etf_buy_qty = 0.0
-            gross_gamma = multiplier * max(
-                close_qty * close_gamma,
-                open_qty * open_gamma,
-            )
-            if abs(gamma_effect) > max(1.0, gross_gamma * 0.05):
-                continue
-            score = abs(gamma_effect) + etf_buy_qty
-            if best is None or score < best["score"]:
-                best = {
-                    "open_qty": open_qty,
-                    "close_qty": close_qty,
-                    "delta_effect": delta_effect,
-                    "gamma_effect": gamma_effect,
-                    "projected_delta": projected_delta,
-                    "etf_buy_qty": etf_buy_qty,
-                    "combined_delta": projected_delta + etf_buy_qty,
-                    "score": score,
-                }
-    return best
 
 
 def _etf_hedge_item(
@@ -1575,19 +1511,21 @@ def _light_itm_call_candidates(config, calls, spot):
     calls = calls.copy()
     calls["_strike"] = pd.to_numeric(calls["strike_price"], errors="coerce")
     calls["_volume"] = pd.to_numeric(calls.get("volume"), errors="coerce").fillna(-1.0)
-    calls = calls[calls["_strike"] < float(spot)]
-    strikes = sorted(calls["_strike"].dropna().unique(), reverse=True)
-    steps = max(
-        1,
-        int(getattr(config.strategy, "option_delta_hedge_call_itm_steps", 1) or 1),
+    max_itm_ratio = float(
+        getattr(config.strategy, "option_delta_hedge_max_itm_ratio", 0.10)
     )
-    if len(strikes) < steps:
-        return calls.iloc[0:0]
-    target_strike = strikes[steps - 1]
-    return calls[calls["_strike"] == target_strike].sort_values(
+    calls = calls[
+        (calls["_strike"] < float(spot))
+        & (calls["_strike"] >= float(spot) * (1.0 - max_itm_ratio))
+    ]
+    calls["_liquidity_capacity"] = calls.apply(
+        core.position.liquidity_capacity,
+        axis=1,
+    )
+    return calls[calls["_liquidity_capacity"] > 0].sort_values(
         "_volume",
         ascending=False,
-    ).head(1)
+    )
 
 
 def _select_itm_call_for_delta_hedge(config, chain_df, spot, atm, exclude_call_codes=None):

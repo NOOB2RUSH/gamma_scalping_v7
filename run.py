@@ -227,6 +227,7 @@ def calc_summary_breakdown(daily_pnl, trades):
             trades["type"].str.contains("straddle", na=False)
             | trades["type"].isin(
                 [
+                    "option_delta_hedge_combination",
                     "gamma_neutral_option_delta_hedge",
                     "close_option_delta_hedge",
                 ]

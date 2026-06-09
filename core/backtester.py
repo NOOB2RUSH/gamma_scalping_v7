@@ -1858,29 +1858,17 @@ class BacktestEngine:
             & ~candidates["order_book_id"].astype(str).eq(str(source_row["order_book_id"]))
         ]
         candidates = self._light_itm_call_candidates(candidates, day["spot"])
-        best = None
-        for _, open_row in candidates.iterrows():
-            solution = self._integer_gamma_neutral_call_solution(
-                source,
-                open_row,
-                -float(residual_delta),
-                max_etf_correction=max(1.0, abs(residual_delta) * 0.05),
-            )
-            if solution is None:
-                continue
-            score = (
-                abs(solution["gamma_effect"]) * float(day["spot"])
-                + solution["etf_buy_qty"]
-                + solution["close_qty"] * 1e-3
-            )
-            if best is None or score < best["score"]:
-                best = {
-                    **solution,
-                    "score": score,
-                    "source_row": source_row,
-                    "open_row": open_row,
-                }
-        return best
+        solution = opt_position.solve_liquid_call_delta_hedge(
+            source,
+            [row for _, row in candidates.iterrows()],
+            float(residual_delta),
+        )
+        if solution is None:
+            return None
+        return {
+            **solution,
+            "source_row": source_row,
+        }
 
     def _light_itm_call_candidates(self, candidates, spot):
         if candidates.empty:
@@ -1894,105 +1882,50 @@ class BacktestEngine:
             candidates.get("volume"),
             errors="coerce",
         ).fillna(-1.0)
-        candidates = candidates[candidates["_strike"] < float(spot)]
-        strikes = sorted(candidates["_strike"].dropna().unique(), reverse=True)
-        steps = max(
-            1,
-            int(getattr(CONFIG.strategy, "option_delta_hedge_call_itm_steps", 1) or 1),
+        max_itm_ratio = float(
+            getattr(CONFIG.strategy, "option_delta_hedge_max_itm_ratio", 0.10)
         )
-        if len(strikes) < steps:
-            return candidates.iloc[0:0]
-        target_strike = strikes[steps - 1]
-        return candidates[candidates["_strike"] == target_strike].sort_values(
+        candidates = candidates[
+            (candidates["_strike"] < float(spot))
+            & (candidates["_strike"] >= float(spot) * (1.0 - max_itm_ratio))
+        ]
+        candidates["_liquidity_capacity"] = candidates.apply(
+            opt_position.liquidity_capacity,
+            axis=1,
+        )
+        return candidates[candidates["_liquidity_capacity"] > 0].sort_values(
             "_volume",
             ascending=False,
-        ).head(1)
-
-    def _integer_gamma_neutral_call_solution(
-        self,
-        source,
-        open_row,
-        target_delta_effect,
-        max_etf_correction,
-    ):
-        close_delta = float(source["row"]["delta"])
-        close_gamma = float(source["row"]["gamma"])
-        open_delta = float(open_row["delta"])
-        open_gamma = float(open_row["gamma"])
-        multiplier = float(open_row["contract_multiplier"])
-        denominator = close_delta * open_gamma / close_gamma - open_delta
-        if close_gamma <= 0 or open_gamma <= 0 or abs(denominator) <= 1e-12:
-            return None
-        continuous_open_qty = (target_delta_effect / multiplier) / denominator
-        if continuous_open_qty <= 0:
-            return None
-        centers = {
-            max(1, int(math.floor(continuous_open_qty))),
-            max(1, int(math.ceil(continuous_open_qty))),
-        }
-        for center in list(centers):
-            centers.update(max(1, center + offset) for offset in range(-4, 5))
-        best = None
-        for open_qty in sorted(centers):
-            continuous_close_qty = open_qty * open_gamma / close_gamma
-            for close_qty in {
-                max(1, int(math.floor(continuous_close_qty))),
-                max(1, int(math.ceil(continuous_close_qty))),
-            }:
-                if close_qty >= int(source["max_qty"]):
-                    continue
-                delta_effect = multiplier * (
-                    close_qty * close_delta - open_qty * open_delta
-                )
-                gamma_effect = multiplier * (
-                    close_qty * close_gamma - open_qty * open_gamma
-                )
-                projected_delta = -target_delta_effect + delta_effect
-                if projected_delta > 0 or abs(projected_delta) > max_etf_correction:
-                    continue
-                gross_gamma = multiplier * max(
-                    close_qty * close_gamma,
-                    open_qty * open_gamma,
-                )
-                if abs(gamma_effect) > max(1.0, gross_gamma * 0.05):
-                    continue
-                etf_buy_qty = float(math.ceil(-projected_delta))
-                score = abs(gamma_effect) + etf_buy_qty
-                if best is None or score < best["score"]:
-                    best = {
-                        "open_qty": open_qty,
-                        "close_qty": close_qty,
-                        "delta_effect": delta_effect,
-                        "gamma_effect": gamma_effect,
-                        "projected_delta": projected_delta,
-                        "etf_buy_qty": etf_buy_qty,
-                        "combined_delta": projected_delta + etf_buy_qty,
-                        "score": score,
-                    }
-        return best
+        )
 
     def _open_gamma_neutral_option_hedge(self, date, state, day, solution):
         source_row = solution["source_row"]
-        open_row = solution["open_row"]
+        open_legs = solution["open_legs"]
+        primary_open_row = open_legs[0]["row"]
         close_qty = int(solution["close_qty"])
-        open_qty = int(solution["open_qty"])
         source_multiplier = float(source_row["contract_multiplier"])
-        open_multiplier = float(open_row["contract_multiplier"])
         source_price = float(source_row["mid"])
-        open_price = float(open_row["mid"])
         source_fee = opt_position.calc_option_fee(close_qty, 0)
-        open_fee = opt_position.calc_option_fee(open_qty, 0)
-        margin = opt_position.margin_call(
-            float(day["spot"]),
-            float(open_row["strike_price"]),
-            open_price,
-            open_multiplier,
-        ) * open_qty
+        open_fee = opt_position.calc_option_fee(solution["open_qty"], 0)
+        open_value = 0.0
+        margin = 0.0
+        for leg in open_legs:
+            row = leg["row"]
+            qty = int(leg["qty"])
+            multiplier = float(row["contract_multiplier"])
+            price = float(row["mid"])
+            open_value += price * qty * multiplier
+            margin += opt_position.margin_call(
+                float(day["spot"]),
+                float(row["strike_price"]),
+                price,
+                multiplier,
+            ) * qty
         projected_cash = (
             state.cash
             - source_price * close_qty * source_multiplier
             - source_fee
-            + open_price * open_qty * open_multiplier
+            + open_value
             - open_fee
             - margin
         )
@@ -2005,8 +1938,9 @@ class BacktestEngine:
             )
             return False
         state.cash = projected_cash
-        state.option_hedges = [
-            {
+        state.option_hedges = []
+        if close_qty > 0:
+            state.option_hedges.append({
                 "order_book_id": source_row["order_book_id"],
                 "side": "long",
                 "qty": close_qty,
@@ -2014,38 +1948,68 @@ class BacktestEngine:
                 "last_price": source_price,
                 "contract_multiplier": source_multiplier,
                 "option_margin": 0.0,
-            },
-            {
-                "order_book_id": open_row["order_book_id"],
+            })
+        for leg in open_legs:
+            row = leg["row"]
+            state.option_hedges.append({
+                "order_book_id": row["order_book_id"],
                 "side": "short",
-                "qty": open_qty,
-                "entry_price": open_price,
-                "last_price": open_price,
-                "contract_multiplier": open_multiplier,
-                "option_margin": margin,
-            },
-        ]
+                "qty": int(leg["qty"]),
+                "entry_price": float(row["mid"]),
+                "last_price": float(row["mid"]),
+                "contract_multiplier": float(row["contract_multiplier"]),
+                "option_margin": opt_position.margin_call(
+                    float(day["spot"]),
+                    float(row["strike_price"]),
+                    float(row["mid"]),
+                    float(row["contract_multiplier"]),
+                ) * int(leg["qty"]),
+            })
         fee = source_fee + open_fee
         day["daily_option_fee"] += fee
         state.trades.append(
             {
                 "date": date,
-                "type": "gamma_neutral_option_delta_hedge",
+                "type": "option_delta_hedge_combination",
                 "fee": fee,
                 "cash": state.cash,
                 "close_call_code": source_row["order_book_id"],
                 "close_call_qty": close_qty,
                 "close_call_price": source_price,
-                "open_call_code": open_row["order_book_id"],
-                "open_call_qty": open_qty,
-                "open_call_price": open_price,
-                "open_call_strike": float(open_row["strike_price"]),
-                "option_margin": margin,
-                **opt_position.build_single_leg_liquidity_fields(
-                    open_row,
-                    open_qty,
-                    leg_name="call",
+                "open_call_code": primary_open_row["order_book_id"],
+                "open_call_qty": solution["open_qty"],
+                "open_call_price": float(primary_open_row["mid"]),
+                "open_call_strike": float(primary_open_row["strike_price"]),
+                "open_legs": [
+                    {
+                        "order_book_id": leg["row"]["order_book_id"],
+                        "qty": int(leg["qty"]),
+                        "price": float(leg["row"]["mid"]),
+                        "strike": float(leg["row"]["strike_price"]),
+                        "volume": float(leg["row"]["volume"]),
+                        "liquidity_capacity": int(leg["liquidity_capacity"]),
+                    }
+                    for leg in open_legs
+                ],
+                "open_liquidity_capacity": sum(
+                    int(leg["liquidity_capacity"]) for leg in open_legs
                 ),
+                "close_liquidity_capacity": solution["close_liquidity_capacity"],
+                "close_call_volume": source_row.get("volume"),
+                "solver_priority": "liquidity_then_delta_then_gamma",
+                "residual_delta_before_option_hedge": solution[
+                    "residual_delta_before"
+                ],
+                "delta_neutral_achieved": solution["delta_neutral_achieved"],
+                "liquidity_capacity_exhausted": solution[
+                    "liquidity_capacity_exhausted"
+                ],
+                "option_margin": margin,
+                "liquidity_warning_ratio": CONFIG.backtest.liquidity_warning_volume_ratio,
+                "liquidity_check_available": True,
+                "liquidity_warning": False,
+                "liquidity_warning_legs": "",
+                "liquidity_volume_missing_legs": "",
                 "delta_effect": solution["delta_effect"],
                 "gamma_effect": solution["gamma_effect"],
                 "projected_option_delta": solution["projected_delta"],
@@ -2115,7 +2079,7 @@ class BacktestEngine:
 
         if not (
             self.config.get("enable_option_delta_hedge", False)
-            and self.config.get("option_delta_hedge_gamma_neutral", False)
+            and self.config.get("option_delta_hedge_combination_enabled", False)
             and day is not None
         ):
             state.trades.append(
@@ -2149,8 +2113,8 @@ class BacktestEngine:
             state.trades.append(
                 {
                     "date": date,
-                    "type": "skip_gamma_neutral_option_delta_hedge",
-                    "reason": "no_light_itm_gamma_neutral_solution",
+                    "type": "skip_option_delta_hedge_combination",
+                    "reason": "no_liquid_light_itm_option_delta_hedge_solution",
                     "residual_delta": residual_delta,
                     "tolerance": tolerance,
                 }
@@ -2453,8 +2417,8 @@ def _backtest_config(
         "delta_hedge_tolerance_ratio": CONFIG.strategy.delta_hedge_tolerance_ratio,
         "allow_etf_short_hedge": CONFIG.strategy.allow_etf_short_hedge,
         "enable_option_delta_hedge": CONFIG.strategy.enable_option_delta_hedge,
-        "option_delta_hedge_gamma_neutral": (
-            CONFIG.strategy.option_delta_hedge_gamma_neutral
+        "option_delta_hedge_combination_enabled": (
+            CONFIG.strategy.option_delta_hedge_combination_enabled
         ),
         "dynamic_position_control_enabled": (
             CONFIG.backtest.dynamic_position_control_enabled

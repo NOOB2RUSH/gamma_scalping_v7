@@ -130,23 +130,35 @@ def _advice_execution_rows(item):
             item.get("estimated_call_price"),
         )]
     if action in {
+        "OPTION_DELTA_HEDGE_COMBINATION",
+        "FINAL_OPTION_DELTA_HEDGE_COMBINATION",
         "GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
         "FINAL_GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
     }:
-        rows = [
-            _execution_row(
+        rows = []
+        if float(item.get("close_call_qty", 0.0) or 0.0) > 0:
+            rows.append(_execution_row(
                 item.get("close_call_code"),
                 "买入平仓",
                 item.get("close_call_qty"),
                 item.get("estimated_close_call_price"),
-            ),
-            _execution_row(
-                item.get("open_call_code"),
-                "卖出开仓",
-                item.get("open_call_qty"),
-                item.get("estimated_open_call_price"),
-            ),
+            ))
+        open_legs = item.get("open_legs") or [
+            {
+                "order_book_id": item.get("open_call_code"),
+                "qty": item.get("open_call_qty"),
+                "estimated_price": item.get("estimated_open_call_price"),
+            }
         ]
+        rows.extend(
+            _execution_row(
+                leg.get("order_book_id"),
+                "卖出开仓",
+                leg.get("qty"),
+                leg.get("estimated_price"),
+            )
+            for leg in open_legs
+        )
         if float(item.get("trade_etf_qty", 0.0) or 0.0) > 0:
             rows.append(
                 _execution_row(
