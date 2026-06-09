@@ -95,6 +95,11 @@ DEFAULT_SUMMARY_REPORT_COLUMNS = [
     "账户Gamma",
     "账户Vega",
     "账户Theta",
+    "单日DeltaPnL",
+    "单日GammaPnL",
+    "单日VegaPnL",
+    "单日ThetaPnL",
+    "单日GreeksPnL",
 ]
 
 DIAGNOSE_SUMMARY_REPORT_COLUMNS = [
@@ -117,6 +122,7 @@ DIAGNOSE_SUMMARY_REPORT_COLUMNS = [
     "单日GammaPnL",
     "单日VegaPnL",
     "单日ThetaPnL",
+    "单日GreeksPnL",
 ]
 
 DEFAULT_POSITION_REPORT_COLUMNS = [
@@ -131,7 +137,6 @@ DEFAULT_POSITION_REPORT_COLUMNS = [
     "持仓盈亏",
     "到期日",
     "IV",
-    "单张Delta",
 ]
 
 DIAGNOSE_POSITION_REPORT_COLUMNS = [
@@ -149,7 +154,6 @@ DIAGNOSE_POSITION_REPORT_COLUMNS = [
     "当日盈亏分解合计",
     "到期日",
     "IV",
-    "单张Delta",
     "单张Gamma",
     "单张Vega",
     "单张Theta",
@@ -171,11 +175,6 @@ INTERNAL_RECONCILIATION_COLUMNS = {
     "期权单日GreeksPnL",
     "对冲单日DeltaPnL",
     "对冲单日GreeksPnL",
-    "单日DeltaPnL",
-    "单日GammaPnL",
-    "单日VegaPnL",
-    "单日ThetaPnL",
-    "单日GreeksPnL",
     "GreeksPnL口径",
     "GreeksPnL说明",
     "GreeksPnL路径节点数",
@@ -602,6 +601,13 @@ def format_terminal_summary(payload, mode="default"):
             f"Theta={_fmt(summary['账户Theta'])} "
             f"持仓IV={_fmt(summary['持仓IV'])}"
         ),
+        (
+            f"单日GreeksPnL={_fmt(summary.get('单日GreeksPnL'))} "
+            f"Delta={_fmt(summary.get('单日DeltaPnL'))} "
+            f"Gamma={_fmt(summary.get('单日GammaPnL'))} "
+            f"Vega={_fmt(summary.get('单日VegaPnL'))} "
+            f"Theta={_fmt(summary.get('单日ThetaPnL'))}"
+        ),
     ]
     if mode == "diagnose":
         lines.extend(
@@ -616,20 +622,13 @@ def format_terminal_summary(payload, mode="default"):
                     f"券商差分总单日盈亏={_fmt(summary.get('券商总单日盈亏变化'))} "
                     f"对账差额={_fmt(_broker_reconciliation_difference(summary, pnl_decomposition))}"
                 ),
-                (
-                    f"单日GreeksPnL={_fmt(summary.get('单日GreeksPnL'))} "
-                    f"Delta={_fmt(summary.get('单日DeltaPnL'))} "
-                    f"Gamma={_fmt(summary.get('单日GammaPnL'))} "
-                    f"Vega={_fmt(summary.get('单日VegaPnL'))} "
-                    f"Theta={_fmt(summary.get('单日ThetaPnL'))}"
-                ),
             ]
         )
     lines.extend(["", "持仓记录"])
     lines.extend(
         _plain_table(
             position_report.to_dict("records"),
-            ["交易方向", "合约代码", "合约名称", "总持仓张数", "今日变化", "最新价", "持仓均价", "IV", "单张Delta"],
+            ["交易方向", "合约代码", "合约名称", "总持仓张数", "今日变化", "最新价", "持仓均价", "IV"],
         )
     )
     lines.extend(["", "当日交易记录"])
