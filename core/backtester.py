@@ -1848,11 +1848,16 @@ class BacktestEngine:
             & (pd.to_numeric(candidates["mid"], errors="coerce") > 0)
             & (pd.to_numeric(candidates["delta"], errors="coerce") > 0)
             & (pd.to_numeric(candidates["gamma"], errors="coerce") > 0)
+            & (
+                pd.to_numeric(candidates["contract_multiplier"], errors="coerce")
+                == float(source_row["contract_multiplier"])
+            )
             & pd.to_datetime(candidates["maturity_date"]).dt.normalize().eq(
                 pd.Timestamp(source_row["maturity_date"]).normalize()
             )
             & ~candidates["order_book_id"].astype(str).eq(str(source_row["order_book_id"]))
         ]
+        candidates = self._light_itm_call_candidates(candidates, day["spot"])
         best = None
         for _, open_row in candidates.iterrows():
             solution = self._integer_gamma_neutral_call_solution(
@@ -1876,6 +1881,32 @@ class BacktestEngine:
                     "open_row": open_row,
                 }
         return best
+
+    def _light_itm_call_candidates(self, candidates, spot):
+        if candidates.empty:
+            return candidates
+        candidates = candidates.copy()
+        candidates["_strike"] = pd.to_numeric(
+            candidates["strike_price"],
+            errors="coerce",
+        )
+        candidates["_volume"] = pd.to_numeric(
+            candidates.get("volume"),
+            errors="coerce",
+        ).fillna(-1.0)
+        candidates = candidates[candidates["_strike"] < float(spot)]
+        strikes = sorted(candidates["_strike"].dropna().unique(), reverse=True)
+        steps = max(
+            1,
+            int(getattr(CONFIG.strategy, "option_delta_hedge_call_itm_steps", 1) or 1),
+        )
+        if len(strikes) < steps:
+            return candidates.iloc[0:0]
+        target_strike = strikes[steps - 1]
+        return candidates[candidates["_strike"] == target_strike].sort_values(
+            "_volume",
+            ascending=False,
+        ).head(1)
 
     def _integer_gamma_neutral_call_solution(
         self,
@@ -2008,6 +2039,7 @@ class BacktestEngine:
                 "open_call_code": open_row["order_book_id"],
                 "open_call_qty": open_qty,
                 "open_call_price": open_price,
+                "open_call_strike": float(open_row["strike_price"]),
                 "option_margin": margin,
                 **opt_position.build_single_leg_liquidity_fields(
                     open_row,
@@ -2118,6 +2150,7 @@ class BacktestEngine:
                 {
                     "date": date,
                     "type": "skip_gamma_neutral_option_delta_hedge",
+                    "reason": "no_light_itm_gamma_neutral_solution",
                     "residual_delta": residual_delta,
                     "tolerance": tolerance,
                 }

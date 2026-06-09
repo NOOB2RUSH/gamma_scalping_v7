@@ -1206,7 +1206,7 @@ def _delta_hedge_plan(
             )
         return plan
 
-    call_row = _select_otm_call_for_delta_hedge(
+    call_row = _select_itm_call_for_delta_hedge(
         config,
         chain_df,
         spot,
@@ -1218,7 +1218,7 @@ def _delta_hedge_plan(
             {
                 "action": "DATA_WARNING",
                 "priority": "warning",
-                "reason": "No valid OTM call found for option delta hedge.",
+                "reason": "No valid lightly ITM call found for option delta hedge.",
                 "residual_delta": residual_delta,
                 "after_actions": after_actions,
             }
@@ -1280,8 +1280,13 @@ def _gamma_neutral_option_delta_hedge_item(
                 pd.Timestamp(source_row.get("maturity_date")).normalize()
             )
         ]
+        same_expiry = _light_itm_call_candidates(config, same_expiry, spot)
         for _, open_row in same_expiry.iterrows():
             if str(open_row.get("order_book_id")) == source_code:
+                continue
+            if float(open_row.get("contract_multiplier")) != float(
+                source_row.get("contract_multiplier")
+            ):
                 continue
             solution = _integer_gamma_neutral_call_solution(
                 source,
@@ -1564,16 +1569,33 @@ def _short_call_delta_hedge_item(
     return item
 
 
-def _select_otm_call_for_delta_hedge(config, chain_df, spot, atm, exclude_call_codes=None):
+def _light_itm_call_candidates(config, calls, spot):
+    if calls.empty:
+        return calls
+    calls = calls.copy()
+    calls["_strike"] = pd.to_numeric(calls["strike_price"], errors="coerce")
+    calls["_volume"] = pd.to_numeric(calls.get("volume"), errors="coerce").fillna(-1.0)
+    calls = calls[calls["_strike"] < float(spot)]
+    strikes = sorted(calls["_strike"].dropna().unique(), reverse=True)
+    steps = max(
+        1,
+        int(getattr(config.strategy, "option_delta_hedge_call_itm_steps", 1) or 1),
+    )
+    if len(strikes) < steps:
+        return calls.iloc[0:0]
+    target_strike = strikes[steps - 1]
+    return calls[calls["_strike"] == target_strike].sort_values(
+        "_volume",
+        ascending=False,
+    ).head(1)
+
+
+def _select_itm_call_for_delta_hedge(config, chain_df, spot, atm, exclude_call_codes=None):
     if chain_df is None or chain_df.empty:
         return None
     calls = chain_df.copy()
     calls = calls[calls["option_type"].astype(str).str.lower().eq("c")]
     calls = calls[calls["contract_multiplier"] == config.vol.contract_multiplier]
-    min_strike = float(spot)
-    if atm is not None and atm.get("strike") is not None and not pd.isna(atm.get("strike")):
-        min_strike = max(min_strike, float(atm.get("strike")))
-    calls = calls[pd.to_numeric(calls["strike_price"], errors="coerce") > min_strike]
     if exclude_call_codes:
         calls = calls[~calls["order_book_id"].astype(str).isin({str(code) for code in exclude_call_codes})]
     calls = calls[pd.to_numeric(calls["delta"], errors="coerce") > 0]
@@ -1587,10 +1609,10 @@ def _select_otm_call_for_delta_hedge(config, chain_df, spot, atm, exclude_call_c
         if not same_expiry.empty:
             calls = same_expiry
 
-    calls = calls.sort_values(["strike_price", "maturity_date"])
-    steps = max(1, int(getattr(config.strategy, "option_delta_hedge_call_otm_steps", 1) or 1))
-    index = min(steps - 1, len(calls) - 1)
-    return calls.iloc[index]
+    calls = _light_itm_call_candidates(config, calls, spot)
+    if calls.empty:
+        return None
+    return calls.iloc[0]
 
 
 def _existing_call_codes(live_account):
