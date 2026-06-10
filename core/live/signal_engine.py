@@ -114,6 +114,15 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
             }
         )
 
+    account_delta = account_greeks["delta"] + live_account.hedge.qty
+    normalized_account_delta, delta_hedge_capacity = (
+        core.strategy.normalized_account_delta(
+            account_delta,
+            live_account.positions,
+            option_hedges=live_account.option_hedges,
+            default_multiplier=config.vol.contract_multiplier,
+        )
+    )
     return {
         "product": product,
         "account_id": account_id,
@@ -123,7 +132,10 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
         "feature": _feature_summary(feature_row),
         "account_greeks": account_greeks,
         "planned_account_greeks": planned_greeks,
-        "account_delta_after_hedge": account_greeks["delta"] + live_account.hedge.qty,
+        "account_delta_after_hedge": account_delta,
+        "normalized_account_delta": normalized_account_delta,
+        "delta_hedge_capacity": delta_hedge_capacity,
+        "delta_hedge_tolerance_ratio": config.strategy.delta_hedge_tolerance_ratio,
         "estimated_option_value": sum(position_values),
         "strategy_state": signal_state.to_dict(),
         "advice": advice,
@@ -1328,11 +1340,19 @@ def _final_hedge_advice(
 
     planned_option_delta = float(planned_greeks["delta"])
     planned_account_delta = planned_option_delta + live_account.hedge.qty
-    tolerance = max(
-        1.0,
-        abs(planned_option_delta) * config.strategy.delta_hedge_tolerance_ratio,
+    planned_positions = dict(live_account.positions)
+    for item in option_actions:
+        if str(item.get("action") or "").startswith("CLOSE_"):
+            planned_positions[item.get("side")] = None
+    normalized_delta, delta_capacity = core.strategy.normalized_account_delta(
+        planned_account_delta,
+        planned_positions,
+        option_hedges=live_account.option_hedges,
+        default_multiplier=config.vol.contract_multiplier,
     )
-    if abs(planned_account_delta) <= tolerance:
+    tolerance_ratio = float(config.strategy.delta_hedge_tolerance_ratio)
+    tolerance = delta_capacity * tolerance_ratio
+    if delta_capacity > 0 and abs(normalized_delta) <= tolerance_ratio:
         return []
 
     plan = _delta_hedge_plan(
@@ -1355,12 +1375,16 @@ def _final_hedge_advice(
             atm,
         ),
         exclude_call_codes=_planned_call_codes(option_actions),
+        positions_for_tolerance=planned_positions,
     )
     for item in plan:
         item.setdefault("planned_account_gamma", planned_greeks["gamma"])
         item.setdefault("planned_account_vega", planned_greeks["vega"])
         item.setdefault("planned_account_theta", planned_greeks["theta"])
         item.setdefault("hedge_tolerance", tolerance)
+        item.setdefault("normalized_account_delta", normalized_delta)
+        item.setdefault("delta_hedge_tolerance_ratio", tolerance_ratio)
+        item.setdefault("delta_hedge_capacity", delta_capacity)
     return plan
 
 
@@ -1377,6 +1401,7 @@ def _delta_hedge_plan(
     after_actions=None,
     underlying_order_book_id=None,
     exclude_call_codes=None,
+    positions_for_tolerance=None,
 ):
     if not config.strategy.enable_delta_hedge:
         return []
@@ -1384,11 +1409,19 @@ def _delta_hedge_plan(
     option_delta = float(greeks["delta"])
     current_hedge_qty = float(live_account.hedge.qty or 0.0)
     account_delta = option_delta + current_hedge_qty
-    tolerance = max(
-        1.0,
-        abs(option_delta) * config.strategy.delta_hedge_tolerance_ratio,
+    normalized_delta, delta_capacity = core.strategy.normalized_account_delta(
+        account_delta,
+        (
+            positions_for_tolerance
+            if positions_for_tolerance is not None
+            else live_account.positions
+        ),
+        option_hedges=live_account.option_hedges,
+        default_multiplier=config.vol.contract_multiplier,
     )
-    if abs(account_delta) <= tolerance:
+    tolerance_ratio = float(config.strategy.delta_hedge_tolerance_ratio)
+    tolerance = delta_capacity * tolerance_ratio
+    if delta_capacity > 0 and abs(normalized_delta) <= tolerance_ratio:
         return []
 
     if getattr(live_account, "option_hedges", None):
@@ -1418,6 +1451,7 @@ def _delta_hedge_plan(
                 after_actions=next_after_actions,
                 underlying_order_book_id=underlying_order_book_id,
                 exclude_call_codes=exclude_call_codes,
+                positions_for_tolerance=positions_for_tolerance,
             ),
         ]
 
@@ -1454,8 +1488,7 @@ def _delta_hedge_plan(
                     "min_cash_reserve": min_cash,
                 }
             ]
-        return [
-            _etf_hedge_item(
+        item = _etf_hedge_item(
                 action,
                 reason,
                 option_delta,
@@ -1467,7 +1500,15 @@ def _delta_hedge_plan(
                 underlying_order_book_id,
                 after_actions=after_actions,
             )
-        ]
+        item.update(
+            {
+                "normalized_account_delta": normalized_delta,
+                "delta_hedge_tolerance_ratio": tolerance_ratio,
+                "delta_hedge_capacity": delta_capacity,
+                "hedge_tolerance": tolerance,
+            }
+        )
+        return [item]
 
     plan = []
     etf_target_qty = 0.0

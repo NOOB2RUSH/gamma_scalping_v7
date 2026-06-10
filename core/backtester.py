@@ -2069,11 +2069,21 @@ class BacktestEngine:
             return
         option_delta = float(greeks["delta"])
         account_delta = option_delta + float(state.hedge_etf_qty)
-        tolerance = max(
-            1.0,
-            abs(option_delta) * self.config.get("delta_hedge_tolerance_ratio", 0.05),
+        normalized_delta, delta_capacity = strategy.normalized_account_delta(
+            account_delta,
+            state.positions,
+            option_hedges=state.option_hedges,
+            default_multiplier=CONFIG.vol.contract_multiplier,
         )
-        if target_qty is None and abs(account_delta) <= tolerance:
+        tolerance_ratio = float(
+            self.config.get("delta_hedge_tolerance_ratio", 0.05)
+        )
+        tolerance = delta_capacity * tolerance_ratio
+        if (
+            target_qty is None
+            and delta_capacity > 0
+            and abs(normalized_delta) <= tolerance_ratio
+        ):
             return
 
         if target_qty is None and state.option_hedges and day is not None:
@@ -2082,12 +2092,14 @@ class BacktestEngine:
             greeks = day["greeks"]
             option_delta = float(greeks["delta"])
             account_delta = option_delta + float(state.hedge_etf_qty)
-            tolerance = max(
-                1.0,
-                abs(option_delta)
-                * self.config.get("delta_hedge_tolerance_ratio", 0.05),
+            normalized_delta, delta_capacity = strategy.normalized_account_delta(
+                account_delta,
+                state.positions,
+                option_hedges=state.option_hedges,
+                default_multiplier=CONFIG.vol.contract_multiplier,
             )
-            if abs(account_delta) <= tolerance:
+            tolerance = delta_capacity * tolerance_ratio
+            if delta_capacity > 0 and abs(normalized_delta) <= tolerance_ratio:
                 return
 
         projected_target_qty = -option_delta if target_qty is None else float(target_qty)
