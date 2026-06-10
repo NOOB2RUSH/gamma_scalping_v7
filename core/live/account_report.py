@@ -360,26 +360,6 @@ def calculate_live_account_report(
             account_id,
         )
     )
-    holding_rows = _holding_rows_from_export(
-        product,
-        account_id,
-        report_date_text,
-        market["chain_df"],
-        not_before=reset_at,
-    )
-    if holding_rows:
-        position_rows = holding_rows
-        option_value = _sum_row_values(holding_rows, "期权市值")
-        option_margin = _sum_row_values(holding_rows, "占用保证金")
-        option_pnl = _sum_row_values(holding_rows, "浮动盈亏")
-        export_greeks = _greeks_from_holding_export(
-            product,
-            report_date_text,
-            market["chain_df"],
-            not_before=reset_at,
-        )
-        if export_greeks is not None:
-            account_greeks = export_greeks
     hedge_rows = _hedge_rows_from_account(
         product,
         report_hedge,
@@ -1477,132 +1457,6 @@ def _apply_account_position_mark(position, call_row, put_row, report_date):
     return call_result, put_result
 
 
-def _holding_rows_from_export(product, account_id, report_date, chain_df, not_before=None):
-    path = _latest_export_file("实时持仓", report_date, not_before=not_before)
-    if path is None:
-        return []
-    df = _read_export_csv(path)
-    if df.empty:
-        return []
-    chain_meta = _chain_metadata(chain_df)
-    rows = []
-    for _, item in df.iterrows():
-        code = str(item.get("合约代码", "")).strip()
-        meta = chain_meta.get(code, {})
-        side = _side_from_holding(item)
-        qty = _number(item.get("总持仓"))
-        holding_cost = _number(item.get("持仓均价"))
-        latest_price = _number(meta.get("mid"))
-        if latest_price is None:
-            latest_price = _number(item.get("最新价"))
-        multiplier = _number(meta.get("contract_multiplier"))
-        if multiplier is None:
-            multiplier = _contract_multiplier(product)
-        direction = -1.0 if side == "short" else 1.0
-        market_value = _number(item.get("期权市值"))
-        floating_pnl = _number(item.get("浮动盈亏"))
-        if latest_price is not None and qty is not None and multiplier is not None:
-            market_value = direction * latest_price * qty * multiplier
-            if holding_cost is not None:
-                floating_pnl = (
-                    direction
-                    * (latest_price - holding_cost)
-                    * qty
-                    * multiplier
-                )
-        single_delta = _single_option_delta_from_chain(meta, side)
-        rows.append(
-            {
-                "日期": report_date,
-                "账户ID": account_id,
-                "方向": side,
-                "合约代码": code,
-                "合约名称": item.get("合约名称"),
-                "买卖": _clean_text(item.get("买卖")),
-                "持仓类型": item.get("持仓类型"),
-                "总持仓": qty,
-                "今持仓": _number(item.get("今持仓")),
-                "今开仓": _number(item.get("今开仓")),
-                "今平仓": _number(item.get("今平仓")),
-                "可平量": _number(item.get("可平量")),
-                "最新价": latest_price,
-                "持仓均价": holding_cost,
-                "开仓均价": _number(item.get("开仓均价")),
-                "期权市值": market_value,
-                "占用保证金": _number(item.get("占用保证金")),
-                "持仓盈亏": floating_pnl,
-                "浮动盈亏": floating_pnl,
-                "行权价": meta.get("strike_price"),
-                "到期日": meta.get("maturity_date"),
-                "剩余天数": meta.get("dte"),
-                "IV": meta.get("iv"),
-                "单张Delta": single_delta,
-                "Delta": _position_total_delta(
-                    single_delta,
-                    qty,
-                    meta.get("contract_multiplier"),
-                ),
-                "Gamma": meta.get("gamma"),
-                "Vega": meta.get("vega"),
-                "Theta": meta.get("theta"),
-            }
-        )
-    return rows
-
-
-def _greeks_from_holding_export(product, report_date, chain_df, not_before=None):
-    path = _latest_export_file("实时持仓", report_date, not_before=not_before)
-    if path is None:
-        return None
-    df = _read_export_csv(path)
-    if df.empty:
-        return None
-
-    chain_by_code = {
-        str(row.get("order_book_id")): row
-        for _, row in chain_df.iterrows()
-    }
-    grouped = {}
-    for _, item in df.iterrows():
-        code = str(item.get("合约代码", "")).strip()
-        chain_row = chain_by_code.get(code)
-        if chain_row is None:
-            continue
-        qty = int(_number(item.get("总持仓")) or 0)
-        if qty <= 0:
-            continue
-        option_type = str(chain_row.get("option_type", "")).upper()
-        leg = "call" if option_type == "C" else "put" if option_type == "P" else None
-        if leg is None:
-            continue
-        key = (
-            _side_from_holding(item),
-            float(chain_row.get("strike_price")),
-            str(pd.Timestamp(chain_row.get("maturity_date")).date()),
-        )
-        grouped.setdefault(key, {})[leg] = {
-            "row": chain_row,
-            "qty": qty,
-        }
-
-    greeks_list = []
-    for (side, _, _), legs in grouped.items():
-        if "call" not in legs or "put" not in legs:
-            continue
-        greeks_list.append(
-            core.strategy.calc_position_greeks(
-                legs["call"]["row"],
-                legs["put"]["row"],
-                legs["call"]["qty"],
-                legs["put"]["qty"],
-                side=side,
-            )
-        )
-    if not greeks_list:
-        return None
-    return core.backtester.combine_greeks(greeks_list)
-
-
 def _hedge_for_report_date(live_account, product, account_id, report_date):
     report_ts = pd.Timestamp(report_date).normalize()
     fills = account_store.list_fills(
@@ -1620,7 +1474,6 @@ def _hedge_for_report_date(live_account, product, account_id, report_date):
             "delta_hedge",
             "rebalance_hedge",
             "close_hedge",
-            "hedge_mark_update",
         }:
             continue
         has_hedge_fill = True
@@ -1628,28 +1481,12 @@ def _hedge_for_report_date(live_account, product, account_id, report_date):
         if fill_date is None or fill_date > report_ts:
             continue
         saw_hedge_fill = True
-        if action == "hedge_mark_update":
-            if hedge is None:
-                continue
-            hedge.latest_price = _number(payload.get("latest_price"))
-            hedge.last_market_value = _number(payload.get("market_value"))
-            hedge.last_unrealized_pnl = _number(payload.get("unrealized_pnl"))
-            hedge.last_mark_date = payload.get("date")
-            hedge.last_mark_source_file = payload.get("holding_source_file")
-            hedge.last_mark_source_timestamp = payload.get("source_timestamp")
-        else:
-            hedge = account_store.HedgeState(
-                qty=float(payload.get("qty", payload.get("new_etf_qty", payload.get("target_hedge_qty", 0.0))) or 0.0),
-                entry_price=float(payload.get("entry_price", payload.get("price", 0.0)) or 0.0),
-                margin=float(payload.get("margin", 0.0) or 0.0),
-                underlying_order_book_id=payload.get("underlying_order_book_id"),
-                latest_price=_number(payload.get("latest_price")),
-                last_market_value=_number(payload.get("market_value")),
-                last_unrealized_pnl=_number(payload.get("unrealized_pnl")),
-                last_mark_date=payload.get("date"),
-                last_mark_source_file=payload.get("holding_source_file"),
-                last_mark_source_timestamp=payload.get("source_timestamp"),
-            )
+        hedge = account_store.HedgeState(
+            qty=float(payload.get("qty", payload.get("new_etf_qty", payload.get("target_hedge_qty", 0.0))) or 0.0),
+            entry_price=float(payload.get("entry_price", payload.get("price", 0.0)) or 0.0),
+            margin=float(payload.get("margin", 0.0) or 0.0),
+            underlying_order_book_id=payload.get("underlying_order_book_id"),
+        )
     if saw_hedge_fill:
         return hedge or account_store.HedgeState()
     if has_hedge_fill:
@@ -1669,27 +1506,15 @@ def _hedge_rows_from_account(
     if abs(float(hedge.qty or 0.0)) <= 1e-9:
         return []
 
-    export_row = _security_holding_export_row(product, report_date, not_before=not_before)
-    mark_with_spot = (
-        export_row is None
-        and prefer_spot_mark
-        and _can_mark_hedge_with_spot(product, hedge)
-    )
-    if export_row is not None:
-        latest_price = _number(export_row.get("最新价"))
-    elif mark_with_spot:
+    mark_with_spot = _can_mark_hedge_with_spot(product, hedge)
+    if mark_with_spot:
         latest_price = float(spot)
     else:
         latest_price = hedge.latest_price
     if latest_price is None:
         latest_price = float(spot)
     qty = float(hedge.qty)
-    if export_row is not None:
-        market_value = _number(export_row.get("市值"))
-    elif mark_with_spot:
-        market_value = None
-    else:
-        market_value = hedge.last_market_value
+    market_value = None if mark_with_spot else hedge.last_market_value
     if market_value is None:
         market_value = qty * latest_price
     entry_price = _hedge_open_cost_for_report(
@@ -1702,22 +1527,10 @@ def _hedge_rows_from_account(
     floating_pnl = None
     if (_number(entry_price) or 0.0) > 0:
         floating_pnl = core.hedge.calc_unrealized_pnl(qty, entry_price, latest_price)
-    elif export_row is not None:
-        floating_pnl = _number(export_row.get("浮动盈亏"))
-    elif not mark_with_spot:
-        floating_pnl = hedge.last_unrealized_pnl
     if floating_pnl is None:
         floating_pnl = 0.0
-    security_code = (
-        _security_code(export_row.get("证券代码"))
-        if export_row is not None
-        else _security_code_from_underlying(hedge.underlying_order_book_id)
-    )
-    security_name = (
-        export_row.get("证券名称")
-        if export_row is not None
-        else hedge.underlying_order_book_id
-    )
+    security_code = _security_code_from_underlying(hedge.underlying_order_book_id)
+    security_name = hedge.underlying_order_book_id
     return [
         {
             "日期": report_date,
@@ -1728,10 +1541,10 @@ def _hedge_rows_from_account(
             "买卖": "买" if qty > 0 else "卖",
             "持仓类型": "ETF对冲",
             "总持仓": qty,
-            "今持仓": _number(export_row.get("持有数量")) if export_row is not None else None,
+            "今持仓": None,
             "今开仓": None,
             "今平仓": None,
-            "可平量": _number(export_row.get("可用数量")) if export_row is not None else None,
+            "可平量": None,
             "最新价": latest_price,
             "持仓均价": entry_price,
             "开仓均价": entry_price,
@@ -1766,31 +1579,7 @@ def _can_mark_hedge_with_spot(product, hedge):
     }
 
 
-def _security_holding_export_row(product, report_date, not_before=None):
-    path = _latest_export_file("证券持仓查询", report_date, not_before=not_before)
-    if path is None:
-        return None
-    df = _read_export_csv(path)
-    target_code = _product_security_code(product)
-    rows = []
-    for _, row in df.iterrows():
-        code = _security_code(row.get("证券代码"))
-        if target_code is not None and code != target_code:
-            continue
-        qty = _number(row.get("持有数量")) or 0.0
-        if qty > 0:
-            rows.append(row)
-    if not rows:
-        return None
-    return rows[0]
-
-
 def _hedge_unrealized_pnl_for_report(product, qty, entry_price, spot, report_date):
-    export_row = _security_holding_export_row(product, report_date)
-    if export_row is not None:
-        broker_pnl = _number(export_row.get("浮动盈亏"))
-        if broker_pnl is not None:
-            return broker_pnl
     return core.hedge.calc_unrealized_pnl(qty, entry_price, spot)
 
 
@@ -2777,18 +2566,31 @@ def _fill_summary_hedge_marks_and_pnl(summary_history, position_history, product
     for index, row in result.iterrows():
         account_id = str(row.get("账户ID"))
         report_date = str(row.get("日期"))
+        hedge_qty = _number(row.get("对冲持仓")) or 0.0
+        hedge_cost = _hedge_open_cost_for_report(product, account_id, report_date)
+        if hedge_cost is None:
+            hedge_cost = _number(row.get("对冲成本")) or 0.0
+        hedge_mark = _number(row.get("对冲估值价"))
+        if hedge_mark is None:
+            hedge_mark = _number(row.get("对冲最新价"))
+        hedge_unrealized = (
+            core.hedge.calc_unrealized_pnl(hedge_qty, hedge_cost, hedge_mark)
+            if hedge_mark is not None and hedge_cost > 0
+            else 0.0
+        )
         hedge_realized = _cumulative_hedge_realized_pnl_for_report(
             product,
             account_id,
             report_date,
         )
-        hedge_unrealized = _number(row.get("对冲浮盈亏")) or 0.0
         option_realized = _cumulative_option_realized_pnl_for_report(
             product,
             account_id,
             report_date,
         )
         option_unrealized = _number(row.get("期权浮盈亏")) or 0.0
+        result.at[index, "对冲成本"] = hedge_cost
+        result.at[index, "对冲浮盈亏"] = hedge_unrealized
         result.at[index, "对冲已实现盈亏"] = hedge_realized
         result.at[index, "对冲总盈亏"] = hedge_realized + hedge_unrealized
         result.at[index, "期权已实现盈亏"] = option_realized
@@ -3433,14 +3235,6 @@ def _date_or_none(value):
         return pd.Timestamp(value).normalize()
     except Exception:
         return None
-
-
-def _side_from_holding(item):
-    buy_sell = _clean_text(item.get("买卖"))
-    position_type = str(item.get("持仓类型", ""))
-    if "卖" in buy_sell or "义务" in position_type:
-        return "short"
-    return "long"
 
 
 def _product_security_code(product):

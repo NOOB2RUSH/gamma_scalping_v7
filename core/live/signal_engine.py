@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -144,7 +145,7 @@ def preview_signal(product, account_id="default", date=None, quote_snapshot=None
 
 def _load_market_context(config, date, quote_snapshot=None):
     start = config.backtest.start
-    end = config.backtest.end if date is None else date
+    end = pd.Timestamp.now().normalize() if date is None else date
     etf_by_date = core.data_loader.load_etf_series(start, end)
     trading_calendar = core.data_loader.load_etf_trading_calendar()
     data_mode = "daily_eod_reference_incremental"
@@ -309,7 +310,17 @@ def _merge_latest_features(product, history, latest_features, latest_date):
     history = history[history.index != latest_date]
     combined = pd.concat([history, latest_row], axis=0).sort_index()
     combined = _refresh_signal_columns(combined)
+    _persist_feature_history(product, combined)
     return combined
+
+
+def _persist_feature_history(product, features):
+    path = storage.feature_history_path(product)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = features.reset_index(names="date")
+    temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    payload.to_parquet(temp_path, index=False)
+    temp_path.replace(path)
 
 
 def _refresh_signal_columns(features):
@@ -809,6 +820,13 @@ def _roll_payload(
         )
 
     dte_too_low = position_dte <= config.strategy.roll_dte_threshold
+    current_strike_differs = _strike_differs(
+        position.get("strike"),
+        feature_atm_strike,
+    )
+    if not dte_too_low and not current_strike_differs:
+        return None
+
     mismatch = _historical_strike_mismatch(
         product,
         side,
@@ -819,7 +837,7 @@ def _roll_payload(
     )
     mismatch_days = mismatch["days"]
     strike_roll_ready = (
-        _strike_differs(position.get("strike"), feature_atm_strike)
+        current_strike_differs
         and mismatch_days >= config.strategy.roll_strike_mismatch_days
     )
     if not (dte_too_low or strike_roll_ready):

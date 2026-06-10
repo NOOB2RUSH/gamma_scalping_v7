@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 from pathlib import Path
 
@@ -77,7 +78,7 @@ def promote_quote_snapshots(
     rows = []
     for date_text in selected_dates:
         day_dir = quote_root / date_text.replace("-", "")
-        etf_src, opt_src = _latest_snapshot_pair(day_dir)
+        etf_src, opt_src = _latest_snapshot_pair(day_dir, date_text)
         if etf_src is None or opt_src is None:
             rows.append(
                 {
@@ -142,14 +143,23 @@ def _selected_quote_dates(quote_root, start_date=None, end_date=None, dates=None
     return sorted(result)
 
 
-def _latest_snapshot_pair(day_dir):
+def _latest_snapshot_pair(day_dir, expected_date):
     if not day_dir.exists():
         return None, None
-    etf_files = sorted(day_dir.glob("*_etf.parquet"))
-    opt_files = sorted(day_dir.glob("*_option_chain.parquet"))
-    if not etf_files or not opt_files:
-        return None, None
-    return etf_files[-1], opt_files[-1]
+    expected_date = _normalize_date_text(expected_date)
+    for metadata_path in reversed(sorted(day_dir.glob("*_metadata.json"))):
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if _normalize_date_text(metadata.get("quote_date")) != expected_date:
+            continue
+        stem = metadata_path.name.removesuffix("_metadata.json")
+        etf_path = day_dir / f"{stem}_etf.parquet"
+        option_path = day_dir / f"{stem}_option_chain.parquet"
+        if etf_path.exists() and option_path.exists():
+            return etf_path, option_path
+    return None, None
 
 
 def _validate_snapshot_pair(etf_src, opt_src):
@@ -178,6 +188,8 @@ def _validate_snapshot_pair(etf_src, opt_src):
 
 
 def _normalize_date_text(value):
+    if value is None:
+        return ""
     text = str(value).strip()
     if len(text) == 8 and text.isdigit():
         return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
