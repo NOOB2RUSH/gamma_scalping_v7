@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import pandas as pd
@@ -7,6 +8,88 @@ from core.live import account_report
 
 
 class AccountReportHedgePnlTest(unittest.TestCase):
+    def test_option_position_uses_current_chain_marks_not_stale_account_marks(self):
+        position = {
+            "call_code": "call",
+            "put_code": "put",
+            "call_qty": 1,
+            "put_qty": 1,
+            "entry_call_price": 0.04,
+            "entry_put_price": 0.06,
+            "entry_option_value": 1000.0,
+            "contract_multiplier": 10_000,
+            "option_margin": 100.0,
+            "last_call_price": 0.01,
+            "last_put_price": 0.01,
+            "last_mark_date": "2026-06-09",
+        }
+        call = pd.Series(
+            {
+                "order_book_id": "call",
+                "contract_symbol": "call",
+                "mid": 0.05,
+                "strike_price": 1.75,
+                "maturity_date": "2026-06-24",
+                "dte": 10,
+                "iv": 0.36,
+                "delta": 0.5,
+            }
+        )
+        put = pd.Series(
+            {
+                "order_book_id": "put",
+                "contract_symbol": "put",
+                "mid": 0.08,
+                "strike_price": 1.75,
+                "maturity_date": "2026-06-24",
+                "dte": 10,
+                "iv": 0.54,
+                "delta": -0.5,
+            }
+        )
+        greeks = {
+            "delta": 0.0,
+            "gamma": -1.0,
+            "vega": -2.0,
+            "theta": 3.0,
+            "position_iv": 0.45,
+            "call_iv": 0.36,
+            "put_iv": 0.54,
+            "call_delta": -0.5,
+            "put_delta": 0.5,
+            "call_gamma": -0.5,
+            "put_gamma": -0.5,
+            "call_vega": -1.0,
+            "put_vega": -1.0,
+            "call_theta": 1.5,
+            "put_theta": 1.5,
+        }
+        account = SimpleNamespace(
+            positions={"long": None, "short": position},
+            option_hedges=[],
+        )
+        with (
+            mock.patch.object(
+                account_report.core.vol_engine,
+                "resolve_position_pair",
+                return_value=(call, put),
+            ),
+            mock.patch.object(
+                account_report.core.strategy,
+                "calc_position_greeks",
+                return_value=greeks,
+            ),
+        ):
+            rows, _, _, _, pnl = account_report._position_rows_from_account(
+                account,
+                pd.DataFrame(),
+                "2026-06-10",
+                "default",
+            )
+
+        self.assertEqual([row["最新价"] for row in rows], [0.05, 0.08])
+        self.assertAlmostEqual(pnl, -300.0)
+
     def test_hedge_unrealized_pnl_uses_system_cost_not_broker_export(self):
         pnl = account_report._hedge_unrealized_pnl_for_report(
             "kc50etf",

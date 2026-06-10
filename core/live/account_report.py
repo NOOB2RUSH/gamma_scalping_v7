@@ -1379,11 +1379,6 @@ def _option_hedge_rows_from_account(position, chain_df, report_date, account_id)
     if matches.empty:
         return [], None, 0.0, 0.0, 0.0
     row = matches.iloc[0].copy()
-    mark_date = _date_or_none(position.get("last_mark_date"))
-    report_ts = _date_or_none(report_date)
-    last_price = _number(position.get("last_price"))
-    if last_price is not None and mark_date is not None and report_ts is not None and mark_date <= report_ts:
-        row["mid"] = last_price
 
     side = position.get("side", "short")
     qty = int(position.get("qty", 0) or 0)
