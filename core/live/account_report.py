@@ -1311,12 +1311,6 @@ def _position_rows_from_account(live_account, chain_df, report_date, account_id)
             call_row, put_row = core.vol_engine.resolve_position_pair(position, chain_df)
         except IndexError:
             continue
-        call_row, put_row = _apply_account_position_mark(
-            position,
-            call_row,
-            put_row,
-            report_date,
-        )
 
         current_value = core.position.value(position, call_row, put_row)
         signed_value = core.position.signed_value(position, call_row, put_row)
@@ -1496,26 +1490,6 @@ def _position_total_delta(single_delta, qty, multiplier):
     if single_delta is None or qty is None or multiplier is None:
         return None
     return single_delta * qty * multiplier
-
-
-def _apply_account_position_mark(position, call_row, put_row, report_date):
-    mark_date = _date_or_none(position.get("last_mark_date"))
-    report_ts = _date_or_none(report_date)
-    if mark_date is None or report_ts is None or mark_date > report_ts:
-        return call_row, put_row
-
-    call_price = _number(position.get("last_call_price"))
-    put_price = _number(position.get("last_put_price"))
-    if call_price is None and put_price is None:
-        return call_row, put_row
-
-    call_result = call_row.copy()
-    put_result = put_row.copy()
-    if call_price is not None:
-        call_result["mid"] = call_price
-    if put_price is not None:
-        put_result["mid"] = put_price
-    return call_result, put_result
 
 
 def _hedge_for_report_date(live_account, product, account_id, report_date):
