@@ -425,9 +425,10 @@ def _integrate_option_greeks(path):
     spot_change = path["spot"].diff().iloc[1:].to_numpy()
     call_iv_change = path["call_iv"].diff().iloc[1:].to_numpy()
     put_iv_change = path["put_iv"].diff().iloc[1:].to_numpy()
-    start_delta = path["call_delta"].iloc[0] + path["put_delta"].iloc[0]
-    total_spot_change = path["spot"].iloc[-1] - path["spot"].iloc[0]
-    delta_pnl = start_delta * total_spot_change
+    delta_pnl = (
+        (prev["call_delta"].to_numpy() + prev["put_delta"].to_numpy())
+        * spot_change
+    ).sum()
     gamma_pnl = (
         0.5
         * (
