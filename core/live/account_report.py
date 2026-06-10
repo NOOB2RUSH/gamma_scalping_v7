@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -511,7 +512,7 @@ def write_live_account_report(product, payload, output_format="excel", mode="def
     _validate_report_mode(mode)
     stamp = storage.local_now_stamp()
     out_dir = storage.output_dir(product)
-    frames = _report_frames(payload, mode=mode)
+    frames = _daily_report_frames(payload, mode=mode)
     paths = {}
     name_suffix = "_diagnose" if mode == "diagnose" else ""
 
@@ -524,6 +525,9 @@ def write_live_account_report(product, payload, output_format="excel", mode="def
             for sheet_name, frame in frames.items():
                 frame.to_excel(writer, sheet_name=sheet_name, index=False)
         paths["excel"] = excel_path
+        total_path = out_dir / f"{product}_account_report_total{name_suffix}.xlsx"
+        _append_daily_frames_to_total_report(total_path, frames, payload["date"])
+        paths["total_excel"] = total_path
 
     if output_format in {"csv", "both"}:
         csv_paths = {}
@@ -552,6 +556,63 @@ def write_live_account_report(product, payload, output_format="excel", mode="def
         )
         paths["diagnostics"] = diagnostics_path
     return paths
+
+
+def _daily_report_frames(payload, mode="default"):
+    report_date = str(payload["date"])
+    frames = _report_frames(payload, mode=mode)
+    return {
+        sheet_name: _rows_for_report_date(frame, report_date)
+        for sheet_name, frame in frames.items()
+    }
+
+
+def _append_daily_frames_to_total_report(path, daily_frames, report_date):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = _read_report_workbook(path) if path.exists() else {}
+    combined = {}
+    for sheet_name, daily in daily_frames.items():
+        old = existing.get(sheet_name, pd.DataFrame(columns=daily.columns))
+        old = old.reindex(columns=daily.columns)
+        old = old.loc[~_report_date_mask(old, report_date)]
+        frame = pd.concat([old, daily], ignore_index=True)
+        combined[sheet_name] = _sort_report_frame(frame)
+    temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
+        for sheet_name, frame in combined.items():
+            frame.to_excel(writer, sheet_name=sheet_name, index=False)
+    temp_path.replace(path)
+
+
+def _read_report_workbook(path):
+    with pd.ExcelFile(path) as workbook:
+        return {
+            sheet_name: workbook.parse(sheet_name=sheet_name)
+            for sheet_name in workbook.sheet_names
+        }
+
+
+def _rows_for_report_date(frame, report_date):
+    if frame.empty or "日期" not in frame.columns:
+        return frame.copy()
+    return frame.loc[_report_date_mask(frame, report_date)].reset_index(drop=True)
+
+
+def _report_date_mask(frame, report_date):
+    if frame.empty or "日期" not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    dates = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return dates.eq(str(report_date))
+
+
+def _sort_report_frame(frame):
+    if frame.empty or "日期" not in frame.columns:
+        return frame.reset_index(drop=True)
+    result = frame.copy()
+    result["_report_sort_date"] = pd.to_datetime(result["日期"], errors="coerce")
+    result = result.sort_values("_report_sort_date", kind="stable")
+    return result.drop(columns=["_report_sort_date"]).reset_index(drop=True)
 
 
 def _json_payload(payload, mode="default"):

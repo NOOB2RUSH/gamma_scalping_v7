@@ -82,6 +82,8 @@ def main():
         )
         if "excel" in paths:
             print(f"account_report_excel={paths['excel']}")
+        if "total_excel" in paths:
+            print(f"account_report_total_excel={paths['total_excel']}")
         if "csv" in paths:
             for sheet_name, path in paths["csv"].items():
                 print(f"account_report_csv[{sheet_name}]={path}")
