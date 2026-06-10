@@ -256,10 +256,12 @@ def _fetch_etf_minute(ak, etf_symbol, captured_at):
 
 def _fetch_option_minute(ak, option_code, captured_at):
     raw = ak.option_finance_minute_sina(symbol=str(option_code))
-    if raw is None or raw.empty:
+    source = "option_finance_minute_sina"
+    if not _option_minute_is_current(raw, captured_at):
         raw = ak.option_sse_minute_sina(symbol=str(option_code))
-    if raw is None or raw.empty:
-        raise ValueError(f"empty option minute data: {option_code}")
+        source = "option_sse_minute_sina"
+    if not _option_minute_is_current(raw, captured_at):
+        raise ValueError(f"no current-date option minute data: {option_code}")
 
     frame = raw.copy()
     if {"date", "time"}.issubset(frame.columns):
@@ -293,9 +295,28 @@ def _fetch_option_minute(ak, option_code, captured_at):
         ["timestamp", "price", "average_price", "volume", "open_interest"]
     ].copy()
     result.insert(0, "symbol", str(option_code))
-    result["source"] = "option_finance_minute_sina"
+    result["source"] = source
     result["captured_at"] = captured_at.isoformat()
     return result.dropna(subset=["timestamp"])
+
+
+def _option_minute_is_current(frame, captured_at):
+    if frame is None or frame.empty:
+        return False
+    if {"date", "time"}.issubset(frame.columns):
+        timestamp = pd.to_datetime(
+            frame["date"].astype(str) + " " + frame["time"].astype(str),
+            errors="coerce",
+        )
+    elif {"日期", "时间"}.issubset(frame.columns):
+        timestamp = pd.to_datetime(
+            frame["日期"].astype(str) + " " + frame["时间"].astype(str),
+            errors="coerce",
+        )
+    else:
+        return False
+    latest = timestamp.max()
+    return pd.notna(latest) and latest.date() == pd.Timestamp(captured_at).date()
 
 
 def _fetch_option_snapshot(func, option_code, captured_at, source):
