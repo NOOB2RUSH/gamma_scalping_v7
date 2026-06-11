@@ -506,7 +506,7 @@ def persist_account_report_history(product, account_id, payload):
     return payload
 
 
-def write_live_account_report(product, payload, output_format="excel", mode="default"):
+def write_live_account_report(product, payload, mode="default"):
     _validate_report_mode(mode)
     stamp = storage.local_now_stamp()
     out_dir = storage.output_dir(product)
@@ -514,54 +514,24 @@ def write_live_account_report(product, payload, output_format="excel", mode="def
     paths = {}
     name_suffix = "_diagnose" if mode == "diagnose" else ""
 
-    if output_format not in {"excel", "csv", "both"}:
-        raise ValueError("output_format must be one of: excel, csv, both")
-
-    if output_format in {"excel", "both"}:
-        excel_path = out_dir / f"{stamp}_daily{name_suffix}.xlsx"
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            for sheet_name, frame in frames.items():
-                frame.to_excel(writer, sheet_name=sheet_name, index=False)
-        paths["excel"] = excel_path
-        total_path = out_dir / f"{stamp}_report{name_suffix}.xlsx"
-        _append_daily_frames_to_total_report(
-            total_path,
-            frames,
-            payload["date"],
-            start_date=_report_history_start_date(payload),
-            existing_path=_latest_total_report_path(
-                out_dir,
-                product,
-                mode=mode,
-                before_path=total_path,
-            ),
-        )
-        paths["total_excel"] = total_path
-
-    if output_format in {"csv", "both"}:
-        csv_paths = {}
-        csv_names = {
-            "账户总体情况": "summary",
-            "持仓记录": "positions",
-            "当日交易记录": "trades",
-        }
-        for sheet_name, frame in frames.items():
-            csv_path = out_dir / f"{stamp}_daily{name_suffix}_{csv_names[sheet_name]}.csv"
-            frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
-            csv_paths[sheet_name] = csv_path
-        paths["csv"] = csv_paths
+    total_path = out_dir / f"{stamp}_report{name_suffix}.xlsx"
+    _append_daily_frames_to_total_report(
+        total_path,
+        frames,
+        payload["date"],
+        start_date=_report_history_start_date(payload),
+        existing_path=_latest_total_report_path(
+            out_dir,
+            product,
+            mode=mode,
+            before_path=total_path,
+        ),
+    )
+    paths["total_excel"] = total_path
 
     json_path = out_dir / f"{stamp}_daily{name_suffix}.json"
     storage.write_json(json_path, _json_payload(payload, mode=mode))
     paths["json"] = json_path
-    if mode == "diagnose":
-        diagnostics_path = out_dir / f"{stamp}_diagnostics.csv"
-        _diagnostic_report_frame(payload).to_csv(
-            diagnostics_path,
-            index=False,
-            encoding="utf-8-sig",
-        )
-        paths["diagnostics"] = diagnostics_path
     return paths
 
 

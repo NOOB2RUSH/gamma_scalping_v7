@@ -283,7 +283,6 @@ def _action_import_hedge(session):
 def _action_account_report(session):
     source = _prompt_choice("行情源", ["akshare", "local", "none"], "akshare")
     date = _prompt_optional("日期，留空则最新")
-    output_format = _prompt_choice("输出格式", ["excel", "csv", "both"], "excel")
     report_mode = _prompt_choice("报告模式", ["default", "diagnose"], "default")
     persist_history = _confirm("更新累计账户/持仓历史", True)
     write_files = _confirm("写出报告文件", True)
@@ -298,7 +297,6 @@ def _action_account_report(session):
         paths = account_report.write_live_account_report(
             session["product"],
             payload,
-            output_format=output_format,
             mode=report_mode,
         )
         _print_report_paths(paths)
@@ -831,15 +829,10 @@ def _fmt_optional(value):
 
 
 def _print_report_paths(paths):
-    if "excel" in paths:
-        print(f"account_report_excel={paths['excel']}")
-    if "csv" in paths:
-        for sheet_name, path in paths["csv"].items():
-            print(f"account_report_csv[{sheet_name}]={path}")
+    if "total_excel" in paths:
+        print(f"account_report_total_excel={paths['total_excel']}")
     if "json" in paths:
         print(f"account_report_json={paths['json']}")
-    if "diagnostics" in paths:
-        print(f"account_report_diagnostics={paths['diagnostics']}")
 
 
 def _print_dict(payload):

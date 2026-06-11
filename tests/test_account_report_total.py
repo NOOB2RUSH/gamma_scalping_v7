@@ -110,9 +110,11 @@ class AccountReportTotalTest(unittest.TestCase):
                     payload,
                 )
 
-            self.assertEqual(paths["excel"].name, "20260611_131816_daily.xlsx")
             self.assertEqual(paths["total_excel"].name, "20260611_131816_report.xlsx")
             self.assertEqual(paths["json"].name, "20260611_131816_daily.json")
+            self.assertNotIn("excel", paths)
+            self.assertNotIn("csv", paths)
+            self.assertNotIn("diagnostics", paths)
             total = account_report._read_report_workbook(paths["total_excel"])
 
         self.assertEqual(
@@ -146,6 +148,56 @@ class AccountReportTotalTest(unittest.TestCase):
                 ),
                 diagnose_path,
             )
+
+    def test_diagnose_write_only_outputs_cumulative_report_and_json(self):
+        with TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            payload = {
+                "date": "2026-06-10",
+                "summary_history": pd.DataFrame([{"日期": "2026-06-10"}]),
+            }
+            daily_frames = {
+                "账户总体情况": pd.DataFrame(
+                    [{"日期": "2026-06-10", "值": 10}]
+                )
+            }
+
+            with (
+                patch.object(
+                    account_report.storage,
+                    "local_now_stamp",
+                    return_value="20260611_131816",
+                ),
+                patch.object(
+                    account_report.storage,
+                    "output_dir",
+                    return_value=out_dir,
+                ),
+                patch.object(
+                    account_report,
+                    "_daily_report_frames",
+                    return_value=daily_frames,
+                ),
+                patch.object(account_report, "_json_payload", return_value={}),
+            ):
+                paths = account_report.write_live_account_report(
+                    "kc50etf",
+                    payload,
+                    mode="diagnose",
+                )
+
+        self.assertEqual(
+            set(paths),
+            {"total_excel", "json"},
+        )
+        self.assertEqual(
+            paths["total_excel"].name,
+            "20260611_131816_report_diagnose.xlsx",
+        )
+        self.assertEqual(
+            paths["json"].name,
+            "20260611_131816_daily_diagnose.json",
+        )
 
 
 if __name__ == "__main__":

@@ -164,11 +164,10 @@ snapshots, and report-date broker trade details.
 python scripts/live/live_account_report.py --product kc50etf
 python scripts/live/live_account_report.py --product kc50etf --mode diagnose
 python scripts/live/live_account_report.py --product kc50etf --source none
-python scripts/live/live_account_report.py --product kc50etf --format csv
 ```
 
 By default it fetches the latest AKShare quotes before reporting and writes an
-Excel workbook with separate sheets:
+timestamped cumulative Excel workbook with separate sheets:
 
 - `账户总体情况`: one row per report date since the account report history began.
 - `持仓记录`: position snapshots accumulated by report date. Contract names are
@@ -177,13 +176,9 @@ Excel workbook with separate sheets:
 
 The default report mode shows the operator-facing account, daily PnL, Greeks,
 position, and trade fields. `--mode diagnose` adds internal PnL decomposition,
-broker reconciliation, and Greeks-explanation fields, and writes the separate
-diagnostics CSV.
-
-`--format csv` writes one CSV per section, and `--format both` writes both Excel
-and CSV outputs. Current option positions are revalued against current mid
-prices, with IV and Greeks calculated through the same project valuation
-functions used by live signals.
+broker reconciliation, and Greeks-explanation fields. Current option positions
+are revalued against current mid prices, with IV and Greeks calculated through
+the same project valuation functions used by live signals.
 
 ## Planned Hedge Advice
 
