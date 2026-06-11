@@ -518,17 +518,23 @@ def write_live_account_report(product, payload, output_format="excel", mode="def
         raise ValueError("output_format must be one of: excel, csv, both")
 
     if output_format in {"excel", "both"}:
-        excel_path = out_dir / f"{stamp}_account_report{name_suffix}.xlsx"
+        excel_path = out_dir / f"{stamp}_daily{name_suffix}.xlsx"
         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
             for sheet_name, frame in frames.items():
                 frame.to_excel(writer, sheet_name=sheet_name, index=False)
         paths["excel"] = excel_path
-        total_path = out_dir / f"{product}_account_report_total{name_suffix}.xlsx"
+        total_path = out_dir / f"{stamp}_report{name_suffix}.xlsx"
         _append_daily_frames_to_total_report(
             total_path,
             frames,
             payload["date"],
             start_date=_report_history_start_date(payload),
+            existing_path=_latest_total_report_path(
+                out_dir,
+                product,
+                mode=mode,
+                before_path=total_path,
+            ),
         )
         paths["total_excel"] = total_path
 
@@ -540,18 +546,16 @@ def write_live_account_report(product, payload, output_format="excel", mode="def
             "当日交易记录": "trades",
         }
         for sheet_name, frame in frames.items():
-            csv_path = out_dir / (
-                f"{stamp}_account_report{name_suffix}_{csv_names[sheet_name]}.csv"
-            )
+            csv_path = out_dir / f"{stamp}_daily{name_suffix}_{csv_names[sheet_name]}.csv"
             frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
             csv_paths[sheet_name] = csv_path
         paths["csv"] = csv_paths
 
-    json_path = out_dir / f"{stamp}_account_report{name_suffix}.json"
+    json_path = out_dir / f"{stamp}_daily{name_suffix}.json"
     storage.write_json(json_path, _json_payload(payload, mode=mode))
     paths["json"] = json_path
     if mode == "diagnose":
-        diagnostics_path = out_dir / f"{stamp}_account_report_diagnostics.csv"
+        diagnostics_path = out_dir / f"{stamp}_diagnostics.csv"
         _diagnostic_report_frame(payload).to_csv(
             diagnostics_path,
             index=False,
@@ -575,10 +579,12 @@ def _append_daily_frames_to_total_report(
     daily_frames,
     report_date,
     start_date=None,
+    existing_path=None,
 ):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _read_report_workbook(path) if path.exists() else {}
+    source_path = Path(existing_path) if existing_path is not None else path
+    existing = _read_report_workbook(source_path) if source_path.exists() else {}
     combined = {}
     for sheet_name, daily in daily_frames.items():
         daily = daily.copy()
@@ -607,6 +613,21 @@ def _append_daily_frames_to_total_report(
         for sheet_name, frame in combined.items():
             frame.to_excel(writer, sheet_name=sheet_name, index=False)
     temp_path.replace(path)
+
+
+def _latest_total_report_path(out_dir, product, mode="default", before_path=None):
+    out_dir = Path(out_dir)
+    name_suffix = "_diagnose" if mode == "diagnose" else ""
+    before_path = Path(before_path) if before_path is not None else None
+    candidates = [
+        path
+        for path in out_dir.glob(f"????????_??????_report{name_suffix}.xlsx")
+        if before_path is None or path != before_path
+    ]
+    if candidates:
+        return max(candidates, key=lambda path: path.name)
+    legacy_path = out_dir / f"{product}_account_report_total{name_suffix}.xlsx"
+    return legacy_path if legacy_path.exists() else None
 
 
 def _read_report_workbook(path):
