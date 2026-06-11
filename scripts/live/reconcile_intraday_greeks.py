@@ -421,7 +421,6 @@ def _leg_intraday_greeks(path, row, price_col, flag):
 def _integrate_option_greeks(path):
     intervals = len(path) - 1
     prev = path.iloc[:-1]
-    current = path.iloc[1:]
     spot_change = path["spot"].diff().iloc[1:].to_numpy()
     call_iv_change = path["call_iv"].diff().iloc[1:].to_numpy()
     put_iv_change = path["put_iv"].diff().iloc[1:].to_numpy()
@@ -432,18 +431,18 @@ def _integrate_option_greeks(path):
     gamma_pnl = (
         0.5
         * (
-            _avg(prev, current, "call_gamma")
-            + _avg(prev, current, "put_gamma")
+            prev["call_gamma"].to_numpy()
+            + prev["put_gamma"].to_numpy()
         )
         * spot_change
         * spot_change
     ).sum()
     vega_pnl = (
-        _avg(prev, current, "call_vega") * call_iv_change * 100.0
-        + _avg(prev, current, "put_vega") * put_iv_change * 100.0
+        prev["call_vega"].to_numpy() * call_iv_change * 100.0
+        + prev["put_vega"].to_numpy() * put_iv_change * 100.0
     ).sum()
     theta_pnl = (
-        (_avg(prev, current, "call_theta") + _avg(prev, current, "put_theta"))
+        (prev["call_theta"].to_numpy() + prev["put_theta"].to_numpy())
         * (1.0 / intervals)
     ).sum()
     return {
@@ -453,12 +452,6 @@ def _integrate_option_greeks(path):
         "theta_pnl": float(theta_pnl),
         "option_greeks_pnl": float(delta_pnl + gamma_pnl + vega_pnl + theta_pnl),
     }
-
-
-def _avg(left, right, column):
-    return (left[column].to_numpy() + right[column].to_numpy()) / 2.0
-
-
 def _hedge_greeks_pnl(product, prev, current):
     start_price = _number(prev.get(COL_HEDGE_PRICE))
     end_price = _number(current.get(COL_HEDGE_PRICE))

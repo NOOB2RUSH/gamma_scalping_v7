@@ -2024,9 +2024,9 @@ def _apply_intraday_greeks_pnl(summary_history, position_history, product, freq=
             result.at[current_index, "单日GreeksPnL"] = (
                 intraday["option_greeks_pnl"] + hedge_delta
             )
-            result.at[current_index, "GreeksPnL口径"] = f"delta_interval+gvt_{freq}"
+            result.at[current_index, "GreeksPnL口径"] = f"start_greeks_taylor_{freq}"
             result.at[current_index, "GreeksPnL说明"] = (
-                intraday.get("reason") or "delta_interval;gamma_vega_theta_intraday"
+                intraday.get("reason") or "all_interval_terms_use_start_greeks"
             )
             result.at[current_index, "GreeksPnL路径节点数"] = intraday["nodes"]
     return result
@@ -2117,7 +2117,7 @@ def _intraday_option_greeks_for_summary_day(
     parts.update(
         {
             "status": "ok",
-            "reason": "ok",
+            "reason": "all_interval_terms_use_start_greeks",
             "nodes": len(path),
         }
     )
@@ -2311,7 +2311,6 @@ def _leg_intraday_option_greeks(path, row, price_col, flag, product):
 def _integrate_intraday_option_greeks(path):
     intervals = len(path) - 1
     previous = path.iloc[:-1]
-    current = path.iloc[1:]
     spot_change = path["spot"].diff().iloc[1:].to_numpy()
     call_iv_change = path["call_iv"].diff().iloc[1:].to_numpy()
     put_iv_change = path["put_iv"].diff().iloc[1:].to_numpy()
@@ -2323,20 +2322,20 @@ def _integrate_intraday_option_greeks(path):
     gamma_pnl = (
         0.5
         * (
-            _intraday_average(previous, current, "call_gamma")
-            + _intraday_average(previous, current, "put_gamma")
+            previous["call_gamma"].to_numpy()
+            + previous["put_gamma"].to_numpy()
         )
         * spot_change
         * spot_change
     ).sum()
     vega_pnl = (
-        _intraday_average(previous, current, "call_vega") * call_iv_change * 100.0
-        + _intraday_average(previous, current, "put_vega") * put_iv_change * 100.0
+        previous["call_vega"].to_numpy() * call_iv_change * 100.0
+        + previous["put_vega"].to_numpy() * put_iv_change * 100.0
     ).sum()
     theta_pnl = (
         (
-            _intraday_average(previous, current, "call_theta")
-            + _intraday_average(previous, current, "put_theta")
+            previous["call_theta"].to_numpy()
+            + previous["put_theta"].to_numpy()
         )
         * (1.0 / intervals)
     ).sum()
@@ -2347,12 +2346,6 @@ def _integrate_intraday_option_greeks(path):
         "theta_pnl": float(theta_pnl),
         "option_greeks_pnl": float(delta_pnl + gamma_pnl + vega_pnl + theta_pnl),
     }
-
-
-def _intraday_average(left, right, column):
-    return (left[column].to_numpy() + right[column].to_numpy()) / 2.0
-
-
 def _resolve_intraday_dir(product, report_date=None):
     root = storage.PROJECT_ROOT / "data" / "live" / product / "intraday"
     if report_date is not None:
