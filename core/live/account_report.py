@@ -583,7 +583,19 @@ def _append_daily_frames_to_total_report(
     existing = _read_report_workbook(path) if path.exists() else {}
     combined = {}
     for sheet_name, daily in daily_frames.items():
-        old = existing.get(sheet_name, pd.DataFrame(columns=daily.columns))
+        daily = daily.copy()
+        old = existing.get(sheet_name, pd.DataFrame(columns=daily.columns)).copy()
+        if sheet_name == "账户总体情况":
+            if "备注" not in daily.columns:
+                daily["备注"] = None
+            if "备注" not in old.columns:
+                old["备注"] = None
+            existing_remarks = old.loc[
+                _report_date_mask(old, report_date),
+                ["日期", "备注"],
+            ]
+            if not existing_remarks.empty and daily["备注"].isna().all():
+                daily.loc[:, "备注"] = existing_remarks.iloc[-1]["备注"]
         old = old.reindex(columns=daily.columns)
         if start_date is not None:
             old = old.loc[_report_date_on_or_after_mask(old, start_date)]
@@ -790,22 +802,9 @@ def _summary_report_frame(
         report_date = str(report_date)
         current_mask = frame["日期"].astype(str).eq(report_date)
         totals = _position_pnl_totals(position_report)
-        broker_total = pd.to_numeric(
-            frame.loc[current_mask, "券商总单日盈亏变化"],
+        actual_total = pd.to_numeric(
+            frame.loc[current_mask, "总单日盈亏"],
             errors="coerce",
-        )
-        if "GreeksPnL说明" in frame.columns:
-            first_history_mask = frame.loc[
-                current_mask,
-                "GreeksPnL说明",
-            ].astype(str).eq("first_history_row")
-            broker_total = broker_total.mask(first_history_mask)
-        frame.loc[current_mask, "期权单日盈亏"] = totals["option_daily_pnl"]
-        frame.loc[current_mask, "ETF单日盈亏"] = totals["etf_daily_pnl"]
-        frame.loc[current_mask, "总单日盈亏"] = totals["daily_pnl_decomposition"]
-        frame.loc[current_mask, "净单日盈亏"] = _net_daily_pnl(
-            totals["daily_pnl_decomposition"],
-            frame.loc[current_mask, "当日手续费"],
         )
         frame.loc[current_mask, "持仓盈亏"] = totals["holding_pnl"]
         frame.loc[current_mask, "交易盈亏"] = totals["realized_cost_pnl"]
@@ -816,7 +815,7 @@ def _summary_report_frame(
             "daily_pnl_decomposition"
         ]
         frame.loc[current_mask, "当日盈亏对账差额"] = (
-            broker_total - totals["daily_pnl_decomposition"]
+            actual_total - totals["daily_pnl_decomposition"]
         )
     frame["总单日盈亏(手续费前)"] = frame["总单日盈亏"]
     return frame.reindex(columns=report_columns)
@@ -824,24 +823,17 @@ def _summary_report_frame(
 
 def _apply_current_pnl_decomposition(payload):
     totals = _position_pnl_totals(_position_report_frame(payload))
-    broker_total = _broker_daily_pnl(payload["summary"])
+    actual_total = _number(payload["summary"].get("总单日盈亏"))
     payload["summary"].update(
         {
-            "期权单日盈亏": totals["option_daily_pnl"],
-            "ETF单日盈亏": totals["etf_daily_pnl"],
-            "总单日盈亏": totals["daily_pnl_decomposition"],
-            "净单日盈亏": _net_daily_pnl(
-                totals["daily_pnl_decomposition"],
-                payload["summary"].get("当日手续费"),
-            ),
             "持仓盈亏": totals["holding_pnl"],
             "交易盈亏": totals["realized_cost_pnl"],
             "当日盯市交易盈亏": totals["mark_to_market_trade_pnl"],
             "当日盈亏分解合计": totals["daily_pnl_decomposition"],
             "当日盈亏对账差额": (
                 None
-                if broker_total is None
-                else broker_total - totals["daily_pnl_decomposition"]
+                if actual_total is None
+                else actual_total - totals["daily_pnl_decomposition"]
             ),
         }
     )
@@ -913,23 +905,16 @@ def _apply_current_pnl_decomposition_to_history(payload):
         return
 
     totals = _position_pnl_totals(_position_report_frame(payload))
-    broker_total = _broker_daily_pnl(history.loc[mask].iloc[-1].to_dict())
+    actual_total = _number(history.loc[mask].iloc[-1].get("总单日盈亏"))
     values = {
-        "期权单日盈亏": totals["option_daily_pnl"],
-        "ETF单日盈亏": totals["etf_daily_pnl"],
-        "总单日盈亏": totals["daily_pnl_decomposition"],
-        "净单日盈亏": _net_daily_pnl(
-            totals["daily_pnl_decomposition"],
-            history.loc[mask, "当日手续费"],
-        ),
         "持仓盈亏": totals["holding_pnl"],
         "交易盈亏": totals["realized_cost_pnl"],
         "当日盯市交易盈亏": totals["mark_to_market_trade_pnl"],
         "当日盈亏分解合计": totals["daily_pnl_decomposition"],
         "当日盈亏对账差额": (
             None
-            if broker_total is None
-            else broker_total - totals["daily_pnl_decomposition"]
+            if actual_total is None
+            else actual_total - totals["daily_pnl_decomposition"]
         ),
     }
     for column, value in values.items():
@@ -1215,14 +1200,6 @@ def _daily_position_pnl_breakdown(
                 * np.sign(old_signed_qty)
                 * multiplier
             )
-        if new_signed_qty != 0 and new_cost is not None:
-            holding_pnl += (
-                abs(new_signed_qty)
-                * (current_price - new_cost)
-                * np.sign(new_signed_qty)
-                * multiplier
-            )
-
     expected_signed_qty = _signed_position_qty(current_qty, current_side)
     ending_cost = total_cost if abs(total_signed_qty - expected_signed_qty) <= 1e-6 else None
     return {
@@ -1884,7 +1861,10 @@ def _add_summary_greeks_pnl(summary_history, position_history=None, product=None
 
 def _add_summary_greeks_pnl_for_account(group, product=None):
     spot = _numeric_series(group, "标的价格")
-    option_actual_pnl = _numeric_series(group, "期权总盈亏").diff()
+    existing_option_daily_pnl = _numeric_series(group, "期权单日盈亏")
+    existing_hedge_daily_pnl = _numeric_series(group, "对冲单日盈亏")
+    option_total = _numeric_series(group, "期权总盈亏")
+    option_actual_pnl = option_total.diff()
     option_actual_pnl = option_actual_pnl.where(
         option_actual_pnl.notna(),
         _numeric_series(group, "期权浮盈亏").diff(),
@@ -1893,6 +1873,9 @@ def _add_summary_greeks_pnl_for_account(group, product=None):
     hedge_unrealized = _numeric_series(group, "对冲浮盈亏")
     hedge_actual_pnl = hedge_total.diff()
     hedge_actual_pnl = hedge_actual_pnl.where(hedge_actual_pnl.notna(), hedge_unrealized.diff())
+    if not group.empty:
+        option_actual_pnl.iloc[0] = option_total.iloc[0]
+        hedge_actual_pnl.iloc[0] = hedge_total.iloc[0]
     hedge_mark = _numeric_series(group, "对冲最新价")
     hedge_qty = _numeric_series(group, "对冲持仓").fillna(0.0)
     call_iv = _numeric_series(group, "Call IV")
@@ -1959,8 +1942,12 @@ def _add_summary_greeks_pnl_for_account(group, product=None):
     group["单日GreeksPnL"] = group[
         ["单日DeltaPnL", "单日GammaPnL", "单日VegaPnL", "单日ThetaPnL"]
     ].sum(axis=1)
-    group["期权单日盈亏"] = option_actual_pnl.fillna(0.0)
-    group["对冲单日盈亏"] = hedge_actual_pnl.fillna(0.0)
+    group["期权单日盈亏"] = option_actual_pnl.combine_first(
+        existing_option_daily_pnl
+    ).fillna(0.0)
+    group["对冲单日盈亏"] = hedge_actual_pnl.combine_first(
+        existing_hedge_daily_pnl
+    ).fillna(0.0)
     group["总单日盈亏"] = group[["期权单日盈亏", "对冲单日盈亏"]].sum(axis=1)
     group["券商期权单日盈亏变化"] = group["期权单日盈亏"]
     group["券商对冲单日盈亏变化"] = group["对冲单日盈亏"]
