@@ -526,7 +526,12 @@ def write_live_account_report(product, payload, output_format="excel", mode="def
                 frame.to_excel(writer, sheet_name=sheet_name, index=False)
         paths["excel"] = excel_path
         total_path = out_dir / f"{product}_account_report_total{name_suffix}.xlsx"
-        _append_daily_frames_to_total_report(total_path, frames, payload["date"])
+        _append_daily_frames_to_total_report(
+            total_path,
+            frames,
+            payload["date"],
+            start_date=_report_history_start_date(payload),
+        )
         paths["total_excel"] = total_path
 
     if output_format in {"csv", "both"}:
@@ -567,7 +572,12 @@ def _daily_report_frames(payload, mode="default"):
     }
 
 
-def _append_daily_frames_to_total_report(path, daily_frames, report_date):
+def _append_daily_frames_to_total_report(
+    path,
+    daily_frames,
+    report_date,
+    start_date=None,
+):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = _read_report_workbook(path) if path.exists() else {}
@@ -575,8 +585,12 @@ def _append_daily_frames_to_total_report(path, daily_frames, report_date):
     for sheet_name, daily in daily_frames.items():
         old = existing.get(sheet_name, pd.DataFrame(columns=daily.columns))
         old = old.reindex(columns=daily.columns)
+        if start_date is not None:
+            old = old.loc[_report_date_on_or_after_mask(old, start_date)]
         old = old.loc[~_report_date_mask(old, report_date)]
         frame = pd.concat([old, daily], ignore_index=True)
+        if start_date is not None:
+            frame = frame.loc[_report_date_on_or_after_mask(frame, start_date)]
         combined[sheet_name] = _sort_report_frame(frame)
     temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
     with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
@@ -604,6 +618,21 @@ def _report_date_mask(frame, report_date):
         return pd.Series(False, index=frame.index)
     dates = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
     return dates.eq(str(report_date))
+
+
+def _report_date_on_or_after_mask(frame, start_date):
+    if frame.empty or "日期" not in frame.columns:
+        return pd.Series(True, index=frame.index)
+    dates = pd.to_datetime(frame["日期"], errors="coerce")
+    return dates.ge(pd.Timestamp(start_date).normalize())
+
+
+def _report_history_start_date(payload):
+    history = payload.get("summary_history")
+    if not isinstance(history, pd.DataFrame) or history.empty or "日期" not in history:
+        return payload.get("date")
+    dates = pd.to_datetime(history["日期"], errors="coerce").dropna()
+    return str(dates.min().date()) if not dates.empty else payload.get("date")
 
 
 def _sort_report_frame(frame):
@@ -1743,9 +1772,9 @@ def _trade_rows_from_summary_file(path, product):
                     "平仓盈亏": realized_pnl,
                     "类型": "期权",
                     "日期": trade_date,
-                    "报单时间": None,
-                    "成交时间": None,
-                    "成交时间(日)": None,
+                    "报单时间": item.get("报单时间"),
+                    "成交时间": item.get("成交时间"),
+                    "成交时间(日)": item.get("成交时间(日)"),
                     "策略名称": None,
                 }
             )
