@@ -260,8 +260,6 @@ TRADE_COLUMNS = [
     "日期",
     "报单时间",
     "成交时间",
-    "成交时间(日)",
-    "策略名称",
 ]
 
 
@@ -3128,6 +3126,8 @@ def _trade_rows_from_file(path, product):
     rows = []
     for _, item in df.iterrows():
         row = {column: item.get(column) for column in TRADE_COLUMNS}
+        row["成交时间(日)"] = item.get("成交时间(日)")
+        row["策略名称"] = item.get("策略名称")
         row["买卖"] = _clean_text(row.get("买卖"))
         for column in ["报单价格", "成交价格", "成交数量", "手续费", "平仓盈亏"]:
             row[column] = _number(row.get(column))
