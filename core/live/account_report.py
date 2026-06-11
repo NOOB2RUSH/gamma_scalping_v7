@@ -1846,12 +1846,6 @@ def _add_summary_greeks_pnl(summary_history, position_history=None, product=None
     for _, group in history.groupby("账户ID", dropna=False, sort=False):
         groups.append(_add_summary_greeks_pnl_for_account(group.copy(), product))
     result = pd.concat(groups, ignore_index=True) if groups else history
-    result = _apply_intraday_greeks_pnl(
-        result,
-        position_history,
-        product,
-        freq="5min",
-    )
     unavailable = result["GreeksPnL说明"].astype(str).eq("first_history_row")
     result.loc[unavailable, DAILY_GREEKS_PNL_COLUMNS] = np.nan
     result.loc[unavailable, "GreeksPnL口径"] = "unavailable"
@@ -1892,7 +1886,10 @@ def _add_summary_greeks_pnl_for_account(group, product=None):
         & put_iv.notna()
     )
 
-    option_delta_pnl = (call_delta.shift(1) + put_delta.shift(1)) * spot_chg
+    option_delta_pnl = (
+        (call_delta.shift(1) + call_delta) / 2
+        + (put_delta.shift(1) + put_delta) / 2
+    ) * spot_chg
     hedge_delta_pnl = _segmented_hedge_delta_pnl_series(
         product,
         group,
@@ -1939,8 +1936,8 @@ def _add_summary_greeks_pnl_for_account(group, product=None):
     group["券商期权单日盈亏变化"] = group["期权单日盈亏"]
     group["券商对冲单日盈亏变化"] = group["对冲单日盈亏"]
     group["券商总单日盈亏变化"] = group["总单日盈亏"]
-    group["GreeksPnL口径"] = "eod"
-    group["GreeksPnL说明"] = "5min_intraday_not_applied"
+    group["GreeksPnL口径"] = "endpoint_average"
+    group["GreeksPnL说明"] = "all_greeks_use_previous_current_endpoint_average"
     group["GreeksPnL路径节点数"] = None
     if not group.empty:
         group.iloc[0, group.columns.get_loc("GreeksPnL说明")] = "first_history_row"
