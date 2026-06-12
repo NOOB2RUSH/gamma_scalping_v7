@@ -37,10 +37,10 @@ def parse_args():
         help="Do not update cumulative account/position history CSV files.",
     )
     parser.add_argument(
-        "--format",
-        choices=["excel", "csv", "both"],
-        default="excel",
-        help="Report file format. CSV writes one file per section.",
+        "--mode",
+        choices=["default", "diagnose"],
+        default="default",
+        help="default shows operator essentials; diagnose includes internal reconciliation fields.",
     )
     parser.add_argument("--json", action="store_true")
     return parser.parse_args()
@@ -57,24 +57,27 @@ def main():
         persist_history=not args.no_history,
     )
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        print(
+            json.dumps(
+                account_report._json_payload(payload, mode=args.mode),
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
         return
 
     if not args.no_write:
         paths = account_report.write_live_account_report(
             args.product,
             payload,
-            output_format=args.format,
+            mode=args.mode,
         )
-        if "excel" in paths:
-            print(f"account_report_excel={paths['excel']}")
-        if "csv" in paths:
-            for sheet_name, path in paths["csv"].items():
-                print(f"account_report_csv[{sheet_name}]={path}")
+        if "total_excel" in paths:
+            print(f"account_report_total_excel={paths['total_excel']}")
         print(f"account_report_json={paths['json']}")
-        print(f"account_report_diagnostics={paths['diagnostics']}")
 
-    for line in account_report.format_terminal_summary(payload):
+    for line in account_report.format_terminal_summary(payload, mode=args.mode):
         print(line)
 
 

@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -39,7 +40,14 @@ SUMMARY_COLUMNS = [
     "当日手续费",
     "期权单日盈亏",
     "对冲单日盈亏",
+    "ETF单日盈亏",
     "总单日盈亏",
+    "净单日盈亏",
+    "持仓盈亏",
+    "交易盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
+    "当日盈亏对账差额",
     "券商期权单日盈亏变化",
     "券商对冲单日盈亏变化",
     "券商总单日盈亏变化",
@@ -76,13 +84,16 @@ SUMMARY_COLUMNS = [
     "GreeksPnL路径节点数",
 ]
 
-SUMMARY_REPORT_COLUMNS = [
+REPORT_MODES = {"default", "diagnose"}
+
+DEFAULT_SUMMARY_REPORT_COLUMNS = [
     "日期",
     "估算权益",
     "当日手续费",
     "期权单日盈亏",
     "ETF单日盈亏",
-    "总单日盈亏",
+    "总单日盈亏(手续费前)",
+    "净单日盈亏",
     "账户Delta",
     "账户Gamma",
     "账户Vega",
@@ -91,9 +102,34 @@ SUMMARY_REPORT_COLUMNS = [
     "单日GammaPnL",
     "单日VegaPnL",
     "单日ThetaPnL",
+    "单日GreeksPnL",
 ]
 
-POSITION_REPORT_COLUMNS = [
+DIAGNOSE_SUMMARY_REPORT_COLUMNS = [
+    "日期",
+    "估算权益",
+    "当日手续费",
+    "期权单日盈亏",
+    "ETF单日盈亏",
+    "总单日盈亏(手续费前)",
+    "净单日盈亏",
+    "持仓盈亏",
+    "交易盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
+    "当日盈亏对账差额",
+    "账户Delta",
+    "账户Gamma",
+    "账户Vega",
+    "账户Theta",
+    "单日DeltaPnL",
+    "单日GammaPnL",
+    "单日VegaPnL",
+    "单日ThetaPnL",
+    "单日GreeksPnL",
+]
+
+DEFAULT_POSITION_REPORT_COLUMNS = [
     "日期",
     "合约代码",
     "合约名称",
@@ -106,21 +142,72 @@ POSITION_REPORT_COLUMNS = [
     "交易盈亏",
     "到期日",
     "IV",
-    "单张Delta",
+]
+
+DIAGNOSE_POSITION_REPORT_COLUMNS = [
+    "日期",
+    "合约代码",
+    "合约名称",
+    "交易方向",
+    "总持仓张数",
+    "今日变化",
+    "最新价",
+    "持仓均价",
+    "持仓盈亏",
+    "交易盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
+    "到期日",
+    "IV",
     "单张Gamma",
     "单张Vega",
     "单张Theta",
 ]
 
+INTERNAL_RECONCILIATION_COLUMNS = {
+    "持仓盈亏",
+    "当日盯市交易盈亏",
+    "当日盈亏分解合计",
+    "当日盈亏对账差额",
+    "券商期权单日盈亏变化",
+    "券商对冲单日盈亏变化",
+    "券商总单日盈亏变化",
+    "期权单日DeltaPnL",
+    "期权单日GammaPnL",
+    "期权单日VegaPnL",
+    "期权单日ThetaPnL",
+    "期权单日GreeksPnL",
+    "对冲单日DeltaPnL",
+    "对冲单日GreeksPnL",
+    "GreeksPnL口径",
+    "GreeksPnL说明",
+    "GreeksPnL路径节点数",
+}
+
 DIAGNOSTIC_REPORT_COLUMNS = [
     "日期",
     "账户ID",
-    "总单日盈亏",
+    "券商总单日盈亏变化",
     "单日GreeksPnL",
     "Greeks解释残差",
     "GreeksPnL口径",
     "GreeksPnL说明",
     "GreeksPnL路径节点数",
+]
+
+DAILY_GREEKS_PNL_COLUMNS = [
+    "期权单日DeltaPnL",
+    "期权单日GammaPnL",
+    "期权单日VegaPnL",
+    "期权单日ThetaPnL",
+    "期权单日GreeksPnL",
+    "对冲单日DeltaPnL",
+    "对冲单日GreeksPnL",
+    "单日DeltaPnL",
+    "单日GammaPnL",
+    "单日VegaPnL",
+    "单日ThetaPnL",
+    "单日GreeksPnL",
 ]
 
 POSITION_COLUMNS = [
@@ -173,8 +260,6 @@ TRADE_COLUMNS = [
     "日期",
     "报单时间",
     "成交时间",
-    "成交时间(日)",
-    "策略名称",
 ]
 
 
@@ -202,6 +287,11 @@ def build_live_account_report(
     if persist_history:
         persist_account_report_history(product, account_id, payload)
     else:
+        payload["position_history"] = pd.DataFrame(
+            payload.get("position_rows", []),
+            columns=POSITION_COLUMNS,
+        )
+        _apply_current_pnl_decomposition(payload)
         payload["summary_history"] = _add_summary_greeks_pnl(
             pd.DataFrame(
                 [payload["summary"]],
@@ -210,10 +300,6 @@ def build_live_account_report(
             product=product,
         )
         _refresh_current_summary_from_history(payload)
-        payload["position_history"] = pd.DataFrame(
-            payload.get("position_rows", []),
-            columns=POSITION_COLUMNS,
-        )
     return payload
 
 
@@ -273,26 +359,6 @@ def calculate_live_account_report(
             account_id,
         )
     )
-    holding_rows = _holding_rows_from_export(
-        product,
-        account_id,
-        report_date_text,
-        market["chain_df"],
-        not_before=reset_at,
-    )
-    if holding_rows:
-        position_rows = holding_rows
-        option_value = _sum_row_values(holding_rows, "期权市值")
-        option_margin = _sum_row_values(holding_rows, "占用保证金")
-        option_pnl = _sum_row_values(holding_rows, "浮动盈亏")
-        export_greeks = _greeks_from_holding_export(
-            product,
-            report_date_text,
-            market["chain_df"],
-            not_before=reset_at,
-        )
-        if export_greeks is not None:
-            account_greeks = export_greeks
     hedge_rows = _hedge_rows_from_account(
         product,
         report_hedge,
@@ -322,6 +388,11 @@ def calculate_live_account_report(
     hedge_latest_price = (
         _number(hedge_rows[0].get("最新价")) if hedge_rows else None
     )
+    hedge_entry_price = (
+        _number(hedge_rows[0].get("持仓均价"))
+        if hedge_rows
+        else _number(report_hedge.entry_price)
+    )
     hedge_mark_price_type = _hedge_mark_price_type(report_date_text)
     hedge_unrealized_pnl = (
         _number(hedge_rows[0].get("浮动盈亏")) if hedge_rows else 0.0
@@ -349,7 +420,7 @@ def calculate_live_account_report(
         "期权市值": option_value,
         "期权保证金": option_margin,
         "对冲持仓": report_hedge.qty,
-        "对冲成本": report_hedge.entry_price,
+        "对冲成本": hedge_entry_price,
         "对冲最新价": hedge_latest_price,
         "对冲估值价": hedge_latest_price,
         "对冲估值价类型": hedge_mark_price_type,
@@ -412,6 +483,7 @@ def persist_account_report_history(product, account_id, payload):
         product=product,
     )
     payload["position_history"].to_csv(position_path, index=False, encoding="utf-8-sig")
+    _apply_current_pnl_decomposition(payload)
     payload["summary_history"] = _update_history_csv(
         summary_path,
         [payload["summary"]],
@@ -428,78 +500,267 @@ def persist_account_report_history(product, account_id, payload):
         payload["position_history"],
         product=product,
     )
+    _apply_current_pnl_decomposition_to_history(payload)
     payload["summary_history"].to_csv(summary_path, index=False, encoding="utf-8-sig")
     _refresh_current_summary_from_history(payload)
     return payload
 
 
-def write_live_account_report(product, payload, output_format="excel"):
+def write_live_account_report(product, payload, mode="default"):
+    _validate_report_mode(mode)
     stamp = storage.local_now_stamp()
     out_dir = storage.output_dir(product)
-    frames = _report_frames(payload)
+    frames = _daily_report_frames(payload, mode=mode)
     paths = {}
+    name_suffix = "_diagnose" if mode == "diagnose" else ""
 
-    if output_format not in {"excel", "csv", "both"}:
-        raise ValueError("output_format must be one of: excel, csv, both")
-
-    if output_format in {"excel", "both"}:
-        excel_path = out_dir / f"{stamp}_account_report.xlsx"
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            for sheet_name, frame in frames.items():
-                frame.to_excel(writer, sheet_name=sheet_name, index=False)
-        paths["excel"] = excel_path
-
-    if output_format in {"csv", "both"}:
-        csv_paths = {}
-        csv_names = {
-            "账户总体情况": "summary",
-            "持仓记录": "positions",
-            "当日交易记录": "trades",
-        }
-        for sheet_name, frame in frames.items():
-            csv_path = out_dir / f"{stamp}_account_report_{csv_names[sheet_name]}.csv"
-            frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
-            csv_paths[sheet_name] = csv_path
-        paths["csv"] = csv_paths
-
-    json_path = out_dir / f"{stamp}_account_report.json"
-    storage.write_json(json_path, _json_payload(payload))
-    paths["json"] = json_path
-    diagnostics_path = out_dir / f"{stamp}_account_report_diagnostics.csv"
-    _diagnostic_report_frame(payload).to_csv(
-        diagnostics_path,
-        index=False,
-        encoding="utf-8-sig",
+    total_path = out_dir / f"{stamp}_report{name_suffix}.xlsx"
+    _append_daily_frames_to_total_report(
+        total_path,
+        frames,
+        payload["date"],
+        start_date=_report_history_start_date(payload),
+        existing_path=_latest_total_report_path(
+            out_dir,
+            product,
+            mode=mode,
+            before_path=total_path,
+        ),
     )
-    paths["diagnostics"] = diagnostics_path
+    paths["total_excel"] = total_path
+
+    json_path = out_dir / f"{stamp}_daily{name_suffix}.json"
+    storage.write_json(json_path, _json_payload(payload, mode=mode))
+    paths["json"] = json_path
     return paths
 
 
-def _json_payload(payload):
+def _daily_report_frames(payload, mode="default"):
+    report_date = str(payload["date"])
+    frames = _report_frames(payload, mode=mode)
+    return {
+        sheet_name: _rows_for_report_date(frame, report_date)
+        for sheet_name, frame in frames.items()
+    }
+
+
+def _append_daily_frames_to_total_report(
+    path,
+    daily_frames,
+    report_date,
+    start_date=None,
+    existing_path=None,
+):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source_path = Path(existing_path) if existing_path is not None else path
+    existing = _read_report_workbook(source_path) if source_path.exists() else {}
+    combined = {}
+    for sheet_name, daily in daily_frames.items():
+        daily = daily.copy()
+        old = existing.get(sheet_name)
+        if old is None and sheet_name == "交易记录":
+            old = existing.get("当日交易记录")
+        if old is None:
+            old = pd.DataFrame(columns=daily.columns)
+        old = old.copy()
+        if sheet_name == "账户总体情况":
+            if "备注" not in daily.columns:
+                daily["备注"] = None
+            if "备注" not in old.columns:
+                old["备注"] = None
+            existing_remarks = old.loc[
+                _report_date_mask(old, report_date),
+                ["日期", "备注"],
+            ]
+            if not existing_remarks.empty and daily["备注"].isna().all():
+                daily.loc[:, "备注"] = existing_remarks.iloc[-1]["备注"]
+        old = old.reindex(columns=daily.columns)
+        if start_date is not None:
+            old = old.loc[_report_date_on_or_after_mask(old, start_date)]
+        old = old.loc[~_report_date_mask(old, report_date)]
+        frame = pd.concat([old, daily], ignore_index=True)
+        if start_date is not None:
+            frame = frame.loc[_report_date_on_or_after_mask(frame, start_date)]
+        combined[sheet_name] = _sort_report_frame(frame)
+    temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
+    with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
+        for sheet_name, frame in combined.items():
+            frame.to_excel(writer, sheet_name=sheet_name, index=False)
+        _format_account_report_workbook(writer.book)
+    temp_path.replace(path)
+
+
+def _format_account_report_workbook(workbook):
+    from openpyxl.utils import get_column_letter
+
+    money_headers = {
+        "估算权益",
+        "当日手续费",
+        "期权单日盈亏",
+        "ETF单日盈亏",
+        "总单日盈亏(手续费前)",
+        "净单日盈亏",
+        "持仓盈亏",
+        "交易盈亏",
+        "当日盯市交易盈亏",
+        "当日盈亏分解合计",
+        "当日盈亏对账差额",
+        "手续费",
+        "平仓盈亏",
+        "账户Delta",
+        "账户Gamma",
+        "账户Vega",
+        "账户Theta",
+        "单日DeltaPnL",
+        "单日GammaPnL",
+        "单日VegaPnL",
+        "单日ThetaPnL",
+        "单日GreeksPnL",
+        "单张Delta",
+        "单张Gamma",
+        "单张Vega",
+        "单张Theta",
+    }
+    price_headers = {"最新价", "持仓均价", "报单价格", "成交价格"}
+    integer_headers = {"序号", "总持仓张数", "今日变化", "成交数量"}
+    percent_headers = {"IV"}
+
+    for worksheet in workbook.worksheets:
+        worksheet.freeze_panes = "A2"
+        headers = {
+            cell.column: str(cell.value or "")
+            for cell in worksheet[1]
+        }
+        for column_index, header in headers.items():
+            if header in money_headers:
+                number_format = "#,##0.00;-#,##0.00;0.00"
+            elif header in price_headers:
+                number_format = "0.00000;-0.00000;0.00000"
+            elif header in integer_headers:
+                number_format = "#,##0;-#,##0;0"
+            elif header in percent_headers:
+                number_format = "0.00%;-0.00%;0.00%"
+            else:
+                number_format = None
+            if number_format is not None:
+                for row_index in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row_index, column_index).number_format = number_format
+
+            max_length = len(header)
+            for row_index in range(2, worksheet.max_row + 1):
+                value = worksheet.cell(row_index, column_index).value
+                if value is not None:
+                    max_length = max(max_length, len(str(value)))
+            if header == "备注":
+                width = 28
+            elif header in {"成交编号", "投资者账号", "合约名称"}:
+                width = min(max(max_length + 2, 14), 32)
+            elif header == "总单日盈亏(手续费前)":
+                width = 20
+            else:
+                width = min(max(max_length + 2, 11), 18)
+            worksheet.column_dimensions[get_column_letter(column_index)].width = width
+
+
+def _latest_total_report_path(out_dir, product, mode="default", before_path=None):
+    out_dir = Path(out_dir)
+    name_suffix = "_diagnose" if mode == "diagnose" else ""
+    before_path = Path(before_path) if before_path is not None else None
+    candidates = [
+        path
+        for path in out_dir.glob(f"????????_??????_report{name_suffix}.xlsx")
+        if before_path is None or path != before_path
+    ]
+    if candidates:
+        return max(candidates, key=lambda path: path.name)
+    legacy_path = out_dir / f"{product}_account_report_total{name_suffix}.xlsx"
+    return legacy_path if legacy_path.exists() else None
+
+
+def _read_report_workbook(path):
+    with pd.ExcelFile(path) as workbook:
+        return {
+            sheet_name: workbook.parse(sheet_name=sheet_name)
+            for sheet_name in workbook.sheet_names
+        }
+
+
+def _rows_for_report_date(frame, report_date):
+    if frame.empty or "日期" not in frame.columns:
+        return frame.copy()
+    return frame.loc[_report_date_mask(frame, report_date)].reset_index(drop=True)
+
+
+def _report_date_mask(frame, report_date):
+    if frame.empty or "日期" not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    dates = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return dates.eq(str(report_date))
+
+
+def _report_date_on_or_after_mask(frame, start_date):
+    if frame.empty or "日期" not in frame.columns:
+        return pd.Series(True, index=frame.index)
+    dates = pd.to_datetime(frame["日期"], errors="coerce")
+    return dates.ge(pd.Timestamp(start_date).normalize())
+
+
+def _report_history_start_date(payload):
+    history = payload.get("summary_history")
+    if not isinstance(history, pd.DataFrame) or history.empty or "日期" not in history:
+        return payload.get("date")
+    dates = pd.to_datetime(history["日期"], errors="coerce").dropna()
+    return str(dates.min().date()) if not dates.empty else payload.get("date")
+
+
+def _sort_report_frame(frame):
+    if frame.empty or "日期" not in frame.columns:
+        return frame.reset_index(drop=True)
+    result = frame.copy()
+    result["_report_sort_date"] = pd.to_datetime(result["日期"], errors="coerce")
+    result = result.sort_values("_report_sort_date", kind="stable")
+    return result.drop(columns=["_report_sort_date"]).reset_index(drop=True)
+
+
+def _json_payload(payload, mode="default"):
+    _validate_report_mode(mode)
     result = dict(payload)
     result.pop("current_chain_metadata", None)
     for key in ["summary_history", "position_history"]:
         value = result.get(key)
         if isinstance(value, pd.DataFrame):
             result[key] = value.to_dict("records")
+    if mode == "default":
+        result["summary"] = _without_internal_reconciliation_fields(
+            result.get("summary")
+        )
+        result["summary_history"] = [
+            _without_internal_reconciliation_fields(row)
+            for row in result.get("summary_history", [])
+        ]
     return result
 
 
-def format_terminal_summary(payload):
+def format_terminal_summary(payload, mode="default"):
+    _validate_report_mode(mode)
     summary = payload["summary"]
+    position_report = _position_report_frame(payload)
+    pnl_decomposition = _position_pnl_totals(position_report)
     lines = [
         (
             f"账户报告={payload['product']}/{payload['account_id']} "
-            f"日期={payload['date']} 标的价格={_fmt(payload['spot'])}"
+            f"模式={mode} 日期={payload['date']} 标的价格={_fmt(payload['spot'])}"
         ),
         (
             f"现金={_fmt(summary['现金'])} "
             f"估算权益={_fmt(summary['估算权益'])}"
         ),
         (
-            f"期权单日盈亏={_fmt(summary.get('券商期权单日盈亏变化'))} "
-            f"ETF单日盈亏={_fmt(summary.get('券商对冲单日盈亏变化'))} "
-            f"总单日盈亏={_fmt(summary.get('券商总单日盈亏变化'))} "
+            f"期权单日盈亏={_fmt(pnl_decomposition['option_daily_pnl'])} "
+            f"ETF单日盈亏={_fmt(pnl_decomposition['etf_daily_pnl'])} "
+            f"总单日盈亏(手续费前)={_fmt(pnl_decomposition['daily_pnl_decomposition'])} "
+            f"净单日盈亏={_fmt(_net_daily_pnl(pnl_decomposition['daily_pnl_decomposition'], summary.get('当日手续费')))} "
             f"当日手续费={_fmt(summary.get('当日手续费'))}"
         ),
         (
@@ -516,16 +777,30 @@ def format_terminal_summary(payload):
             f"Vega={_fmt(summary.get('单日VegaPnL'))} "
             f"Theta={_fmt(summary.get('单日ThetaPnL'))}"
         ),
-        "",
-        "持仓记录",
     ]
+    if mode == "diagnose":
+        lines.extend(
+            [
+                (
+                    f"持仓盈亏={_fmt(pnl_decomposition['holding_pnl'])} "
+                    f"交易盈亏(成本口径)={_fmt(pnl_decomposition['realized_cost_pnl'])} "
+                    f"当日盯市交易盈亏={_fmt(pnl_decomposition['mark_to_market_trade_pnl'])} "
+                    f"当日盈亏分解合计={_fmt(pnl_decomposition['daily_pnl_decomposition'])}"
+                ),
+                (
+                    f"券商差分总单日盈亏={_fmt(_broker_daily_pnl(summary))} "
+                    f"对账差额={_fmt(_broker_reconciliation_difference(summary, pnl_decomposition))}"
+                ),
+            ]
+        )
+    lines.extend(["", "持仓记录"])
     lines.extend(
         _plain_table(
-            _position_report_frame(payload).to_dict("records"),
-            ["交易方向", "合约代码", "合约名称", "总持仓张数", "今日变化", "最新价", "持仓均价", "IV", "单张Delta"],
+            position_report.to_dict("records"),
+            ["交易方向", "合约代码", "合约名称", "总持仓张数", "今日变化", "最新价", "持仓均价", "IV"],
         )
     )
-    lines.extend(["", "当日交易记录"])
+    lines.extend(["", "交易记录"])
     lines.extend(
         _plain_table(
             payload["trade_rows"],
@@ -535,22 +810,210 @@ def format_terminal_summary(payload):
     return lines
 
 
-def _report_frames(payload):
+def _report_frames(payload, mode="default"):
+    _validate_report_mode(mode)
+    position_report = _position_report_frame(payload)
     return {
-        "账户总体情况": _summary_report_frame(payload["summary_history"]),
-        "持仓记录": _position_report_frame(payload),
-        "当日交易记录": _frame(payload["trade_rows"], TRADE_COLUMNS),
+        "账户总体情况": _summary_report_frame(
+            payload["summary_history"],
+            position_report=position_report,
+            report_date=payload.get("date"),
+            mode=mode,
+        ),
+        "持仓记录": position_report.reindex(
+            columns=(
+                DIAGNOSE_POSITION_REPORT_COLUMNS
+                if mode == "diagnose"
+                else DEFAULT_POSITION_REPORT_COLUMNS
+            )
+        ),
+        "交易记录": _frame(payload["trade_rows"], TRADE_COLUMNS),
     }
 
 
-def _summary_report_frame(summary_history):
+def _summary_report_frame(
+    summary_history,
+    position_report=None,
+    report_date=None,
+    mode="default",
+):
+    _validate_report_mode(mode)
+    report_columns = (
+        DIAGNOSE_SUMMARY_REPORT_COLUMNS
+        if mode == "diagnose"
+        else DEFAULT_SUMMARY_REPORT_COLUMNS
+    )
     if summary_history is None:
-        return pd.DataFrame(columns=SUMMARY_REPORT_COLUMNS)
+        return pd.DataFrame(columns=report_columns)
     frame = summary_history.copy()
-    frame["期权单日盈亏"] = frame.get("券商期权单日盈亏变化")
-    frame["ETF单日盈亏"] = frame.get("券商对冲单日盈亏变化")
-    frame["总单日盈亏"] = frame.get("券商总单日盈亏变化")
-    return frame.reindex(columns=SUMMARY_REPORT_COLUMNS)
+    frame["期权单日盈亏"] = _prefer_numeric_column(
+        frame,
+        "期权单日盈亏",
+        "券商期权单日盈亏变化",
+    )
+    frame["ETF单日盈亏"] = _prefer_numeric_column(
+        frame,
+        "ETF单日盈亏",
+        "券商对冲单日盈亏变化",
+    )
+    frame["总单日盈亏"] = _prefer_numeric_column(
+        frame,
+        "总单日盈亏",
+        "券商总单日盈亏变化",
+    )
+    frame["净单日盈亏"] = pd.to_numeric(
+        frame["总单日盈亏"],
+        errors="coerce",
+    ) - pd.to_numeric(frame.get("当日手续费"), errors="coerce").fillna(0.0)
+    if isinstance(position_report, pd.DataFrame) and not position_report.empty:
+        report_date = str(report_date)
+        current_mask = frame["日期"].astype(str).eq(report_date)
+        totals = _position_pnl_totals(position_report)
+        actual_total = pd.to_numeric(
+            frame.loc[current_mask, "总单日盈亏"],
+            errors="coerce",
+        )
+        frame.loc[current_mask, "持仓盈亏"] = totals["holding_pnl"]
+        frame.loc[current_mask, "交易盈亏"] = totals["realized_cost_pnl"]
+        frame.loc[current_mask, "当日盯市交易盈亏"] = totals[
+            "mark_to_market_trade_pnl"
+        ]
+        frame.loc[current_mask, "当日盈亏分解合计"] = totals[
+            "daily_pnl_decomposition"
+        ]
+        frame.loc[current_mask, "当日盈亏对账差额"] = (
+            actual_total - totals["daily_pnl_decomposition"]
+        )
+    frame["总单日盈亏(手续费前)"] = frame["总单日盈亏"]
+    return frame.reindex(columns=report_columns)
+
+
+def _apply_current_pnl_decomposition(payload):
+    totals = _position_pnl_totals(_position_report_frame(payload))
+    actual_total = _number(payload["summary"].get("总单日盈亏"))
+    payload["summary"].update(
+        {
+            "持仓盈亏": totals["holding_pnl"],
+            "交易盈亏": totals["realized_cost_pnl"],
+            "当日盯市交易盈亏": totals["mark_to_market_trade_pnl"],
+            "当日盈亏分解合计": totals["daily_pnl_decomposition"],
+            "当日盈亏对账差额": (
+                None
+                if actual_total is None
+                else actual_total - totals["daily_pnl_decomposition"]
+            ),
+        }
+    )
+    return totals
+
+
+def _prefer_numeric_column(frame, preferred, fallback):
+    preferred_values = (
+        pd.to_numeric(frame[preferred], errors="coerce")
+        if preferred in frame.columns
+        else pd.Series(np.nan, index=frame.index)
+    )
+    fallback_values = (
+        pd.to_numeric(frame[fallback], errors="coerce")
+        if fallback in frame.columns
+        else pd.Series(np.nan, index=frame.index)
+    )
+    return preferred_values.combine_first(fallback_values)
+
+
+def _position_pnl_totals(position_report):
+    holding_pnl = _sum_numeric_column(position_report, "持仓盈亏")
+    realized_cost_pnl = _sum_numeric_column(position_report, "交易盈亏")
+    mark_to_market_trade_pnl = _sum_numeric_column(
+        position_report,
+        "当日盯市交易盈亏",
+    )
+    daily_by_row = (
+        pd.to_numeric(position_report.get("当日盈亏分解合计"), errors="coerce")
+        .fillna(0.0)
+    )
+    option_mask = position_report.get("到期日").notna()
+    option_daily_pnl = float(daily_by_row.loc[option_mask].sum())
+    etf_daily_pnl = float(daily_by_row.loc[~option_mask].sum())
+    return {
+        "holding_pnl": holding_pnl,
+        "realized_cost_pnl": realized_cost_pnl,
+        "mark_to_market_trade_pnl": mark_to_market_trade_pnl,
+        "daily_pnl_decomposition": holding_pnl + mark_to_market_trade_pnl,
+        "option_daily_pnl": option_daily_pnl,
+        "etf_daily_pnl": etf_daily_pnl,
+    }
+
+
+def _sum_numeric_column(frame, column):
+    if column not in frame.columns:
+        return 0.0
+    return float(pd.to_numeric(frame[column], errors="coerce").fillna(0.0).sum())
+
+
+def _net_daily_pnl(gross_pnl, daily_fee):
+    if isinstance(daily_fee, pd.Series):
+        return float(gross_pnl) - pd.to_numeric(
+            daily_fee,
+            errors="coerce",
+        ).fillna(0.0)
+    return float(gross_pnl) - float(_number(daily_fee) or 0.0)
+
+
+def _apply_current_pnl_decomposition_to_history(payload):
+    history = payload.get("summary_history")
+    if history is None or history.empty:
+        return
+    mask = (
+        history["日期"].astype(str).eq(str(payload["date"]))
+        & history["账户ID"].astype(str).eq(str(payload["account_id"]))
+    )
+    if not mask.any():
+        return
+
+    totals = _position_pnl_totals(_position_report_frame(payload))
+    actual_total = _number(history.loc[mask].iloc[-1].get("总单日盈亏"))
+    values = {
+        "持仓盈亏": totals["holding_pnl"],
+        "交易盈亏": totals["realized_cost_pnl"],
+        "当日盯市交易盈亏": totals["mark_to_market_trade_pnl"],
+        "当日盈亏分解合计": totals["daily_pnl_decomposition"],
+        "当日盈亏对账差额": (
+            None
+            if actual_total is None
+            else actual_total - totals["daily_pnl_decomposition"]
+        ),
+    }
+    for column, value in values.items():
+        history.loc[mask, column] = value
+
+
+def _validate_report_mode(mode):
+    if mode not in REPORT_MODES:
+        raise ValueError("mode must be one of: default, diagnose")
+
+
+def _without_internal_reconciliation_fields(row):
+    if not isinstance(row, dict):
+        return row
+    return {
+        key: value
+        for key, value in row.items()
+        if key not in INTERNAL_RECONCILIATION_COLUMNS
+    }
+
+
+def _broker_reconciliation_difference(summary, pnl_decomposition):
+    broker_total = _broker_daily_pnl(summary)
+    if broker_total is None:
+        return None
+    return broker_total - pnl_decomposition["daily_pnl_decomposition"]
+
+
+def _broker_daily_pnl(summary):
+    if str(summary.get("GreeksPnL说明") or "") == "first_history_row":
+        return None
+    return _number(summary.get("券商总单日盈亏变化"))
 
 
 def _diagnostic_report_frame(payload):
@@ -559,8 +1022,10 @@ def _diagnostic_report_frame(payload):
         return pd.DataFrame(columns=DIAGNOSTIC_REPORT_COLUMNS)
     frame = history.copy()
     actual = pd.to_numeric(frame.get("券商总单日盈亏变化"), errors="coerce")
+    if "GreeksPnL说明" in frame.columns:
+        actual = actual.mask(frame["GreeksPnL说明"].astype(str).eq("first_history_row"))
     greeks = pd.to_numeric(frame.get("单日GreeksPnL"), errors="coerce")
-    frame["总单日盈亏"] = actual
+    frame["券商总单日盈亏变化"] = actual
     frame["Greeks解释残差"] = actual - greeks
     return frame.reindex(columns=DIAGNOSTIC_REPORT_COLUMNS)
 
@@ -570,7 +1035,7 @@ def _position_report_frame(payload):
     if not isinstance(history, pd.DataFrame):
         history = _frame(payload.get("position_rows", []), POSITION_COLUMNS)
     if history.empty:
-        return pd.DataFrame(columns=POSITION_REPORT_COLUMNS)
+        return pd.DataFrame(columns=DIAGNOSE_POSITION_REPORT_COLUMNS)
 
     report_date = str(payload["date"])
     dates = history["日期"].astype(str)
@@ -615,7 +1080,7 @@ def _position_report_frame(payload):
                 trade_rows,
             )
         )
-    return pd.DataFrame(rows, columns=POSITION_REPORT_COLUMNS)
+    return pd.DataFrame(rows, columns=DIAGNOSE_POSITION_REPORT_COLUMNS)
 
 
 def _position_report_row(payload, code, current_rows, previous_rows, trade_rows):
@@ -646,6 +1111,20 @@ def _position_report_row(payload, code, current_rows, previous_rows, trade_rows)
     holding_cost = _weighted_position_value(cost_rows, "持仓均价")
     if holding_cost is None:
         holding_cost = _weighted_trade_open_price(trade_rows)
+    multiplier = _number(metadata.get("contract_multiplier")) if is_option else 1.0
+    pnl_breakdown = _daily_position_pnl_breakdown(
+        current_qty=current_qty,
+        current_side=side,
+        current_price=latest_price,
+        previous_qty=previous_qty,
+        previous_side=_first_value(previous_rows, "方向"),
+        previous_price=_first_value(previous_rows, "最新价"),
+        previous_cost=_weighted_position_value(previous_rows, "持仓均价"),
+        trade_rows=trade_rows,
+        multiplier=multiplier or 1.0,
+    )
+    if pnl_breakdown["ending_cost"] is not None and current_qty != 0:
+        holding_cost = pnl_breakdown["ending_cost"]
     contract_name = metadata.get("contract_symbol")
     if contract_name is None:
         contract_name = _first_value(current_rows, "合约名称")
@@ -674,8 +1153,10 @@ def _position_report_row(payload, code, current_rows, previous_rows, trade_rows)
         "今日变化": current_qty - previous_qty,
         "最新价": latest_price,
         "持仓均价": holding_cost,
-        "持仓盈亏": None,
-        "交易盈亏": None,
+        "持仓盈亏": pnl_breakdown["holding_pnl"],
+        "交易盈亏": pnl_breakdown["realized_cost_pnl"],
+        "当日盯市交易盈亏": pnl_breakdown["mark_to_market_trade_pnl"],
+        "当日盈亏分解合计": pnl_breakdown["daily_pnl_decomposition"],
         "到期日": metadata.get("maturity_date") if is_option else None,
         "IV": metadata.get("iv") if is_option else None,
         "单张Delta": single_delta,
@@ -683,6 +1164,150 @@ def _position_report_row(payload, code, current_rows, previous_rows, trade_rows)
         "单张Vega": single_vega,
         "单张Theta": single_theta,
     }
+
+
+def _daily_position_pnl_breakdown(
+    current_qty,
+    current_side,
+    current_price,
+    previous_qty,
+    previous_side,
+    previous_price,
+    previous_cost,
+    trade_rows,
+    multiplier,
+):
+    current_price = _number(current_price)
+    previous_price = _number(previous_price)
+    previous_cost = _number(previous_cost)
+    multiplier = float(_number(multiplier) or 1.0)
+    old_signed_qty = _signed_position_qty(previous_qty, previous_side)
+    total_signed_qty = old_signed_qty
+    total_cost = previous_cost
+    new_signed_qty = 0.0
+    new_cost = None
+    realized_cost_pnl = 0.0
+    mark_to_market_trade_pnl = 0.0
+
+    for trade in sorted(trade_rows, key=_trade_sort_key):
+        trade_qty = float(_number(trade.get("成交数量")) or 0.0)
+        trade_price = _number(trade.get("成交价格"))
+        trade_signed_qty = _trade_signed_position_qty(trade)
+        if trade_qty <= 0 or trade_price is None or trade_signed_qty == 0:
+            continue
+
+        if total_signed_qty != 0 and total_signed_qty * trade_signed_qty < 0:
+            close_qty = min(abs(total_signed_qty), abs(trade_signed_qty))
+            if total_cost is not None:
+                realized_cost_pnl += (
+                    close_qty
+                    * (trade_price - total_cost)
+                    * np.sign(total_signed_qty)
+                    * multiplier
+                )
+
+            remaining_close = close_qty
+            if old_signed_qty != 0 and old_signed_qty * trade_signed_qty < 0:
+                old_close = min(abs(old_signed_qty), remaining_close)
+                if previous_price is not None:
+                    mark_to_market_trade_pnl += (
+                        old_close
+                        * (trade_price - previous_price)
+                        * np.sign(old_signed_qty)
+                        * multiplier
+                    )
+                old_signed_qty -= np.sign(old_signed_qty) * old_close
+                remaining_close -= old_close
+            if (
+                remaining_close > 0
+                and new_signed_qty != 0
+                and new_signed_qty * trade_signed_qty < 0
+            ):
+                new_close = min(abs(new_signed_qty), remaining_close)
+                if new_cost is not None:
+                    mark_to_market_trade_pnl += (
+                        new_close
+                        * (trade_price - new_cost)
+                        * np.sign(new_signed_qty)
+                        * multiplier
+                    )
+                new_signed_qty -= np.sign(new_signed_qty) * new_close
+
+            total_signed_qty -= np.sign(total_signed_qty) * close_qty
+            trade_signed_qty += np.sign(trade_signed_qty) * -close_qty
+            if abs(total_signed_qty) <= 1e-9:
+                total_signed_qty = 0.0
+                total_cost = None
+            if abs(new_signed_qty) <= 1e-9:
+                new_signed_qty = 0.0
+                new_cost = None
+
+        if abs(trade_signed_qty) > 1e-9:
+            total_cost = _weighted_signed_cost(
+                total_signed_qty,
+                total_cost,
+                trade_signed_qty,
+                trade_price,
+            )
+            total_signed_qty += trade_signed_qty
+            new_cost = _weighted_signed_cost(
+                new_signed_qty,
+                new_cost,
+                trade_signed_qty,
+                trade_price,
+            )
+            new_signed_qty += trade_signed_qty
+
+    holding_pnl = 0.0
+    if current_price is not None:
+        if old_signed_qty != 0 and previous_price is not None:
+            holding_pnl += (
+                abs(old_signed_qty)
+                * (current_price - previous_price)
+                * np.sign(old_signed_qty)
+                * multiplier
+            )
+    expected_signed_qty = _signed_position_qty(current_qty, current_side)
+    ending_cost = total_cost if abs(total_signed_qty - expected_signed_qty) <= 1e-6 else None
+    return {
+        "holding_pnl": holding_pnl,
+        "realized_cost_pnl": realized_cost_pnl,
+        "mark_to_market_trade_pnl": mark_to_market_trade_pnl,
+        "daily_pnl_decomposition": holding_pnl + mark_to_market_trade_pnl,
+        "ending_cost": ending_cost,
+    }
+
+
+def _signed_position_qty(qty, side):
+    qty = float(_number(qty) or 0.0)
+    return -abs(qty) if str(side or "").lower() == "short" else qty
+
+
+def _trade_signed_position_qty(trade):
+    qty = float(_number(trade.get("成交数量")) or 0.0)
+    return -qty if "卖" in str(trade.get("买卖") or "") else qty
+
+
+def _weighted_signed_cost(current_qty, current_cost, added_qty, added_price):
+    if abs(added_qty) <= 1e-9:
+        return current_cost
+    if abs(current_qty) <= 1e-9 or current_cost is None:
+        return float(added_price)
+    if current_qty * added_qty <= 0:
+        return current_cost
+    return (
+        abs(current_qty) * float(current_cost) + abs(added_qty) * float(added_price)
+    ) / (abs(current_qty) + abs(added_qty))
+
+
+def _trade_sort_key(row):
+    return str(
+        row.get("成交时间(日)")
+        or row.get("成交时间")
+        or row.get("报单时间")
+        or row.get("成交编号")
+        or ""
+    )
 
 
 def _rows_total_qty(rows):
@@ -759,12 +1384,6 @@ def _position_rows_from_account(live_account, chain_df, report_date, account_id)
             call_row, put_row = core.vol_engine.resolve_position_pair(position, chain_df)
         except IndexError:
             continue
-        call_row, put_row = _apply_account_position_mark(
-            position,
-            call_row,
-            put_row,
-            report_date,
-        )
 
         current_value = core.position.value(position, call_row, put_row)
         signed_value = core.position.signed_value(position, call_row, put_row)
@@ -833,11 +1452,6 @@ def _option_hedge_rows_from_account(position, chain_df, report_date, account_id)
     if matches.empty:
         return [], None, 0.0, 0.0, 0.0
     row = matches.iloc[0].copy()
-    mark_date = _date_or_none(position.get("last_mark_date"))
-    report_ts = _date_or_none(report_date)
-    last_price = _number(position.get("last_price"))
-    if last_price is not None and mark_date is not None and report_ts is not None and mark_date <= report_ts:
-        row["mid"] = last_price
 
     side = position.get("side", "short")
     qty = int(position.get("qty", 0) or 0)
@@ -946,133 +1560,6 @@ def _position_total_delta(single_delta, qty, multiplier):
     return single_delta * qty * multiplier
 
 
-def _apply_account_position_mark(position, call_row, put_row, report_date):
-    mark_date = _date_or_none(position.get("last_mark_date"))
-    report_ts = _date_or_none(report_date)
-    if mark_date is None or report_ts is None or mark_date > report_ts:
-        return call_row, put_row
-
-    call_price = _number(position.get("last_call_price"))
-    put_price = _number(position.get("last_put_price"))
-    if call_price is None and put_price is None:
-        return call_row, put_row
-
-    call_result = call_row.copy()
-    put_result = put_row.copy()
-    if call_price is not None:
-        call_result["mid"] = call_price
-    if put_price is not None:
-        put_result["mid"] = put_price
-    return call_result, put_result
-
-
-def _holding_rows_from_export(product, account_id, report_date, chain_df, not_before=None):
-    path = _latest_export_file("实时持仓", report_date, not_before=not_before)
-    if path is None:
-        return []
-    df = _read_export_csv(path)
-    if df.empty:
-        return []
-    chain_meta = _chain_metadata(chain_df)
-    rows = []
-    for _, item in df.iterrows():
-        code = str(item.get("合约代码", "")).strip()
-        meta = chain_meta.get(code, {})
-        side = _side_from_holding(item)
-        qty = _number(item.get("总持仓"))
-        single_delta = _single_option_delta_from_chain(meta, side)
-        rows.append(
-            {
-                "日期": report_date,
-                "账户ID": account_id,
-                "方向": side,
-                "合约代码": code,
-                "合约名称": item.get("合约名称"),
-                "买卖": _clean_text(item.get("买卖")),
-                "持仓类型": item.get("持仓类型"),
-                "总持仓": qty,
-                "今持仓": _number(item.get("今持仓")),
-                "今开仓": _number(item.get("今开仓")),
-                "今平仓": _number(item.get("今平仓")),
-                "可平量": _number(item.get("可平量")),
-                "最新价": _number(item.get("最新价")),
-                "持仓均价": _number(item.get("持仓均价")),
-                "开仓均价": _number(item.get("开仓均价")),
-                "期权市值": _number(item.get("期权市值")),
-                "占用保证金": _number(item.get("占用保证金")),
-                "持仓盈亏": _number(item.get("持仓盈亏")),
-                "浮动盈亏": _number(item.get("浮动盈亏")),
-                "行权价": meta.get("strike_price"),
-                "到期日": meta.get("maturity_date"),
-                "剩余天数": meta.get("dte"),
-                "IV": meta.get("iv"),
-                "单张Delta": single_delta,
-                "Delta": _position_total_delta(
-                    single_delta,
-                    qty,
-                    meta.get("contract_multiplier"),
-                ),
-                "Gamma": meta.get("gamma"),
-                "Vega": meta.get("vega"),
-                "Theta": meta.get("theta"),
-            }
-        )
-    return rows
-
-
-def _greeks_from_holding_export(product, report_date, chain_df, not_before=None):
-    path = _latest_export_file("实时持仓", report_date, not_before=not_before)
-    if path is None:
-        return None
-    df = _read_export_csv(path)
-    if df.empty:
-        return None
-
-    chain_by_code = {
-        str(row.get("order_book_id")): row
-        for _, row in chain_df.iterrows()
-    }
-    grouped = {}
-    for _, item in df.iterrows():
-        code = str(item.get("合约代码", "")).strip()
-        chain_row = chain_by_code.get(code)
-        if chain_row is None:
-            continue
-        qty = int(_number(item.get("总持仓")) or 0)
-        if qty <= 0:
-            continue
-        option_type = str(chain_row.get("option_type", "")).upper()
-        leg = "call" if option_type == "C" else "put" if option_type == "P" else None
-        if leg is None:
-            continue
-        key = (
-            _side_from_holding(item),
-            float(chain_row.get("strike_price")),
-            str(pd.Timestamp(chain_row.get("maturity_date")).date()),
-        )
-        grouped.setdefault(key, {})[leg] = {
-            "row": chain_row,
-            "qty": qty,
-        }
-
-    greeks_list = []
-    for (side, _, _), legs in grouped.items():
-        if "call" not in legs or "put" not in legs:
-            continue
-        greeks_list.append(
-            core.strategy.calc_position_greeks(
-                legs["call"]["row"],
-                legs["put"]["row"],
-                legs["call"]["qty"],
-                legs["put"]["qty"],
-                side=side,
-            )
-        )
-    if not greeks_list:
-        return None
-    return core.backtester.combine_greeks(greeks_list)
-
-
 def _hedge_for_report_date(live_account, product, account_id, report_date):
     report_ts = pd.Timestamp(report_date).normalize()
     fills = account_store.list_fills(
@@ -1090,7 +1577,6 @@ def _hedge_for_report_date(live_account, product, account_id, report_date):
             "delta_hedge",
             "rebalance_hedge",
             "close_hedge",
-            "hedge_mark_update",
         }:
             continue
         has_hedge_fill = True
@@ -1098,28 +1584,12 @@ def _hedge_for_report_date(live_account, product, account_id, report_date):
         if fill_date is None or fill_date > report_ts:
             continue
         saw_hedge_fill = True
-        if action == "hedge_mark_update":
-            if hedge is None:
-                continue
-            hedge.latest_price = _number(payload.get("latest_price"))
-            hedge.last_market_value = _number(payload.get("market_value"))
-            hedge.last_unrealized_pnl = _number(payload.get("unrealized_pnl"))
-            hedge.last_mark_date = payload.get("date")
-            hedge.last_mark_source_file = payload.get("holding_source_file")
-            hedge.last_mark_source_timestamp = payload.get("source_timestamp")
-        else:
-            hedge = account_store.HedgeState(
-                qty=float(payload.get("qty", payload.get("new_etf_qty", payload.get("target_hedge_qty", 0.0))) or 0.0),
-                entry_price=float(payload.get("entry_price", payload.get("price", 0.0)) or 0.0),
-                margin=float(payload.get("margin", 0.0) or 0.0),
-                underlying_order_book_id=payload.get("underlying_order_book_id"),
-                latest_price=_number(payload.get("latest_price")),
-                last_market_value=_number(payload.get("market_value")),
-                last_unrealized_pnl=_number(payload.get("unrealized_pnl")),
-                last_mark_date=payload.get("date"),
-                last_mark_source_file=payload.get("holding_source_file"),
-                last_mark_source_timestamp=payload.get("source_timestamp"),
-            )
+        hedge = account_store.HedgeState(
+            qty=float(payload.get("qty", payload.get("new_etf_qty", payload.get("target_hedge_qty", 0.0))) or 0.0),
+            entry_price=float(payload.get("entry_price", payload.get("price", 0.0)) or 0.0),
+            margin=float(payload.get("margin", 0.0) or 0.0),
+            underlying_order_book_id=payload.get("underlying_order_book_id"),
+        )
     if saw_hedge_fill:
         return hedge or account_store.HedgeState()
     if has_hedge_fill:
@@ -1139,47 +1609,31 @@ def _hedge_rows_from_account(
     if abs(float(hedge.qty or 0.0)) <= 1e-9:
         return []
 
-    export_row = _security_holding_export_row(product, report_date, not_before=not_before)
-    mark_with_spot = (
-        export_row is None
-        and prefer_spot_mark
-        and _can_mark_hedge_with_spot(product, hedge)
-    )
-    if export_row is not None:
-        latest_price = _number(export_row.get("最新价"))
-    elif mark_with_spot:
+    mark_with_spot = _can_mark_hedge_with_spot(product, hedge)
+    if mark_with_spot:
         latest_price = float(spot)
     else:
         latest_price = hedge.latest_price
     if latest_price is None:
         latest_price = float(spot)
     qty = float(hedge.qty)
-    if export_row is not None:
-        market_value = _number(export_row.get("市值"))
-    elif mark_with_spot:
-        market_value = None
-    else:
-        market_value = hedge.last_market_value
+    market_value = None if mark_with_spot else hedge.last_market_value
     if market_value is None:
         market_value = qty * latest_price
-    if export_row is not None:
-        floating_pnl = _number(export_row.get("浮动盈亏"))
-    elif mark_with_spot:
-        floating_pnl = None
-    else:
-        floating_pnl = hedge.last_unrealized_pnl
+    entry_price = _hedge_open_cost_for_report(
+        product,
+        account_id,
+        report_date,
+    )
+    if entry_price is None:
+        entry_price = hedge.entry_price
+    floating_pnl = None
+    if (_number(entry_price) or 0.0) > 0:
+        floating_pnl = core.hedge.calc_unrealized_pnl(qty, entry_price, latest_price)
     if floating_pnl is None:
-        floating_pnl = core.hedge.calc_unrealized_pnl(qty, hedge.entry_price, latest_price)
-    security_code = (
-        _security_code(export_row.get("证券代码"))
-        if export_row is not None
-        else _security_code_from_underlying(hedge.underlying_order_book_id)
-    )
-    security_name = (
-        export_row.get("证券名称")
-        if export_row is not None
-        else hedge.underlying_order_book_id
-    )
+        floating_pnl = 0.0
+    security_code = _security_code_from_underlying(hedge.underlying_order_book_id)
+    security_name = hedge.underlying_order_book_id
     return [
         {
             "日期": report_date,
@@ -1190,13 +1644,13 @@ def _hedge_rows_from_account(
             "买卖": "买" if qty > 0 else "卖",
             "持仓类型": "ETF对冲",
             "总持仓": qty,
-            "今持仓": _number(export_row.get("持有数量")) if export_row is not None else None,
+            "今持仓": None,
             "今开仓": None,
             "今平仓": None,
-            "可平量": _number(export_row.get("可用数量")) if export_row is not None else None,
+            "可平量": None,
             "最新价": latest_price,
-            "持仓均价": hedge.entry_price,
-            "开仓均价": hedge.entry_price,
+            "持仓均价": entry_price,
+            "开仓均价": entry_price,
             "期权市值": market_value,
             "占用保证金": hedge.margin,
             "持仓盈亏": floating_pnl,
@@ -1228,31 +1682,7 @@ def _can_mark_hedge_with_spot(product, hedge):
     }
 
 
-def _security_holding_export_row(product, report_date, not_before=None):
-    path = _latest_export_file("证券持仓查询", report_date, not_before=not_before)
-    if path is None:
-        return None
-    df = _read_export_csv(path)
-    target_code = _product_security_code(product)
-    rows = []
-    for _, row in df.iterrows():
-        code = _security_code(row.get("证券代码"))
-        if target_code is not None and code != target_code:
-            continue
-        qty = _number(row.get("持有数量")) or 0.0
-        if qty > 0:
-            rows.append(row)
-    if not rows:
-        return None
-    return rows[0]
-
-
 def _hedge_unrealized_pnl_for_report(product, qty, entry_price, spot, report_date):
-    export_row = _security_holding_export_row(product, report_date)
-    if export_row is not None:
-        broker_pnl = _number(export_row.get("浮动盈亏"))
-        if broker_pnl is not None:
-            return broker_pnl
     return core.hedge.calc_unrealized_pnl(qty, entry_price, spot)
 
 
@@ -1386,9 +1816,9 @@ def _trade_rows_from_summary_file(path, product):
                     "平仓盈亏": realized_pnl,
                     "类型": "期权",
                     "日期": trade_date,
-                    "报单时间": None,
-                    "成交时间": None,
-                    "成交时间(日)": None,
+                    "报单时间": item.get("报单时间"),
+                    "成交时间": item.get("成交时间"),
+                    "成交时间(日)": item.get("成交时间(日)"),
                     "策略名称": None,
                 }
             )
@@ -1489,19 +1919,19 @@ def _add_summary_greeks_pnl(summary_history, position_history=None, product=None
     for _, group in history.groupby("账户ID", dropna=False, sort=False):
         groups.append(_add_summary_greeks_pnl_for_account(group.copy(), product))
     result = pd.concat(groups, ignore_index=True) if groups else history
-    result = _apply_intraday_greeks_pnl(
-        result,
-        position_history,
-        product,
-        freq="5min",
-    )
+    unavailable = result["GreeksPnL说明"].astype(str).eq("first_history_row")
+    result.loc[unavailable, DAILY_GREEKS_PNL_COLUMNS] = np.nan
+    result.loc[unavailable, "GreeksPnL口径"] = "unavailable"
     result = result.sort_values(["日期", "账户ID"]).reset_index(drop=True)
     return result.reindex(columns=SUMMARY_COLUMNS)
 
 
 def _add_summary_greeks_pnl_for_account(group, product=None):
     spot = _numeric_series(group, "标的价格")
-    option_actual_pnl = _numeric_series(group, "期权总盈亏").diff()
+    existing_option_daily_pnl = _numeric_series(group, "期权单日盈亏")
+    existing_hedge_daily_pnl = _numeric_series(group, "对冲单日盈亏")
+    option_total = _numeric_series(group, "期权总盈亏")
+    option_actual_pnl = option_total.diff()
     option_actual_pnl = option_actual_pnl.where(
         option_actual_pnl.notna(),
         _numeric_series(group, "期权浮盈亏").diff(),
@@ -1510,6 +1940,9 @@ def _add_summary_greeks_pnl_for_account(group, product=None):
     hedge_unrealized = _numeric_series(group, "对冲浮盈亏")
     hedge_actual_pnl = hedge_total.diff()
     hedge_actual_pnl = hedge_actual_pnl.where(hedge_actual_pnl.notna(), hedge_unrealized.diff())
+    if not group.empty:
+        option_actual_pnl.iloc[0] = option_total.iloc[0]
+        hedge_actual_pnl.iloc[0] = hedge_total.iloc[0]
     hedge_mark = _numeric_series(group, "对冲最新价")
     hedge_qty = _numeric_series(group, "对冲持仓").fillna(0.0)
     call_iv = _numeric_series(group, "Call IV")
@@ -1532,7 +1965,10 @@ def _add_summary_greeks_pnl_for_account(group, product=None):
         & put_iv.notna()
     )
 
-    option_delta_pnl = (call_delta.shift(1) + put_delta.shift(1)) * spot_chg
+    option_delta_pnl = (
+        (call_delta.shift(1) + call_delta) / 2
+        + (put_delta.shift(1) + put_delta) / 2
+    ) * spot_chg
     hedge_delta_pnl = _segmented_hedge_delta_pnl_series(
         product,
         group,
@@ -1573,14 +2009,18 @@ def _add_summary_greeks_pnl_for_account(group, product=None):
     group["单日GreeksPnL"] = group[
         ["单日DeltaPnL", "单日GammaPnL", "单日VegaPnL", "单日ThetaPnL"]
     ].sum(axis=1)
-    group["期权单日盈亏"] = option_actual_pnl.fillna(0.0)
-    group["对冲单日盈亏"] = hedge_actual_pnl.fillna(0.0)
+    group["期权单日盈亏"] = option_actual_pnl.combine_first(
+        existing_option_daily_pnl
+    ).fillna(0.0)
+    group["对冲单日盈亏"] = hedge_actual_pnl.combine_first(
+        existing_hedge_daily_pnl
+    ).fillna(0.0)
     group["总单日盈亏"] = group[["期权单日盈亏", "对冲单日盈亏"]].sum(axis=1)
     group["券商期权单日盈亏变化"] = group["期权单日盈亏"]
     group["券商对冲单日盈亏变化"] = group["对冲单日盈亏"]
     group["券商总单日盈亏变化"] = group["总单日盈亏"]
-    group["GreeksPnL口径"] = "eod"
-    group["GreeksPnL说明"] = "5min_intraday_not_applied"
+    group["GreeksPnL口径"] = "endpoint_average"
+    group["GreeksPnL说明"] = "all_greeks_use_previous_current_endpoint_average"
     group["GreeksPnL路径节点数"] = None
     if not group.empty:
         group.iloc[0, group.columns.get_loc("GreeksPnL说明")] = "first_history_row"
@@ -1664,9 +2104,9 @@ def _apply_intraday_greeks_pnl(summary_history, position_history, product, freq=
             result.at[current_index, "单日GreeksPnL"] = (
                 intraday["option_greeks_pnl"] + hedge_delta
             )
-            result.at[current_index, "GreeksPnL口径"] = f"delta_trade_nodes+gvt_{freq}"
+            result.at[current_index, "GreeksPnL口径"] = f"start_greeks_taylor_{freq}"
             result.at[current_index, "GreeksPnL说明"] = (
-                intraday.get("reason") or "delta_trade_nodes;gamma_vega_theta_intraday"
+                intraday.get("reason") or "all_interval_terms_use_start_greeks"
             )
             result.at[current_index, "GreeksPnL路径节点数"] = intraday["nodes"]
     return result
@@ -1757,7 +2197,7 @@ def _intraday_option_greeks_for_summary_day(
     parts.update(
         {
             "status": "ok",
-            "reason": "ok",
+            "reason": "all_interval_terms_use_start_greeks",
             "nodes": len(path),
         }
     )
@@ -1951,31 +2391,31 @@ def _leg_intraday_option_greeks(path, row, price_col, flag, product):
 def _integrate_intraday_option_greeks(path):
     intervals = len(path) - 1
     previous = path.iloc[:-1]
-    current = path.iloc[1:]
     spot_change = path["spot"].diff().iloc[1:].to_numpy()
     call_iv_change = path["call_iv"].diff().iloc[1:].to_numpy()
     put_iv_change = path["put_iv"].diff().iloc[1:].to_numpy()
 
-    start_delta = path["call_delta"].iloc[0] + path["put_delta"].iloc[0]
-    total_spot_change = path["spot"].iloc[-1] - path["spot"].iloc[0]
-    delta_pnl = start_delta * total_spot_change
+    delta_pnl = (
+        (previous["call_delta"].to_numpy() + previous["put_delta"].to_numpy())
+        * spot_change
+    ).sum()
     gamma_pnl = (
         0.5
         * (
-            _intraday_average(previous, current, "call_gamma")
-            + _intraday_average(previous, current, "put_gamma")
+            previous["call_gamma"].to_numpy()
+            + previous["put_gamma"].to_numpy()
         )
         * spot_change
         * spot_change
     ).sum()
     vega_pnl = (
-        _intraday_average(previous, current, "call_vega") * call_iv_change * 100.0
-        + _intraday_average(previous, current, "put_vega") * put_iv_change * 100.0
+        previous["call_vega"].to_numpy() * call_iv_change * 100.0
+        + previous["put_vega"].to_numpy() * put_iv_change * 100.0
     ).sum()
     theta_pnl = (
         (
-            _intraday_average(previous, current, "call_theta")
-            + _intraday_average(previous, current, "put_theta")
+            previous["call_theta"].to_numpy()
+            + previous["put_theta"].to_numpy()
         )
         * (1.0 / intervals)
     ).sum()
@@ -1986,12 +2426,6 @@ def _integrate_intraday_option_greeks(path):
         "theta_pnl": float(theta_pnl),
         "option_greeks_pnl": float(delta_pnl + gamma_pnl + vega_pnl + theta_pnl),
     }
-
-
-def _intraday_average(left, right, column):
-    return (left[column].to_numpy() + right[column].to_numpy()) / 2.0
-
-
 def _resolve_intraday_dir(product, report_date=None):
     root = storage.PROJECT_ROOT / "data" / "live" / product / "intraday"
     if report_date is not None:
@@ -2235,18 +2669,31 @@ def _fill_summary_hedge_marks_and_pnl(summary_history, position_history, product
     for index, row in result.iterrows():
         account_id = str(row.get("账户ID"))
         report_date = str(row.get("日期"))
+        hedge_qty = _number(row.get("对冲持仓")) or 0.0
+        hedge_cost = _hedge_open_cost_for_report(product, account_id, report_date)
+        if hedge_cost is None:
+            hedge_cost = _number(row.get("对冲成本")) or 0.0
+        hedge_mark = _number(row.get("对冲估值价"))
+        if hedge_mark is None:
+            hedge_mark = _number(row.get("对冲最新价"))
+        hedge_unrealized = (
+            core.hedge.calc_unrealized_pnl(hedge_qty, hedge_cost, hedge_mark)
+            if hedge_mark is not None and hedge_cost > 0
+            else 0.0
+        )
         hedge_realized = _cumulative_hedge_realized_pnl_for_report(
             product,
             account_id,
             report_date,
         )
-        hedge_unrealized = _number(row.get("对冲浮盈亏")) or 0.0
         option_realized = _cumulative_option_realized_pnl_for_report(
             product,
             account_id,
             report_date,
         )
         option_unrealized = _number(row.get("期权浮盈亏")) or 0.0
+        result.at[index, "对冲成本"] = hedge_cost
+        result.at[index, "对冲浮盈亏"] = hedge_unrealized
         result.at[index, "对冲已实现盈亏"] = hedge_realized
         result.at[index, "对冲总盈亏"] = hedge_realized + hedge_unrealized
         result.at[index, "期权已实现盈亏"] = option_realized
@@ -2377,6 +2824,7 @@ def _refresh_current_summary_from_history(payload):
     )
     if mask.any():
         payload["summary"] = history.loc[mask].iloc[-1].to_dict()
+        _apply_current_pnl_decomposition(payload)
 
 
 def _backfill_summary_financial_columns(product, account_id, summary_history):
@@ -2607,6 +3055,66 @@ def _cumulative_hedge_realized_pnl_for_report(product, account_id, report_date):
     return realized
 
 
+def _hedge_open_cost_for_report(product, account_id, report_date):
+    cutoff = _date_or_none(report_date)
+    if cutoff is None:
+        return None
+
+    qty = 0.0
+    avg_cost = 0.0
+    fills = account_store.list_fills(
+        product,
+        account_id=account_id,
+        include_voided=False,
+    )
+    for row in fills:
+        fill = account_store.normalize_fill(row["payload"])
+        if fill.get("action") not in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
+            continue
+        fill_date = _date_or_none(fill.get("date"))
+        if fill_date is None or fill_date > cutoff:
+            continue
+
+        trades = _hedge_fill_trade_events(fill)
+        if not trades:
+            fill_qty = _number(fill.get("qty", fill.get("new_etf_qty")))
+            fill_cost = _number(fill.get("entry_price"))
+            if fill_qty is not None:
+                qty = fill_qty
+            if fill_cost is not None and qty > 0:
+                avg_cost = fill_cost
+            if qty <= 1e-9:
+                qty = 0.0
+                avg_cost = 0.0
+            continue
+
+        for trade in trades:
+            signed_qty = _number(trade.get("signed_qty")) or 0.0
+            price = _number(trade.get("price"))
+            if abs(signed_qty) <= 1e-9 or price is None:
+                continue
+            if signed_qty > 0:
+                new_qty = qty + signed_qty
+                avg_cost = (
+                    ((qty * avg_cost) + (signed_qty * price)) / new_qty
+                    if new_qty > 1e-9
+                    else 0.0
+                )
+                qty = new_qty
+            else:
+                qty -= min(abs(signed_qty), max(qty, 0.0))
+                if qty <= 1e-9:
+                    qty = 0.0
+                    avg_cost = 0.0
+
+        target_qty = _number(fill.get("qty", fill.get("new_etf_qty")))
+        if target_qty is not None and abs(target_qty - qty) > 1e-6:
+            qty = target_qty
+            avg_cost = _number(fill.get("entry_price")) or avg_cost
+
+    return avg_cost if qty > 1e-9 and avg_cost > 0 else None
+
+
 def _hedge_fill_trade_events(fill):
     trades = []
     for trade in fill.get("security_trades") or []:
@@ -2687,6 +3195,8 @@ def _trade_rows_from_file(path, product):
     rows = []
     for _, item in df.iterrows():
         row = {column: item.get(column) for column in TRADE_COLUMNS}
+        row["成交时间(日)"] = item.get("成交时间(日)")
+        row["策略名称"] = item.get("策略名称")
         row["买卖"] = _clean_text(row.get("买卖"))
         for column in ["报单价格", "成交价格", "成交数量", "手续费", "平仓盈亏"]:
             row[column] = _number(row.get(column))
@@ -2832,14 +3342,6 @@ def _date_or_none(value):
         return None
 
 
-def _side_from_holding(item):
-    buy_sell = _clean_text(item.get("买卖"))
-    position_type = str(item.get("持仓类型", ""))
-    if "卖" in buy_sell or "义务" in position_type:
-        return "short"
-    return "long"
-
-
 def _product_security_code(product):
     spec = market_data.SSE_ETF_OPTION_SPECS.get(product)
     if spec is None:
@@ -2907,7 +3409,7 @@ def _plain_table(rows, columns):
 
 
 def _fmt(value):
-    if value is None:
+    if value is None or pd.isna(value):
         return ""
     if isinstance(value, float):
         return f"{value:.6f}"

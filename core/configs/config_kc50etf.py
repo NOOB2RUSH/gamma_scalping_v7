@@ -27,10 +27,14 @@ CONFIG = AppConfig(
         short_qty=80,
         etf_fee_rate=0.00005,
         option_fee_per_contract=2.0,
+        proportional_position_sizing_enabled=False,
+        position_sizing_base_nav=1_000_000.0,
+        dynamic_position_control_enabled=False,
+        max_margin_to_nav_ratio=0.80,
         # 科创50ETF 期权单合约历史成交量不是交易所逐合约原始数据，
         # 而是用 Sina 合约活跃度按上交所认购/认沽总量校准后的估算值。
         # 因此成交量预警只适合作为粗略流动性提示，不宜视为精确成交约束。
-        liquidity_warning_volume_ratio=0.005,
+        liquidity_warning_volume_ratio=0.01,
     ),
     strategy=StrategyConfig(
         enable_long_straddle=True,
@@ -50,8 +54,8 @@ CONFIG = AppConfig(
         delta_hedge_tolerance_ratio=0.10,
         allow_etf_short_hedge=False,
         enable_option_delta_hedge=True,
-        option_delta_hedge_gamma_neutral=True,
-        option_delta_hedge_call_otm_steps=1,
+        option_delta_hedge_combination_enabled=True,
+        option_delta_hedge_max_itm_ratio=0.10,
         # 该退出信号依赖估算后的单合约成交量，适合捕捉明显放量，
         # 但不代表真实逐合约成交量的严格放大。
         short_volume_spike_exit_enabled=True,

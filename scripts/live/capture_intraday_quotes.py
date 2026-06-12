@@ -12,6 +12,7 @@ import _bootstrap  # noqa: F401
 import core
 from core.live import account as account_store
 from core.live import market_data, storage
+from promote_quote_snapshots import promote_quote_snapshots
 
 
 DEFAULT_DAILY_SCHEDULE = "10:30,11:35,14:00,15:10"
@@ -127,12 +128,28 @@ def capture_once(args):
         "output_dir": str(output_dir),
         "etf_symbol": spec.etf_symbol,
         "option_codes": option_codes,
+        "quote_snapshot": None,
+        "quote_promotion": None,
         "etf_rows": 0,
         "option_minute_rows": {},
         "option_spot_rows": {},
         "option_greeks_rows": {},
         "errors": [],
     }
+
+    try:
+        result["quote_snapshot"] = market_data.fetch_quote_snapshot(
+            args.product,
+            source="akshare",
+            date="latest",
+        )
+        if captured_at.hour >= 15:
+            result["quote_promotion"] = promote_quote_snapshots(
+                args.product,
+                dates=[captured_at.date()],
+            )
+    except Exception as exc:
+        result["errors"].append(f"quote_snapshot:{type(exc).__name__}:{exc}")
 
     try:
         etf_frame = _fetch_etf_minute(ak, spec.etf_symbol, captured_at)
@@ -256,10 +273,12 @@ def _fetch_etf_minute(ak, etf_symbol, captured_at):
 
 def _fetch_option_minute(ak, option_code, captured_at):
     raw = ak.option_finance_minute_sina(symbol=str(option_code))
-    if raw is None or raw.empty:
+    source = "option_finance_minute_sina"
+    if not _option_minute_is_current(raw, captured_at):
         raw = ak.option_sse_minute_sina(symbol=str(option_code))
-    if raw is None or raw.empty:
-        raise ValueError(f"empty option minute data: {option_code}")
+        source = "option_sse_minute_sina"
+    if not _option_minute_is_current(raw, captured_at):
+        raise ValueError(f"no current-date option minute data: {option_code}")
 
     frame = raw.copy()
     if {"date", "time"}.issubset(frame.columns):
@@ -293,9 +312,28 @@ def _fetch_option_minute(ak, option_code, captured_at):
         ["timestamp", "price", "average_price", "volume", "open_interest"]
     ].copy()
     result.insert(0, "symbol", str(option_code))
-    result["source"] = "option_finance_minute_sina"
+    result["source"] = source
     result["captured_at"] = captured_at.isoformat()
     return result.dropna(subset=["timestamp"])
+
+
+def _option_minute_is_current(frame, captured_at):
+    if frame is None or frame.empty:
+        return False
+    if {"date", "time"}.issubset(frame.columns):
+        timestamp = pd.to_datetime(
+            frame["date"].astype(str) + " " + frame["time"].astype(str),
+            errors="coerce",
+        )
+    elif {"日期", "时间"}.issubset(frame.columns):
+        timestamp = pd.to_datetime(
+            frame["日期"].astype(str) + " " + frame["时间"].astype(str),
+            errors="coerce",
+        )
+    else:
+        return False
+    latest = timestamp.max()
+    return pd.notna(latest) and latest.date() == pd.Timestamp(captured_at).date()
 
 
 def _fetch_option_snapshot(func, option_code, captured_at, source):
@@ -418,6 +456,8 @@ def _format_result(result):
         f"output_dir={result['output_dir']} "
         f"etf={result['etf_symbol']} etf_rows={result['etf_rows']} "
         f"options={','.join(result['option_codes']) or '-'} "
+        f"quote_snapshot={bool(result['quote_snapshot'])} "
+        f"quote_promotion={bool(result['quote_promotion'])} "
         f"option_minute_rows={result['option_minute_rows']} "
         f"errors={len(result['errors'])} "
         f"error_detail={result['errors']}"

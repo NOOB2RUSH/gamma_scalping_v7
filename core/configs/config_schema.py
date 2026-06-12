@@ -13,6 +13,10 @@ class BacktestConfig:
     etf_fee_rate: float = 0.00005
     option_fee_per_contract: float = 2.0
     liquidity_warning_volume_ratio: float = 0.005
+    proportional_position_sizing_enabled: bool = False
+    position_sizing_base_nav: float = 1_000_000.0
+    dynamic_position_control_enabled: bool = False
+    max_margin_to_nav_ratio: float = 0.80
 
 
 @dataclass(frozen=True)
@@ -56,8 +60,8 @@ class StrategyConfig:
     delta_hedge_tolerance_ratio: float = 0.05
     allow_etf_short_hedge: bool = True
     enable_option_delta_hedge: bool = False
-    option_delta_hedge_gamma_neutral: bool = False
-    option_delta_hedge_call_otm_steps: int = 1
+    option_delta_hedge_combination_enabled: bool = False
+    option_delta_hedge_max_itm_ratio: float = 0.10
 
     # 卖方持仓期间，若持仓合约 call+put 成交量较开仓时明显放大，主动退出。
     short_volume_spike_exit_enabled: bool = True
