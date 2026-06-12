@@ -172,7 +172,7 @@ timestamped cumulative Excel workbook with separate sheets:
 - `账户总体情况`: one row per report date since the account report history began.
 - `持仓记录`: position snapshots accumulated by report date. Contract names are
   read from the broker holding export when available.
-- `当日交易记录`: report-date rows from `live_hold/成交明细*.csv`.
+- `交易记录`: cumulative trade rows from `live_hold/成交明细*.csv` and supported summary exports.
 
 The default report mode shows the operator-facing account, daily PnL, Greeks,
 position, and trade fields. `--mode diagnose` adds internal PnL decomposition,

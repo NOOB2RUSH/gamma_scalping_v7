@@ -34,6 +34,18 @@ def parse_args():
         default=None,
         help="烟雾测试日期，默认使用所选品种配置文件中的 test_date。",
     )
+    parser.add_argument("--initial-cash", type=float, default=None)
+    parser.add_argument(
+        "--dynamic-position-control",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--proportional-position-sizing",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument("--max-margin-to-nav-ratio", type=float, default=None)
     return parser.parse_args()
 
 
@@ -59,6 +71,10 @@ def select_runtime_config(args):
             "start": args.start,
             "end": args.end,
             "test_date": args.test_date,
+            "initial_cash": args.initial_cash,
+            "dynamic_position_control_enabled": args.dynamic_position_control,
+            "proportional_position_sizing_enabled": args.proportional_position_sizing,
+            "max_margin_to_nav_ratio": args.max_margin_to_nav_ratio,
         }.items()
         if value is not None
     }

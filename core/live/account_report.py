@@ -558,7 +558,12 @@ def _append_daily_frames_to_total_report(
     combined = {}
     for sheet_name, daily in daily_frames.items():
         daily = daily.copy()
-        old = existing.get(sheet_name, pd.DataFrame(columns=daily.columns)).copy()
+        old = existing.get(sheet_name)
+        if old is None and sheet_name == "交易记录":
+            old = existing.get("当日交易记录")
+        if old is None:
+            old = pd.DataFrame(columns=daily.columns)
+        old = old.copy()
         if sheet_name == "账户总体情况":
             if "备注" not in daily.columns:
                 daily["备注"] = None
@@ -582,7 +587,80 @@ def _append_daily_frames_to_total_report(
     with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
         for sheet_name, frame in combined.items():
             frame.to_excel(writer, sheet_name=sheet_name, index=False)
+        _format_account_report_workbook(writer.book)
     temp_path.replace(path)
+
+
+def _format_account_report_workbook(workbook):
+    from openpyxl.utils import get_column_letter
+
+    money_headers = {
+        "估算权益",
+        "当日手续费",
+        "期权单日盈亏",
+        "ETF单日盈亏",
+        "总单日盈亏(手续费前)",
+        "净单日盈亏",
+        "持仓盈亏",
+        "交易盈亏",
+        "当日盯市交易盈亏",
+        "当日盈亏分解合计",
+        "当日盈亏对账差额",
+        "手续费",
+        "平仓盈亏",
+        "账户Delta",
+        "账户Gamma",
+        "账户Vega",
+        "账户Theta",
+        "单日DeltaPnL",
+        "单日GammaPnL",
+        "单日VegaPnL",
+        "单日ThetaPnL",
+        "单日GreeksPnL",
+        "单张Delta",
+        "单张Gamma",
+        "单张Vega",
+        "单张Theta",
+    }
+    price_headers = {"最新价", "持仓均价", "报单价格", "成交价格"}
+    integer_headers = {"序号", "总持仓张数", "今日变化", "成交数量"}
+    percent_headers = {"IV"}
+
+    for worksheet in workbook.worksheets:
+        worksheet.freeze_panes = "A2"
+        headers = {
+            cell.column: str(cell.value or "")
+            for cell in worksheet[1]
+        }
+        for column_index, header in headers.items():
+            if header in money_headers:
+                number_format = "#,##0.00;-#,##0.00;0.00"
+            elif header in price_headers:
+                number_format = "0.00000;-0.00000;0.00000"
+            elif header in integer_headers:
+                number_format = "#,##0;-#,##0;0"
+            elif header in percent_headers:
+                number_format = "0.00%;-0.00%;0.00%"
+            else:
+                number_format = None
+            if number_format is not None:
+                for row_index in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row_index, column_index).number_format = number_format
+
+            max_length = len(header)
+            for row_index in range(2, worksheet.max_row + 1):
+                value = worksheet.cell(row_index, column_index).value
+                if value is not None:
+                    max_length = max(max_length, len(str(value)))
+            if header == "备注":
+                width = 28
+            elif header in {"成交编号", "投资者账号", "合约名称"}:
+                width = min(max(max_length + 2, 14), 32)
+            elif header == "总单日盈亏(手续费前)":
+                width = 20
+            else:
+                width = min(max(max_length + 2, 11), 18)
+            worksheet.column_dimensions[get_column_letter(column_index)].width = width
 
 
 def _latest_total_report_path(out_dir, product, mode="default", before_path=None):
@@ -722,7 +800,7 @@ def format_terminal_summary(payload, mode="default"):
             ["交易方向", "合约代码", "合约名称", "总持仓张数", "今日变化", "最新价", "持仓均价", "IV"],
         )
     )
-    lines.extend(["", "当日交易记录"])
+    lines.extend(["", "交易记录"])
     lines.extend(
         _plain_table(
             payload["trade_rows"],
@@ -749,7 +827,7 @@ def _report_frames(payload, mode="default"):
                 else DEFAULT_POSITION_REPORT_COLUMNS
             )
         ),
-        "当日交易记录": _frame(payload["trade_rows"], TRADE_COLUMNS),
+        "交易记录": _frame(payload["trade_rows"], TRADE_COLUMNS),
     }
 
 

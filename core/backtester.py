@@ -654,6 +654,12 @@ class BacktestEngine:
             if pd.isna(feature_row["atm_iv"]) and not self._has_any_position(state):
                 continue
 
+            if self._has_any_position(state):
+                self._mark_current_positions_for_capacity(day, state)
+                if day["defer_delta_hedge"] or self._enforce_margin_limit(day, state):
+                    self._record_day(day, state)
+                    continue
+
             for side in POSITION_SIDES:
                 if state.positions[side] is not None:
                     self._handle_existing_position(day, state, side)
@@ -673,8 +679,10 @@ class BacktestEngine:
 
             self._tick_flat_cooldowns(day, state)
             self._update_day_aggregates(day, state)
-            self._hedge_to(date, spot, state, day, day["greeks"])
-            self._enforce_margin_limit(day, state)
+            if not day["defer_delta_hedge"]:
+                self._hedge_to(date, spot, state, day, day["greeks"])
+                if self.config.get("dynamic_position_control_enabled", False):
+                    self._enforce_margin_limit(day, state)
             self._record_day(day, state)
 
         daily_df = pd.DataFrame(state.daily_records).set_index("date")
@@ -704,6 +712,8 @@ class BacktestEngine:
             "daily_option_fee": 0.0,
             "skip_new_entry_by_side": set(),
             "cooldown_started_by_side": set(),
+            "defer_delta_hedge": False,
+            "data_warnings": [],
         }
 
     def _has_any_position(self, state):
@@ -723,35 +733,17 @@ class BacktestEngine:
             position = state.positions[side]
             if position is None:
                 continue
-            print(
-                f"[missing option chain] date={date.date()}, spot={spot}, "
-                f"side={side}, position={position['call_code']}/{position['put_code']}, "
-                f"strike={position['strike']}, expiry={position['expiry'].date()}, "
-                "action=close_at_last_value"
+            self._record_data_warning(day, state, side, "missing_option_chain")
+            self._set_side_eod(
+                day,
+                state,
+                side,
+                float(position.get("last_option_value", 0.0) or 0.0),
+                empty_greeks(),
+                None,
             )
-            trade_count = len(state.trades)
-            state.cash, _ = opt_position.close_at_last_value(
-                date,
-                state.cash,
-                position,
-                state.trades,
-                exit_reason="missing_option_chain_last_price",
-            )
-            self._add_new_option_fees(day, state, trade_count)
-            state.positions[side] = None
-            self._start_cooldown(day, state, side)
-            day["skip_new_entry_by_side"].add(side)
-
+        day["defer_delta_hedge"] = True
         self._update_day_aggregates(day, state)
-        self._hedge_to(
-            date,
-            spot,
-            state,
-            day,
-            greeks=empty_greeks(),
-            target_qty=0.0,
-            trade_type="close_hedge",
-        )
         self._record_day(day, state)
 
     def _handle_existing_position(self, day, state, side):
@@ -765,17 +757,21 @@ class BacktestEngine:
         try:
             call_row, put_row = self._get_position_rows(day, state, side)
         except IndexError:
-            trade_count = len(state.trades)
-            state.cash, _ = opt_position.close_at_last_value(
-                date,
-                state.cash,
-                position,
-                state.trades,
+            self._record_data_warning(
+                day,
+                state,
+                side,
+                "missing_position_contracts",
             )
-            self._add_new_option_fees(day, state, trade_count)
-            state.positions[side] = None
-            self._start_cooldown(day, state, side)
-            day["skip_new_entry_by_side"].add(side)
+            self._set_side_eod(
+                day,
+                state,
+                side,
+                float(position.get("last_option_value", 0.0) or 0.0),
+                empty_greeks(),
+                None,
+            )
+            day["defer_delta_hedge"] = True
             return
 
         position_dte = int(call_row["dte"])
@@ -792,20 +788,21 @@ class BacktestEngine:
         side_record["pnl_greeks"] = pnl_greeks.copy()
 
         if pd.isna(pnl_greeks["position_iv"]):
-            trade_count = len(state.trades)
-            state.cash, _ = opt_position.close_trade(
-                date,
-                state.cash,
-                position,
-                call_row,
-                put_row,
-                state.trades,
-                exit_reason="missing_position_iv",
+            self._record_data_warning(
+                day,
+                state,
+                side,
+                "missing_position_iv",
             )
-            self._add_new_option_fees(day, state, trade_count)
-            state.positions[side] = None
-            self._start_cooldown(day, state, side)
-            day["skip_new_entry_by_side"].add(side)
+            self._set_side_eod(
+                day,
+                state,
+                side,
+                opt_position.signed_value(position, call_row, put_row),
+                empty_greeks(),
+                position_dte,
+            )
+            day["defer_delta_hedge"] = True
             return
 
         if side == "short" and opt_position.has_short_volume_spike(
@@ -890,6 +887,56 @@ class BacktestEngine:
         position["last_option_value"] = day["side_records"][side]["option_value"]
         self._tick_roll_cooldown(state, side)
 
+    def _mark_current_positions_for_capacity(self, day, state):
+        for side in POSITION_SIDES:
+            position = state.positions.get(side)
+            if position is None:
+                continue
+            try:
+                call_row, put_row = self._get_position_rows(day, state, side)
+            except IndexError:
+                self._record_data_warning(
+                    day,
+                    state,
+                    side,
+                    "missing_position_contracts",
+                )
+                self._set_side_eod(
+                    day,
+                    state,
+                    side,
+                    float(position.get("last_option_value", 0.0) or 0.0),
+                    empty_greeks(),
+                    None,
+                )
+                day["defer_delta_hedge"] = True
+                continue
+            greeks = strategy.calc_position_greeks(
+                call_row,
+                put_row,
+                position["call_qty"],
+                position["put_qty"],
+                side=side,
+            )
+            if pd.isna(greeks["position_iv"]):
+                self._record_data_warning(day, state, side, "missing_position_iv")
+                greeks = empty_greeks()
+                day["defer_delta_hedge"] = True
+            record = day["side_records"][side]
+            record["pnl_position_iv"] = greeks["position_iv"]
+            record["pnl_call_iv"] = greeks["call_iv"]
+            record["pnl_put_iv"] = greeks["put_iv"]
+            record["pnl_greeks"] = greeks.copy()
+            self._set_side_eod(
+                day,
+                state,
+                side,
+                opt_position.signed_value(position, call_row, put_row),
+                greeks,
+                int(call_row["dte"]),
+            )
+        self._update_day_aggregates(day, state)
+
     def _entry_target_qty(self, feature_row, max_qty, side):
         if side == "short":
             return strategy.calc_short_entry_target_qty(feature_row, max_qty)
@@ -914,13 +961,16 @@ class BacktestEngine:
         if not self.config.get("dynamic_position_control_enabled", False):
             return requested_qty
         nav = self._current_nav_and_margin(day, state)[0]
-        margin_limit = max(0.0, nav * self.config["max_margin_to_nav_ratio"])
-        other_margin = sum(
-            opt_position.margin_value(position)
+        occupation_limit = max(0.0, nav * self.config["max_margin_to_nav_ratio"])
+        other_occupation = sum(
+            self._position_capital_occupation(position)
             for candidate_side, position in state.positions.items()
             if position is not None and candidate_side != replacing_side
         )
-        other_margin += day.get("option_hedge_margin", 0.0)
+        other_occupation += sum(
+            self._option_hedge_capital_occupation(position)
+            for position in state.option_hedges
+        )
         other_greeks = combine_greeks(
             [
                 day["side_records"][candidate_side]["greeks"]
@@ -936,20 +986,27 @@ class BacktestEngine:
                 qty,
                 side=side,
             )
-            option_margin = 0.0
             if side == "short":
-                option_margin = opt_position.calc_short_margin(
+                option_occupation = opt_position.calc_short_margin(
                     atm["call"],
                     atm["put"],
                     qty,
                     qty,
                     self._atm_underlying_price(atm, day["spot"]),
                 )
+            else:
+                option_occupation = opt_position.calc_trade_value(
+                    atm["call"],
+                    atm["put"],
+                    qty,
+                    qty,
+                )
             projected_delta = float(other_greeks["delta"]) + float(projected["delta"])
-            # Reserve enough capacity for either ETF hedge or the option-combination
-            # substitute used when ETF shorting is disabled.
-            hedge_capacity = abs(projected_delta) * float(day["spot"])
-            if other_margin + option_margin + hedge_capacity <= margin_limit:
+            hedge_occupation = abs(projected_delta) * float(day["spot"])
+            if (
+                other_occupation + option_occupation + hedge_occupation
+                <= occupation_limit + 1e-6
+            ):
                 return qty
         return 0
 
@@ -1049,19 +1106,6 @@ class BacktestEngine:
             put_qty,
             side=side,
         )
-        account_greeks = self._project_account_greeks_with_side(
-            day,
-            side,
-            projected_greeks,
-        )
-        projected_cash = self._project_cash_after_hedge(
-            projected_cash,
-            state,
-            date,
-            spot,
-            -account_greeks["delta"],
-            atm.get("underlying_order_book_id"),
-        )
         cash_would_decrease = projected_cash < state.cash
         if cash_would_decrease and not self._has_cash_reserve(projected_cash):
             self._record_cash_reserve_skip(
@@ -1156,19 +1200,6 @@ class BacktestEngine:
             put_qty,
             side=side,
         )
-        account_greeks = self._project_account_greeks_with_side(
-            day,
-            side,
-            projected_greeks,
-        )
-        projected_cash = self._project_cash_after_hedge(
-            projected_cash,
-            state,
-            date,
-            spot,
-            -account_greeks["delta"],
-            atm.get("underlying_order_book_id"),
-        )
         if not self._has_cash_reserve(projected_cash):
             self._record_cash_reserve_skip(
                 date,
@@ -1209,32 +1240,6 @@ class BacktestEngine:
         if position is not None:
             position["last_option_value"] = option_value
 
-    def _refresh_short_margin(self, state, side, call_row, put_row, spot):
-        position = state.positions[side]
-        if position is None or position.get("side", "long") != "short":
-            return 0.0
-
-        old_margin = position.get("option_margin", 0.0)
-        underlying_price = call_row.get("underlying_close")
-        if pd.isna(underlying_price):
-            underlying_price = self._position_underlying_price(
-                {"date": call_row["date"]},
-                position,
-                spot,
-            )
-        new_margin = opt_position.calc_short_margin(
-            call_row,
-            put_row,
-            position["call_qty"],
-            position["put_qty"],
-            underlying_price,
-        )
-        margin_change = new_margin - old_margin
-        if margin_change != 0:
-            state.cash -= margin_change
-            position["option_margin"] = new_margin
-        return margin_change
-
     def _set_existing_position_eod(
         self,
         day,
@@ -1245,7 +1250,6 @@ class BacktestEngine:
         greeks,
         dte,
     ):
-        self._refresh_short_margin(state, side, call_row, put_row, day["spot"])
         self._set_side_eod(
             day,
             state,
@@ -1288,18 +1292,6 @@ class BacktestEngine:
             signed_value = self._single_option_signed_value(hedge_position, row)
             option_value += signed_value
             if side == "short":
-                new_margin = opt_position.margin_call(
-                    float(day["spot"]),
-                    float(row["strike_price"]),
-                    float(row["mid"]),
-                    float(row["contract_multiplier"]),
-                ) * qty
-                margin_change = new_margin - float(
-                    hedge_position.get("option_margin", 0.0) or 0.0
-                )
-                if abs(margin_change) > 1e-9:
-                    state.cash -= margin_change
-                    hedge_position["option_margin"] = new_margin
                 margin += hedge_position.get("option_margin", 0.0)
             hedge_position["last_price"] = float(row["mid"])
             hedge_position["last_option_value"] = signed_value
@@ -1337,15 +1329,6 @@ class BacktestEngine:
             if side_records[side]["eod_position_dte"] is not None
         ]
         day["eod_position_dte"] = min(dtes) if dtes else None
-
-    def _project_account_greeks_with_side(self, day, side, projected_greeks):
-        greeks_list = []
-        for candidate_side in POSITION_SIDES:
-            if candidate_side == side:
-                greeks_list.append(projected_greeks)
-            else:
-                greeks_list.append(day["side_records"][candidate_side]["greeks"])
-        return combine_greeks(greeks_list)
 
     def _min_cash_reserve(self):
         return self.config.get("min_cash_reserve", CONFIG.backtest.min_cash_reserve)
@@ -1642,6 +1625,32 @@ class BacktestEngine:
         )
         return nav, total_margin
 
+    def _position_capital_occupation(self, position):
+        if position is None:
+            return 0.0
+        if position.get("side", "long") == "short":
+            return float(position.get("option_margin", 0.0) or 0.0)
+        return max(0.0, float(position.get("last_option_value", 0.0) or 0.0))
+
+    def _option_hedge_capital_occupation(self, position):
+        if position.get("side", "long") == "short":
+            return float(position.get("option_margin", 0.0) or 0.0)
+        return max(0.0, float(position.get("last_option_value", 0.0) or 0.0))
+
+    def _current_nav_and_occupation(self, day, state):
+        nav = self._current_nav_and_margin(day, state)[0]
+        occupation = sum(
+            self._position_capital_occupation(position)
+            for position in state.positions.values()
+            if position is not None
+        )
+        occupation += sum(
+            self._option_hedge_capital_occupation(position)
+            for position in state.option_hedges
+        )
+        occupation += float(state.hedge_margin)
+        return nav, occupation
+
     def _reduce_position_for_margin(self, day, state, side, target_qty):
         position = state.positions.get(side)
         if position is None:
@@ -1660,17 +1669,7 @@ class BacktestEngine:
         fee = opt_position.calc_option_fee(close_qty, close_qty)
         old_margin = float(position.get("option_margin", 0.0) or 0.0)
         if side == "short":
-            new_margin = (
-                opt_position.calc_short_margin(
-                    call_row,
-                    put_row,
-                    target_qty,
-                    target_qty,
-                    day["spot"],
-                )
-                if target_qty > 0
-                else 0.0
-            )
+            new_margin = old_margin * target_qty / current_qty if target_qty > 0 else 0.0
             state.cash += old_margin - new_margin - close_value - fee
         else:
             new_margin = 0.0
@@ -1679,7 +1678,7 @@ class BacktestEngine:
         state.trades.append(
             {
                 "date": day["date"],
-                "type": "dynamic_reduce_straddle",
+                "type": "reduce_short_straddle_for_capacity",
                 "side": side,
                 "call_code": position["call_code"],
                 "put_code": position["put_code"],
@@ -1694,6 +1693,7 @@ class BacktestEngine:
                 "margin_limit_ratio": self.config["max_margin_to_nav_ratio"],
             }
         )
+
         day["daily_option_fee"] += fee
         if target_qty == 0:
             state.positions[side] = None
@@ -1725,84 +1725,129 @@ class BacktestEngine:
         )
         return True
 
-    def _projected_margin_after_delta_hedge(self, day, state):
-        core_option_margin = sum(
-            opt_position.margin_value(position)
-            for position in state.positions.values()
-            if position is not None
-        )
-        core_greeks = combine_greeks(
-            [day["side_records"][side]["greeks"] for side in POSITION_SIDES]
-        )
-        projected_hedge_margin = abs(float(core_greeks["delta"])) * float(day["spot"])
-        return core_option_margin + projected_hedge_margin
+    def _record_data_warning(self, day, state, side, reason):
+        warning = {
+            "date": day["date"],
+            "type": "data_warning",
+            "side": side,
+            "reason": reason,
+        }
+        day["data_warnings"].append(warning)
+        state.trades.append(warning)
 
     def _enforce_margin_limit(self, day, state):
-        if not self.config.get("dynamic_position_control_enabled", False):
-            return
+        if self.config.get("dynamic_position_control_enabled", False):
+            return self._enforce_dynamic_occupation_limit(day, state)
+
+        short_position = state.positions.get("short")
+        if short_position is None:
+            return False
         ratio_limit = float(self.config["max_margin_to_nav_ratio"])
         self._update_day_aggregates(day, state)
         nav, total_margin = self._current_nav_and_margin(day, state)
-        if nav > 0 and total_margin <= nav * ratio_limit + 1e-6:
-            return
+        margin_limit = max(0.0, nav * ratio_limit)
+        cash_shortfall = max(0.0, self._min_cash_reserve() - state.cash)
+        margin_excess = max(0.0, total_margin - margin_limit)
+        if cash_shortfall <= 1e-6 and margin_excess <= 1e-6:
+            return False
 
-        # Auxiliary option hedges are replanned after the core position reaches its
-        # final size. Keep the ETF hedge in place so margin enforcement does not
-        # repeatedly sell and repurchase the full hedge within the same day.
-        if state.option_hedges:
-            self._close_option_delta_hedges(day["date"], state, day)
+        current_qty = min(
+            int(short_position.get("call_qty", 0) or 0),
+            int(short_position.get("put_qty", 0) or 0),
+        )
+        if current_qty <= 0:
+            return False
+        call_row, put_row = self._get_position_rows(day, state, "short")
+        option_margin = float(short_position.get("option_margin", 0.0) or 0.0)
+        margin_relief_per_contract = option_margin / current_qty
+        multiplier = float(short_position["contract_multiplier"])
+        close_cost_per_contract = (
+            float(call_row["mid"]) + float(put_row["mid"])
+        ) * multiplier + opt_position.calc_option_fee(1, 1)
+        cash_relief_per_contract = margin_relief_per_contract - close_cost_per_contract
+        close_for_cash = (
+            int(math.ceil(cash_shortfall / cash_relief_per_contract))
+            if cash_shortfall > 0 and cash_relief_per_contract > 0
+            else 0
+        )
+        close_for_margin = (
+            int(math.ceil(margin_excess / margin_relief_per_contract))
+            if margin_excess > 0 and margin_relief_per_contract > 0
+            else 0
+        )
+        close_qty = min(current_qty, max(close_for_cash, close_for_margin))
+        if close_qty <= 0:
+            self._record_data_warning(
+                day,
+                state,
+                "short",
+                "capacity_reduction_not_feasible",
+            )
+            day["defer_delta_hedge"] = True
+            return False
+        reduced = self._reduce_position_for_margin(
+            day,
+            state,
+            "short",
+            current_qty - close_qty,
+        )
+        day["defer_delta_hedge"] = bool(reduced)
+        return reduced
 
-        for _ in range(50):
+    def _enforce_dynamic_occupation_limit(self, day, state):
+        ratio_limit = float(self.config["max_margin_to_nav_ratio"])
+        changed = False
+        for _ in range(100):
             self._update_day_aggregates(day, state)
-            nav, total_margin = self._current_nav_and_margin(day, state)
-            projected_margin = self._projected_margin_after_delta_hedge(day, state)
-            margin_limit = nav * ratio_limit
-            if nav > 0 and projected_margin <= margin_limit + 1e-6:
-                self._hedge_to(day["date"], day["spot"], state, day, day["greeks"])
-                self._update_day_aggregates(day, state)
-                nav, total_margin = self._current_nav_and_margin(day, state)
-                if nav > 0 and total_margin <= nav * ratio_limit + 1e-6:
-                    return
+            nav, occupation = self._current_nav_and_occupation(day, state)
+            occupation_limit = max(0.0, nav * ratio_limit)
+            if nav > 0 and occupation <= occupation_limit + 1e-6:
+                return changed
 
             if state.option_hedges:
                 self._close_option_delta_hedges(day["date"], state, day)
                 self._update_day_aggregates(day, state)
-                nav, total_margin = self._current_nav_and_margin(day, state)
-                projected_margin = self._projected_margin_after_delta_hedge(day, state)
+                nav, occupation = self._current_nav_and_occupation(day, state)
+                occupation_limit = max(0.0, nav * ratio_limit)
+                if nav > 0 and occupation <= occupation_limit + 1e-6:
+                    self._hedge_to(day["date"], day["spot"], state, day, day["greeks"])
+                    changed = True
+                    continue
 
             candidates = [
-                (opt_position.margin_value(position), side, position)
+                (self._position_capital_occupation(position), side, position)
                 for side, position in state.positions.items()
                 if position is not None
             ]
             if not candidates:
-                return
+                break
             _, side, position = max(candidates, key=lambda item: item[0])
             current_qty = min(int(position["call_qty"]), int(position["put_qty"]))
             if current_qty <= 0:
-                return
+                break
             scale = max(
                 0.0,
-                min(
-                    0.99,
-                    (nav * ratio_limit) / max(total_margin, projected_margin, 1.0),
-                ),
+                min(0.99, occupation_limit / max(occupation, 1.0)),
             )
             target_qty = min(current_qty - 1, int(math.floor(current_qty * scale)))
             if not self._reduce_position_for_margin(day, state, side, target_qty):
-                return
+                break
+            changed = True
+            self._update_day_aggregates(day, state)
+            self._hedge_to(day["date"], day["spot"], state, day, day["greeks"])
 
-        nav, total_margin = self._current_nav_and_margin(day, state)
+        nav, occupation = self._current_nav_and_occupation(day, state)
         state.trades.append(
             {
                 "date": day["date"],
-                "type": "margin_limit_unresolved",
+                "type": "capital_occupation_limit_unresolved",
                 "nav": nav,
-                "total_margin": total_margin,
-                "margin_to_nav_ratio": total_margin / nav if nav > 0 else None,
-                "margin_limit_ratio": ratio_limit,
+                "capital_occupation": occupation,
+                "capital_occupation_ratio": occupation / nav if nav > 0 else None,
+                "capital_occupation_limit_ratio": ratio_limit,
             }
         )
+        return changed
 
     def _close_option_delta_hedges(self, date, state, day):
         if not state.option_hedges:
@@ -2251,11 +2296,29 @@ class BacktestEngine:
         total_margin = option_margin + state.hedge_margin
         record["total_margin"] = total_margin
         record["margin_to_nav_ratio"] = total_margin / nav if nav > 0 else None
+        _, capital_occupation = self._current_nav_and_occupation(day, state)
+        record["capital_occupation"] = capital_occupation
+        record["capital_occupation_ratio"] = (
+            capital_occupation / nav if nav > 0 else None
+        )
+        record["capital_occupation_limit_ratio"] = self.config.get(
+            "max_margin_to_nav_ratio"
+        )
+        record["capital_occupation_limit_breach"] = (
+            nav > 0
+            and capital_occupation
+            > nav * self.config["max_margin_to_nav_ratio"] + 1e-6
+        )
         record["margin_limit_ratio"] = self.config.get("max_margin_to_nav_ratio")
         record["margin_limit_breach"] = (
-            self.config.get("dynamic_position_control_enabled", False)
-            and nav > 0
+            nav > 0
             and total_margin > nav * self.config["max_margin_to_nav_ratio"] + 1e-6
+        )
+        record["data_warning_count"] = len(day.get("data_warnings", []))
+        record["data_warning_reasons"] = ",".join(
+            str(item.get("reason"))
+            for item in day.get("data_warnings", [])
+            if item.get("reason")
         )
         state.daily_records.append(record)
 
@@ -2319,6 +2382,12 @@ class AlwaysAtmBenchmarkEngine(BacktestEngine):
             side = self.benchmark_side
 
             if state.positions[side] is not None:
+                self._mark_current_positions_for_capacity(day, state)
+                if day["defer_delta_hedge"] or self._enforce_margin_limit(day, state):
+                    self._record_day(day, state)
+                    continue
+
+            if state.positions[side] is not None:
                 self._handle_existing_position(day, state, side)
 
             if (
@@ -2335,8 +2404,10 @@ class AlwaysAtmBenchmarkEngine(BacktestEngine):
 
             self._tick_flat_cooldowns(day, state)
             self._update_day_aggregates(day, state)
-            self._hedge_to(date, spot, state, day, day["greeks"])
-            self._enforce_margin_limit(day, state)
+            if not day["defer_delta_hedge"]:
+                self._hedge_to(date, spot, state, day, day["greeks"])
+                if self.config.get("dynamic_position_control_enabled", False):
+                    self._enforce_margin_limit(day, state)
             self._record_day(day, state)
 
         daily_df = pd.DataFrame(state.daily_records).set_index("date")

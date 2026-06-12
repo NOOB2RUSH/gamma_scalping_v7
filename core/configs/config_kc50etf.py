@@ -27,9 +27,9 @@ CONFIG = AppConfig(
         short_qty=80,
         etf_fee_rate=0.00005,
         option_fee_per_contract=2.0,
-        proportional_position_sizing_enabled=True,
+        proportional_position_sizing_enabled=False,
         position_sizing_base_nav=1_000_000.0,
-        dynamic_position_control_enabled=True,
+        dynamic_position_control_enabled=False,
         max_margin_to_nav_ratio=0.80,
         # 科创50ETF 期权单合约历史成交量不是交易所逐合约原始数据，
         # 而是用 Sina 合约活跃度按上交所认购/认沽总量校准后的估算值。
