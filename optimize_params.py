@@ -409,7 +409,7 @@ def parse_args():
     parser.add_argument(
         "--output",
         default=None,
-        help="结果 CSV 路径；默认写入 output/optimize_阶段_时间戳.csv。",
+        help="结果 CSV 路径；默认写入 output/backtest/optimize_阶段_时间戳.csv。",
     )
     return parser.parse_args()
 

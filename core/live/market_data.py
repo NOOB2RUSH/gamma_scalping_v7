@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,179 @@ SSE_ETF_OPTION_SPECS = {
     "500etf": SseEtfOptionSpec("510500", "510500.XSHG", "500ETF_OPTION"),
     "kc50etf": SseEtfOptionSpec("588000", "588000.XSHG", "KC50ETF_OPTION"),
 }
+
+
+def fetch_historical_atm_strike(product, date):
+    """Return the exact-date ATM strike from AKShare, with a persistent cache."""
+    if product not in SSE_ETF_OPTION_SPECS:
+        raise ValueError(
+            f"AKShare historical ATM source currently supports: "
+            f"{', '.join(sorted(SSE_ETF_OPTION_SPECS))}"
+        )
+
+    target = pd.Timestamp(date).normalize()
+    cache_path = storage.historical_atm_cache_path(product)
+    cached = _read_historical_atm_cache(cache_path)
+    matched = cached[cached["date"].eq(target)] if not cached.empty else cached
+    if not matched.empty:
+        row = matched.iloc[-1]
+        return {
+            "date": target,
+            "spot": float(row["spot"]),
+            "strike": float(row["strike"]),
+            "source": "akshare_historical_atm_cache",
+        }
+
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError("akshare is required for historical ATM fallback.") from exc
+
+    config = load_product_config(product)
+    spec = SSE_ETF_OPTION_SPECS[product]
+    spot = _fetch_historical_etf_close(ak, spec.etf_symbol, target)
+    risk_df = _ak_call(
+        ak.option_risk_indicator_sse,
+        date=target.strftime("%Y%m%d"),
+    )
+    strike = _select_historical_atm_strike(risk_df, spec, target, spot, config.vol)
+    row = pd.DataFrame(
+        [
+            {
+                "date": target,
+                "spot": spot,
+                "strike": strike,
+                "fetched_at": storage.utc_now_text(),
+            }
+        ]
+    )
+    updated = row if cached.empty else pd.concat([cached, row], ignore_index=True)
+    updated = updated.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    updated.to_csv(cache_path, index=False)
+    return {
+        "date": target,
+        "spot": float(spot),
+        "strike": float(strike),
+        "source": "akshare_historical_market_data",
+    }
+
+
+def _read_historical_atm_cache(path):
+    columns = ["date", "spot", "strike", "fetched_at"]
+    if not Path(path).exists():
+        return pd.DataFrame(columns=columns)
+    df = pd.read_csv(path)
+    missing = set(columns) - set(df.columns)
+    if missing:
+        raise ValueError(f"Historical ATM cache is missing columns: {sorted(missing)}")
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    df["spot"] = pd.to_numeric(df["spot"], errors="coerce")
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    return df.dropna(subset=["date", "spot", "strike"])
+
+
+def _fetch_historical_etf_close(ak, etf_symbol, date):
+    date_text = pd.Timestamp(date).strftime("%Y%m%d")
+    try:
+        raw_df = _ak_call(
+            ak.fund_etf_hist_em,
+            symbol=etf_symbol,
+            period="daily",
+            start_date=date_text,
+            end_date=date_text,
+            adjust="",
+        )
+    except Exception:
+        raw_df = _ak_call(ak.fund_etf_hist_sina, symbol=f"sh{etf_symbol}")
+
+    date_col = _first_column(raw_df, "\u65e5\u671f", "date")
+    close_col = _first_column(raw_df, "\u6536\u76d8", "close")
+    if date_col is None or close_col is None:
+        raise ValueError(f"AKShare ETF history has no date/close columns: {etf_symbol}")
+    rows = raw_df.copy()
+    rows[date_col] = pd.to_datetime(rows[date_col], errors="coerce").dt.normalize()
+    rows = rows[rows[date_col].eq(pd.Timestamp(date).normalize())]
+    if rows.empty:
+        raise ValueError(f"AKShare ETF history is empty for {etf_symbol} {date_text}")
+    close = pd.to_numeric(rows[close_col], errors="coerce").dropna()
+    if close.empty:
+        raise ValueError(f"AKShare ETF close is invalid for {etf_symbol} {date_text}")
+    return float(close.iloc[-1])
+
+
+def _select_historical_atm_strike(risk_df, spec, date, spot, vol_config):
+    required = {"CONTRACT_ID", "CONTRACT_SYMBOL"}
+    missing = required - set(risk_df.columns)
+    if missing:
+        raise ValueError(f"AKShare option risk data is missing columns: {sorted(missing)}")
+
+    rows = risk_df[
+        risk_df["CONTRACT_ID"].astype(str).str.startswith(spec.etf_symbol)
+    ].copy()
+    parsed = rows["CONTRACT_ID"].astype(str).map(
+        lambda value: _parse_sse_option_contract(value, spec.etf_symbol)
+    )
+    rows["option_type"] = parsed.map(lambda value: value[0] if value else None)
+    rows["maturity_date"] = parsed.map(lambda value: value[1] if value else pd.NaT)
+    rows["strike"] = [
+        _parse_contract_symbol_strike(symbol, parsed_value[2] if parsed_value else None)
+        for symbol, parsed_value in zip(rows["CONTRACT_SYMBOL"], parsed)
+    ]
+    rows["dte"] = (pd.to_datetime(rows["maturity_date"]) - pd.Timestamp(date)).dt.days
+    rows = rows[
+        rows["dte"].between(
+            int(vol_config.atm_target_dte_min),
+            int(vol_config.atm_target_dte_max),
+        )
+    ].dropna(subset=["strike", "option_type", "maturity_date"])
+    pairs = (
+        rows.groupby(["strike", "maturity_date"])["option_type"]
+        .nunique()
+        .reset_index(name="option_type_count")
+    )
+    pairs = pairs[pairs["option_type_count"].ge(2)].copy()
+    if pairs.empty:
+        raise ValueError(
+            f"AKShare option risk data has no valid call/put ATM pair for "
+            f"{spec.etf_symbol} {pd.Timestamp(date).date()}"
+        )
+    pairs["spot_diff"] = (pairs["strike"] - float(spot)).abs()
+    pairs["dte"] = (pairs["maturity_date"] - pd.Timestamp(date)).dt.days
+    pairs["target_dte_diff"] = (
+        pairs["dte"] - int(vol_config.atm_target_dte)
+    ).abs()
+    selected = pairs.sort_values(
+        ["spot_diff", "target_dte_diff", "dte", "strike"]
+    ).iloc[0]
+    return float(selected["strike"])
+
+
+def _parse_sse_option_contract(contract_id, etf_symbol):
+    match = re.fullmatch(
+        rf"{re.escape(etf_symbol)}([CP])(\d{{2}})(\d{{2}})([A-Z]?)(\d+)",
+        str(contract_id),
+    )
+    if match is None:
+        return None
+    option_type = match.group(1)
+    year = 2000 + int(match.group(2))
+    month = int(match.group(3))
+    maturity = _fourth_wednesday(year, month)
+    raw_strike = float(match.group(5)) / 1000
+    return option_type, pd.Timestamp(maturity), raw_strike
+
+
+def _parse_contract_symbol_strike(contract_symbol, fallback):
+    match = re.search(r"(\d+(?:\.\d+)?)[A-Z]?$", str(contract_symbol))
+    if match is None:
+        return fallback
+    value = float(match.group(1))
+    return value / 1000 if value > 100 else value
+
+
+def _first_column(df, *candidates):
+    return next((candidate for candidate in candidates if candidate in df.columns), None)
 
 
 def fetch_quote_snapshot(product, source="local", date="latest"):

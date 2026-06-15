@@ -111,7 +111,7 @@ class VolConfig:
 
 @dataclass(frozen=True)
 class ReportConfig:
-    output_root: str = "output"
+    output_root: str = "output/backtest"
     daily_feature_cols: tuple[str, ...] = ("yz_hv60", "atm_iv_percentile")
     enable_surface_full_sample_plot: bool = False
 

@@ -1,3 +1,5 @@
+import math
+
 import pandas as pd
 
 from .config import CONFIG
@@ -6,6 +8,19 @@ from .config import CONFIG
 LONG_SIGNAL_MODES = {"absolute", "percentile"}
 SHORT_SIGNAL_MODES = {"absolute", "percentile", "low_iv_hv_spread"}
 IV_OBSERVATION_MODES = {"legacy", "simple_atm_absolute", "surface_percentile"}
+ETF_HEDGE_LOT_SIZE = 100
+
+
+def round_etf_hedge_target(qty, lot_size=ETF_HEDGE_LOT_SIZE):
+    """Round an ETF hedge target to the nearest executable board lot."""
+    qty = float(qty)
+    lot_size = int(lot_size)
+    if lot_size <= 0:
+        raise ValueError("lot_size must be positive")
+    if abs(qty) < 1e-12:
+        return 0.0
+    lots = math.floor(abs(qty) / lot_size + 0.5)
+    return float(math.copysign(lots * lot_size, qty))
 
 
 def option_delta_capacity(positions, option_hedges=None, default_multiplier=10000):

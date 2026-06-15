@@ -276,6 +276,12 @@ def build_live_account_report(
         source=source,
         date=date,
     )
+    if persist_history:
+        _ensure_account_report_history(
+            product,
+            account_id,
+            through_date=str(market["date"].date()),
+        )
     payload = calculate_live_account_report(
         product,
         account_id=account_id,
@@ -301,6 +307,331 @@ def build_live_account_report(
         )
         _refresh_current_summary_from_history(payload)
     return payload
+
+
+def _ensure_account_report_history(product, account_id, through_date=None):
+    summary_path = storage.account_report_summary_history_path(product, account_id)
+    position_path = storage.account_report_position_history_path(product, account_id)
+    summary_exists = summary_path.exists()
+    position_exists = position_path.exists()
+    if summary_exists and position_exists:
+        return None
+    if summary_exists != position_exists:
+        raise RuntimeError(
+            "Account report history is incomplete: summary and position history "
+            "must either both exist or both be absent."
+        )
+
+    total_path = _latest_total_report_path(storage.output_dir(product), product)
+    if total_path is None:
+        return None
+    reset_at = account_store.load_account(product, account_id=account_id).reset_at
+    restore_account_report_history_from_total(
+        product,
+        account_id=account_id,
+        total_path=total_path,
+        from_date=_date_or_none(reset_at),
+        through_date=through_date,
+    )
+    return total_path
+
+
+def restore_account_report_history_from_total(
+    product,
+    account_id="default",
+    total_path=None,
+    from_date=None,
+    through_date=None,
+):
+    total_path = (
+        Path(total_path)
+        if total_path is not None
+        else _latest_total_report_path(storage.output_dir(product), product)
+    )
+    if total_path is None or not total_path.exists():
+        raise FileNotFoundError("No cumulative account report is available for history restore.")
+
+    frames = _read_report_workbook(total_path)
+    summary_report = frames.get("账户总体情况")
+    position_report = frames.get("持仓记录")
+    if summary_report is None or position_report is None:
+        raise ValueError("Cumulative account report is missing required sheets.")
+
+    summary_report = _history_rows_between_dates(
+        summary_report,
+        from_date,
+        through_date,
+    )
+    position_report = _history_rows_between_dates(
+        position_report,
+        from_date,
+        through_date,
+    )
+    if summary_report.empty or position_report.empty:
+        raise ValueError("Cumulative account report contains no restorable history rows.")
+
+    position_history = _restore_position_history_from_total(
+        product,
+        account_id,
+        position_report,
+    )
+    summary_history = _restore_summary_history_from_total(
+        product,
+        account_id,
+        summary_report,
+        position_history,
+    )
+    summary_history = _add_summary_greeks_pnl(
+        summary_history,
+        position_history,
+        product=product,
+    )
+
+    summary_path = storage.account_report_summary_history_path(product, account_id)
+    position_path = storage.account_report_position_history_path(product, account_id)
+    position_history.to_csv(position_path, index=False, encoding="utf-8-sig")
+    summary_history.to_csv(summary_path, index=False, encoding="utf-8-sig")
+    return {
+        "summary_path": summary_path,
+        "position_path": position_path,
+        "source_total": total_path,
+    }
+
+
+def _history_rows_between_dates(frame, from_date, through_date):
+    result = frame.copy()
+    if "日期" in result.columns:
+        dates = pd.to_datetime(result["日期"], errors="coerce")
+        mask = pd.Series(True, index=result.index)
+        if from_date is not None:
+            mask &= dates.ge(pd.Timestamp(from_date).normalize().tz_localize(None))
+        if through_date is not None:
+            mask &= dates.le(pd.Timestamp(through_date).normalize().tz_localize(None))
+        result = result.loc[mask]
+    return _sort_report_frame(result)
+
+
+def _restore_position_history_from_total(product, account_id, position_report):
+    config = load_product_config(product)
+    multiplier = float(config.vol.contract_multiplier)
+    spots = {}
+    for _, report_row in position_report.iterrows():
+        if pd.isna(report_row.get("到期日")):
+            report_date = str(pd.Timestamp(report_row.get("日期")).date())
+            spots[report_date] = _number(report_row.get("最新价"))
+    restored = []
+    for _, report_row in position_report.iterrows():
+        report_row = report_row.copy()
+        report_date = str(pd.Timestamp(report_row.get("日期")).date())
+        report_row["_恢复标的价格"] = spots.get(report_date)
+        is_option = pd.notna(report_row.get("到期日"))
+        side = (
+            "short"
+            if str(report_row.get("交易方向")) == "空"
+            else "long"
+            if is_option
+            else "hedge"
+        )
+        qty = float(_number(report_row.get("总持仓张数")) or 0.0)
+        latest = _number(report_row.get("最新价"))
+        cost = _number(report_row.get("持仓均价"))
+        direction = -1.0 if side == "short" else 1.0
+        row = {
+            "日期": report_date,
+            "账户ID": account_id,
+            "方向": side,
+            "合约代码": _security_code(report_row.get("合约代码")),
+            "合约名称": report_row.get("合约名称"),
+            "买卖": "卖" if direction < 0 else "买",
+            "持仓类型": "ETF对冲" if side == "hedge" else "义务仓" if side == "short" else "权利仓",
+            "总持仓": qty,
+            "今持仓": None,
+            "今开仓": None,
+            "今平仓": None,
+            "可平量": None,
+            "最新价": latest,
+            "持仓均价": cost,
+            "开仓均价": cost,
+            "期权市值": (
+                None
+                if latest is None
+                else latest * qty * (multiplier if is_option else 1.0)
+            ),
+            "占用保证金": None,
+            "持仓盈亏": report_row.get("持仓盈亏"),
+            "浮动盈亏": (
+                None
+                if latest is None or cost is None
+                else direction * qty * (latest - cost) * (multiplier if is_option else 1.0)
+            ),
+            "行权价": None,
+            "到期日": (
+                str(pd.Timestamp(report_row.get("到期日")).date())
+                if is_option
+                else None
+            ),
+            "剩余天数": None,
+            "IV": report_row.get("IV") if is_option else None,
+            "单张Delta": None,
+            "Delta": qty if side == "hedge" else None,
+            "Gamma": 0.0 if side == "hedge" else None,
+            "Vega": 0.0 if side == "hedge" else None,
+            "Theta": 0.0 if side == "hedge" else None,
+        }
+        if is_option:
+            _restore_option_position_greeks(row, report_row, config)
+        restored.append(row)
+    return pd.DataFrame(restored, columns=POSITION_COLUMNS)
+
+
+def _restore_option_position_greeks(row, report_row, config):
+    iv = _number(report_row.get("IV"))
+    spot = _restored_spot_for_date(report_row.get("日期"), report_row)
+    strike = _strike_from_contract_name(report_row.get("合约名称"), spot)
+    maturity = _date_or_none(report_row.get("到期日"))
+    report_date = _date_or_none(report_row.get("日期"))
+    option_type = _option_type_from_contract_name(report_row.get("合约名称"))
+    qty = abs(_number(report_row.get("总持仓张数")) or 0.0)
+    if None in {iv, spot, strike, maturity, report_date, option_type} or qty <= 0:
+        raise ValueError(
+            f"Cannot restore option history for contract {report_row.get('合约代码')}."
+        )
+
+    dte = core.vol_engine._count_trading_dte(report_date, maturity)
+    chain = pd.DataFrame(
+        [
+            {
+                "option_type": option_type,
+                "pricing_spot": spot,
+                "strike_price": strike,
+                "ttm": dte / float(config.vol.annual_days),
+                "iv": iv,
+            }
+        ]
+    )
+    greeks = core.vol_engine.add_greeks_for_day(chain, spot).iloc[0]
+    direction = -1.0 if row["方向"] == "short" else 1.0
+    scale = direction * qty * float(config.vol.contract_multiplier)
+    row["行权价"] = strike
+    row["剩余天数"] = dte
+    row["单张Delta"] = direction * float(greeks["delta"])
+    for metric in ["Delta", "Gamma", "Vega", "Theta"]:
+        row[metric] = float(greeks[metric.lower()]) * scale
+
+
+def _restored_spot_for_date(report_date, report_row):
+    value = _number(report_row.get("_恢复标的价格"))
+    if value is not None:
+        return value
+    raise ValueError(f"Missing ETF mark for restored report date {report_date}.")
+
+
+def _strike_from_contract_name(name, spot=None):
+    match = re.search(r"(\d{4,5})$", str(name or ""))
+    if match is None:
+        return None
+    raw = float(match.group(1))
+    if spot is None or spot <= 0:
+        return raw
+    candidates = [raw, raw / 10.0, raw / 100.0, raw / 1000.0]
+    return min(candidates, key=lambda value: abs(np.log(value / spot)))
+
+
+def _option_type_from_contract_name(name):
+    text = str(name or "").upper()
+    if "购" in text or "CALL" in text:
+        return "c"
+    if "沽" in text or "PUT" in text:
+        return "p"
+    return None
+
+
+def _restore_summary_history_from_total(
+    product,
+    account_id,
+    summary_report,
+    position_history,
+):
+    config = load_product_config(product)
+    initial_cash = float(config.backtest.initial_cash)
+    positions = position_history.copy()
+    spots = (
+        positions.loc[positions["方向"].astype(str).eq("hedge"), ["日期", "最新价"]]
+        .drop_duplicates("日期", keep="last")
+        .set_index("日期")["最新价"]
+        .to_dict()
+    )
+    option_realized = 0.0
+    hedge_realized = 0.0
+    cumulative_fee = 0.0
+    previous_option_unrealized = 0.0
+    previous_hedge_unrealized = 0.0
+    rows = []
+    for _, report_row in summary_report.iterrows():
+        report_date = str(pd.Timestamp(report_row.get("日期")).date())
+        date_positions = positions.loc[positions["日期"].astype(str).eq(report_date)]
+        option_positions = date_positions.loc[
+            ~date_positions["方向"].astype(str).eq("hedge")
+        ]
+        hedge_positions = date_positions.loc[
+            date_positions["方向"].astype(str).eq("hedge")
+        ]
+        daily_fee = _number(report_row.get("当日手续费")) or 0.0
+        cumulative_fee += daily_fee
+        option_unrealized = _sum_numeric_column(option_positions, "浮动盈亏")
+        hedge_unrealized = _sum_numeric_column(hedge_positions, "浮动盈亏")
+        option_daily_pnl = _number(report_row.get("期权单日盈亏")) or 0.0
+        hedge_daily_pnl = _number(report_row.get("ETF单日盈亏")) or 0.0
+        option_realized += option_daily_pnl - (
+            option_unrealized - previous_option_unrealized
+        )
+        hedge_realized += hedge_daily_pnl - (
+            hedge_unrealized - previous_hedge_unrealized
+        )
+        previous_option_unrealized = option_unrealized
+        previous_hedge_unrealized = hedge_unrealized
+        hedge_qty = _sum_numeric_column(hedge_positions, "总持仓")
+        hedge_cost = _weighted_position_value(hedge_positions, "持仓均价")
+        spot = _number(spots.get(report_date))
+        row = {column: None for column in SUMMARY_COLUMNS}
+        row.update(
+            {
+                "日期": report_date,
+                "账户ID": account_id,
+                "初始资金": initial_cash,
+                "标的价格": spot,
+                "对冲持仓": hedge_qty,
+                "对冲成本": hedge_cost,
+                "对冲最新价": spot,
+                "对冲估值价": spot,
+                "对冲估值价类型": _hedge_mark_price_type(report_date),
+                "对冲浮盈亏": hedge_unrealized,
+                "对冲已实现盈亏": hedge_realized,
+                "对冲总盈亏": hedge_unrealized + hedge_realized,
+                "估算权益": _number(report_row.get("估算权益")),
+                "期权浮盈亏": option_unrealized,
+                "期权已实现盈亏": option_realized,
+                "期权总盈亏": option_unrealized + option_realized,
+                "手续费": cumulative_fee,
+                "当日手续费": daily_fee,
+                "期权单日盈亏": _number(report_row.get("期权单日盈亏")),
+                "对冲单日盈亏": _number(report_row.get("ETF单日盈亏")),
+                "ETF单日盈亏": _number(report_row.get("ETF单日盈亏")),
+                "总单日盈亏": _number(report_row.get("总单日盈亏(手续费前)")),
+                "净单日盈亏": _number(report_row.get("净单日盈亏")),
+                "账户Delta": _number(report_row.get("账户Delta")),
+                "期权Delta": (
+                    None
+                    if _number(report_row.get("账户Delta")) is None
+                    else _number(report_row.get("账户Delta")) - hedge_qty
+                ),
+                "账户Gamma": _number(report_row.get("账户Gamma")),
+                "账户Vega": _number(report_row.get("账户Vega")),
+                "账户Theta": _number(report_row.get("账户Theta")),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
 
 
 def prepare_account_report_market(product, source="akshare", date=None):

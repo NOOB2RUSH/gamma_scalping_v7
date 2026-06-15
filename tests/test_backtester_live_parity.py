@@ -42,6 +42,43 @@ def _short_position(qty=80):
 
 
 class BacktesterLiveParityTest(unittest.TestCase):
+    def test_day_aggregates_clear_stale_eod_marks_after_position_close(self):
+        engine = _engine()
+        state = backtester.BacktestState(cash=1_000_000.0)
+        day = engine._new_day(pd.Timestamp("2026-06-12"), 1.8, {}, None)
+        record = day["side_records"]["short"]
+        record["option_value"] = -160_000.0
+        record["greeks"]["delta"] = -200_000.0
+        record["pnl_greeks"]["delta"] = -180_000.0
+        record["eod_position_dte"] = 20
+
+        engine._update_day_aggregates(day, state)
+
+        self.assertEqual(day["option_value"], 0.0)
+        self.assertEqual(day["greeks"]["delta"], 0.0)
+        self.assertEqual(day["pnl_greeks"]["delta"], -180_000.0)
+        self.assertIsNone(day["eod_position_dte"])
+
+    def test_execute_delta_hedge_rounds_to_etf_board_lot(self):
+        trades = []
+
+        result = backtester.execute_delta_hedge(
+            pd.Timestamp("2026-06-12"),
+            1_000_000.0,
+            {"delta": -259290.84776481945},
+            53100.0,
+            1.756,
+            53100.0,
+            1.8,
+            trades,
+            etf_fee_rate=0.0,
+            underlying_order_book_id="588000.XSHG",
+            current_underlying_order_book_id="588000.XSHG",
+        )
+
+        self.assertEqual(result[1], 259300)
+        self.assertEqual(trades[0]["trade_etf_qty"], 206200)
+
     def test_fixed_live_quantities_when_dynamic_scaling_is_disabled(self):
         engine = _engine()
         engine.config["dynamic_position_control_enabled"] = False
@@ -75,6 +112,56 @@ class BacktesterLiveParityTest(unittest.TestCase):
             qty = engine._dynamic_target_qty(day, state, atm, 80, "short")
 
         self.assertEqual(qty, 39)
+
+    def test_dynamic_reduction_keeps_maximum_qty_that_allows_neutral_hedge(self):
+        engine = _engine()
+        state = backtester.BacktestState(
+            cash=1_000_000.0,
+            positions={"long": None, "short": _short_position(qty=80)},
+        )
+        position = state.positions["short"]
+        position["option_margin"] = 431_680.0
+        day = engine._new_day(pd.Timestamp("2026-06-12"), 1.8, {}, None)
+        day["greeks"]["delta"] = -259290.84776481945
+        day["side_records"]["short"]["greeks"]["delta"] = -259290.84776481945
+
+        target = engine._dynamic_reduction_target_qty(
+            day,
+            state,
+            "short",
+            position,
+            80,
+            800_000.0,
+        )
+
+        self.assertEqual(target, 71)
+
+    def test_dynamic_occupation_reduction_forces_neutral_hedge(self):
+        engine = _engine()
+        engine.config["dynamic_position_control_enabled"] = True
+        state = backtester.BacktestState(
+            cash=1_000_000.0,
+            positions={"long": None, "short": _short_position(qty=80)},
+        )
+        day = engine._new_day(pd.Timestamp("2026-06-12"), 1.8, {}, None)
+        day["greeks"]["delta"] = -259290.84776481945
+        with (
+            patch.object(
+                engine,
+                "_current_nav_and_occupation",
+                side_effect=[
+                    (1_000_000.0, 900_000.0),
+                    (1_000_000.0, 790_000.0),
+                ],
+            ),
+            patch.object(engine, "_update_day_aggregates"),
+            patch.object(engine, "_dynamic_reduction_target_qty", return_value=71),
+            patch.object(engine, "_reduce_position_for_margin", return_value=True),
+            patch.object(engine, "_hedge_to") as hedge_to,
+        ):
+            engine._enforce_dynamic_occupation_limit(day, state)
+
+        self.assertEqual(hedge_to.call_args.kwargs["target_qty"], 259300)
 
     def test_open_allows_same_close_delta_hedge_in_daily_backtest(self):
         engine = _engine()
@@ -164,7 +251,7 @@ class BacktesterLiveParityTest(unittest.TestCase):
         reduce.assert_called_once_with(day, state, "short", 8)
         self.assertTrue(day["defer_delta_hedge"])
 
-    def test_existing_short_margin_is_not_refreshed_from_market(self):
+    def test_existing_short_margin_refresh_preserves_nav(self):
         engine = _engine()
         state = backtester.BacktestState(
             cash=100.0,
@@ -175,19 +262,36 @@ class BacktesterLiveParityTest(unittest.TestCase):
         with patch.object(
             backtester.opt_position,
             "calc_short_margin",
-            side_effect=AssertionError("live margin must remain broker-imported"),
+            return_value=80.0,
         ):
-            engine._set_existing_position_eod(
+            engine._refresh_short_margin(
                 day,
                 state,
                 "short",
-                pd.Series({"mid": 0.001}),
-                pd.Series({"mid": 0.001}),
-                backtester.empty_greeks(),
-                10,
+                pd.Series({"mid": 0.001, "underlying_close": 1.0}),
+                pd.Series({"mid": 0.001, "underlying_close": 1.0}),
             )
 
-        self.assertEqual(state.positions["short"]["option_margin"], 50.0)
+        self.assertEqual(state.cash, 70.0)
+        self.assertEqual(state.positions["short"]["option_margin"], 80.0)
+        self.assertEqual(state.cash + state.positions["short"]["option_margin"], 150.0)
+
+    def test_etf_capital_occupation_uses_current_market_value(self):
+        engine = _engine()
+        state = backtester.BacktestState(
+            cash=900.0,
+            hedge_etf_qty=100.0,
+            hedge_entry_price=1.0,
+            hedge_margin=100.0,
+            hedge_underlying_order_book_id="ETF",
+        )
+        day = engine._new_day(pd.Timestamp("2026-06-11"), 2.0, {}, pd.DataFrame())
+
+        with patch.object(engine, "_get_hedge_price", return_value=2.0):
+            nav, occupation = engine._current_nav_and_occupation(day, state)
+
+        self.assertEqual(nav, 1_100.0)
+        self.assertEqual(occupation, 200.0)
 
 
 if __name__ == "__main__":

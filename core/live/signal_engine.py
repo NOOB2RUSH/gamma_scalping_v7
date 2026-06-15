@@ -9,6 +9,7 @@ import pandas as pd
 
 import core
 from . import account as account_store
+from . import market_data
 from . import storage
 from .runtime import load_product_config
 
@@ -537,12 +538,17 @@ def _atm_strike_for_roll_check(
         )
         spot = float(etf_by_date[date]["close"].iloc[-1])
         atm = core.vol_engine.select_atm_from_chain(chain_df, spot)
-    except Exception as exc:
-        raise ValueError(
-            "Missing ATM strike for roll mismatch check: "
-            f"date={date.date()}, cannot build from signal history or daily market data: {exc}. "
-            "No strategy_state fallback is used."
-        ) from exc
+    except Exception as local_exc:
+        try:
+            historical_atm = market_data.fetch_historical_atm_strike(product, date)
+            return float(historical_atm["strike"]), historical_atm["source"]
+        except Exception as akshare_exc:
+            raise ValueError(
+                "Missing ATM strike for roll mismatch check: "
+                f"date={date.date()}, cannot build from signal history, daily market data "
+                f"({local_exc}), or AKShare historical market data ({akshare_exc}). "
+                "No strategy_state fallback is used."
+            ) from akshare_exc
 
     if atm is None or pd.isna(atm.get("strike")):
         raise ValueError(
@@ -1102,6 +1108,7 @@ def _live_capacity_reduction_item(
     chain_df,
     spot,
     required_cash_relief=0.0,
+    minimum_close_qty=0,
     reason=None,
 ):
     short_position = live_account.positions.get("short")
@@ -1133,11 +1140,26 @@ def _live_capacity_reduction_item(
         0.0,
         capacity["nav"] * float(config.backtest.max_margin_to_nav_ratio),
     )
-    margin_excess = max(0.0, capacity["total_margin"] - margin_limit)
-    if cash_shortfall <= 1e-6 and margin_excess <= 1e-6:
+    capacity_usage = (
+        capacity["capital_occupation"]
+        if getattr(config.backtest, "dynamic_position_control_enabled", False)
+        else capacity["total_margin"]
+    )
+    margin_excess = max(0.0, capacity_usage - margin_limit)
+    if (
+        cash_shortfall <= 1e-6
+        and margin_excess <= 1e-6
+        and int(minimum_close_qty or 0) <= 0
+    ):
         return None
 
-    option_margin = float(short_position.get("option_margin", 0.0) or 0.0)
+    option_margin = _current_short_margin(
+        config,
+        short_position,
+        call_row,
+        put_row,
+        spot,
+    )
     margin_relief_per_contract = option_margin / current_qty
     multiplier = float(
         short_position.get(
@@ -1165,7 +1187,10 @@ def _live_capacity_reduction_item(
         if margin_excess > 0 and margin_relief_per_contract > 0
         else 0
     )
-    close_qty = min(current_qty, max(close_for_cash, close_for_margin))
+    close_qty = min(
+        current_qty,
+        max(close_for_cash, close_for_margin, int(minimum_close_qty or 0)),
+    )
     if close_qty <= 0:
         return {
             "action": "DATA_WARNING",
@@ -1177,6 +1202,7 @@ def _live_capacity_reduction_item(
             "cash": float(live_account.cash),
             "min_cash_reserve": min_cash,
             "total_margin": capacity["total_margin"],
+            "capital_occupation": capacity["capital_occupation"],
             "margin_limit": margin_limit,
         }
 
@@ -1206,39 +1232,178 @@ def _live_capacity_reduction_item(
         "cash_before": float(live_account.cash),
         "projected_cash_after": float(live_account.cash) + estimated_cash_effect,
         "min_cash_reserve": min_cash,
-        "margin_before": capacity["total_margin"],
-        "projected_margin_after": capacity["total_margin"]
+        "margin_before": capacity_usage,
+        "projected_margin_after": capacity_usage
         - margin_relief_per_contract * close_qty,
         "margin_limit": margin_limit,
         "requires_import_and_rerun": True,
     }
 
 
+def _delta_hedge_capacity_reduction_item(
+    config,
+    live_account,
+    chain_df,
+    spot,
+    option_delta,
+    target_hedge_qty,
+):
+    if not getattr(config.backtest, "dynamic_position_control_enabled", False):
+        return None
+
+    short_position = live_account.positions.get("short")
+    if short_position is None:
+        return None
+    try:
+        call_row, put_row = core.vol_engine.resolve_position_pair(
+            short_position,
+            chain_df,
+        )
+    except IndexError:
+        return None
+
+    current_qty = min(
+        int(short_position.get("call_qty", 0) or 0),
+        int(short_position.get("put_qty", 0) or 0),
+    )
+    if current_qty <= 0:
+        return None
+
+    capacity = _live_account_capacity(config, live_account, chain_df, spot)
+    occupation_limit = max(
+        0.0,
+        capacity["nav"] * float(config.backtest.max_margin_to_nav_ratio),
+    )
+    current_hedge_occupation = capacity["hedge_capital_occupation"]
+    projected_occupation = (
+        capacity["capital_occupation"]
+        - current_hedge_occupation
+        + abs(float(target_hedge_qty)) * float(spot)
+    )
+    if projected_occupation <= occupation_limit + 1e-6:
+        return None
+
+    short_margin = _current_short_margin(
+        config,
+        short_position,
+        call_row,
+        put_row,
+        spot,
+    )
+    short_greeks = core.strategy.calc_position_greeks(
+        call_row,
+        put_row,
+        current_qty,
+        current_qty,
+        side="short",
+    )
+    short_delta = float(short_greeks["delta"])
+    other_occupation = (
+        capacity["capital_occupation"] - current_hedge_occupation - short_margin
+    )
+    selected = None
+    for close_qty in range(1, current_qty + 1):
+        remaining_ratio = (current_qty - close_qty) / current_qty
+        projected_option_delta = option_delta - short_delta * (close_qty / current_qty)
+        projected_target = core.strategy.round_etf_hedge_target(-projected_option_delta)
+        occupation_after = (
+            other_occupation
+            + short_margin * remaining_ratio
+            + abs(projected_target) * float(spot)
+        )
+        if occupation_after <= occupation_limit + 1e-6:
+            selected = {
+                "close_qty": close_qty,
+                "projected_target_hedge_qty": projected_target,
+                "projected_capital_occupation": occupation_after,
+            }
+            break
+
+    if selected is None:
+        selected = {
+            "close_qty": current_qty,
+            "projected_target_hedge_qty": core.strategy.round_etf_hedge_target(
+                -(option_delta - short_delta)
+            ),
+            "projected_capital_occupation": other_occupation
+            + abs(
+                core.strategy.round_etf_hedge_target(
+                    -(option_delta - short_delta)
+                )
+            )
+            * float(spot),
+        }
+
+    item = _live_capacity_reduction_item(
+        config,
+        live_account,
+        chain_df,
+        spot,
+        minimum_close_qty=selected["close_qty"],
+        reason=(
+            "Reduce the short straddle before a delta-neutral ETF hedge would "
+            "breach the live capital occupation limit."
+        ),
+    )
+    if item is not None:
+        item.update(
+            {
+                "projected_capital_occupation_before_reduction": projected_occupation,
+                "projected_capital_occupation_after_reduction_and_hedge": selected[
+                    "projected_capital_occupation"
+                ],
+                "capital_occupation_limit": occupation_limit,
+                "projected_target_hedge_qty_after_reduction": selected[
+                    "projected_target_hedge_qty"
+                ],
+            }
+        )
+    return item
+
+
 def _live_account_capacity(config, live_account, chain_df, spot):
     option_value = 0.0
-    option_margin = 0.0
+    stored_option_margin = 0.0
+    current_option_margin = 0.0
     for side, position in live_account.positions.items():
         if position is None:
             continue
-        option_margin += float(position.get("option_margin", 0.0) or 0.0)
+        stored_option_margin += float(position.get("option_margin", 0.0) or 0.0)
         try:
             call_row, put_row = core.vol_engine.resolve_position_pair(position, chain_df)
         except IndexError:
             continue
         option_value += core.position.signed_value(position, call_row, put_row)
+        if side == "short":
+            current_option_margin += _current_short_margin(
+                config,
+                position,
+                call_row,
+                put_row,
+                spot,
+            )
     for hedge_position in getattr(live_account, "option_hedges", []) or []:
         _, value = _option_hedge_greeks_and_value(hedge_position, chain_df)
         option_value += float(value or 0.0)
-        option_margin += float(hedge_position.get("option_margin", 0.0) or 0.0)
+        stored_option_margin += float(hedge_position.get("option_margin", 0.0) or 0.0)
+        current_option_margin += _current_option_hedge_margin(
+            config,
+            hedge_position,
+            chain_df,
+            spot,
+        )
 
-    hedge_margin = float(live_account.hedge.margin or 0.0)
-    hedge_price = float(live_account.hedge.latest_price or spot)
+    stored_hedge_margin = float(live_account.hedge.margin or 0.0)
+    hedge_price = float(spot)
+    hedge_qty = float(live_account.hedge.qty or 0.0)
     hedge_pnl = core.hedge.calc_unrealized_pnl(
-        float(live_account.hedge.qty or 0.0),
+        hedge_qty,
         float(live_account.hedge.entry_price or 0.0),
         hedge_price,
     )
-    total_margin = option_margin + hedge_margin
+    total_margin = stored_option_margin + stored_hedge_margin
+    hedge_capital_occupation = abs(hedge_qty) * hedge_price
+    capital_occupation = current_option_margin + hedge_capital_occupation
     nav = (
         float(live_account.cash)
         + option_value
@@ -1248,7 +1413,44 @@ def _live_account_capacity(config, live_account, chain_df, spot):
     return {
         "nav": nav,
         "total_margin": total_margin,
+        "current_option_margin": current_option_margin,
+        "hedge_capital_occupation": hedge_capital_occupation,
+        "capital_occupation": capital_occupation,
     }
+
+
+def _current_short_margin(config, position, call_row, put_row, spot):
+    underlying_price = call_row.get("underlying_close")
+    if pd.isna(underlying_price):
+        underlying_price = spot
+    return core.position.calc_short_margin(
+        call_row,
+        put_row,
+        int(position.get("call_qty", 0) or 0),
+        int(position.get("put_qty", 0) or 0),
+        float(underlying_price),
+    )
+
+
+def _current_option_hedge_margin(config, hedge_position, chain_df, spot):
+    if hedge_position.get("side", "long") != "short":
+        return 0.0
+    rows = chain_df[
+        chain_df["order_book_id"].astype(str)
+        == str(hedge_position.get("order_book_id"))
+    ]
+    if rows.empty:
+        return float(hedge_position.get("option_margin", 0.0) or 0.0)
+    row = rows.iloc[-1]
+    underlying_price = row.get("underlying_close")
+    if pd.isna(underlying_price):
+        underlying_price = spot
+    return core.position.margin_call(
+        float(underlying_price),
+        float(row.get("strike_price")),
+        float(row.get("mid")),
+        float(row.get("contract_multiplier", config.vol.contract_multiplier)),
+    ) * int(hedge_position.get("qty", 0) or 0)
 
 
 def _is_option_execution_action(action):
@@ -1455,11 +1657,22 @@ def _delta_hedge_plan(
             ),
         ]
 
-    target_qty = -option_delta
+    target_qty = core.strategy.round_etf_hedge_target(-option_delta)
     if underlying_order_book_id is None:
         underlying_order_book_id = _underlying_id_from_atm(atm)
 
     if getattr(config.strategy, "allow_etf_short_hedge", True) or target_qty >= 0:
+        reduction_item = _delta_hedge_capacity_reduction_item(
+            config,
+            live_account,
+            chain_df,
+            spot,
+            option_delta,
+            target_qty,
+        )
+        if reduction_item is not None:
+            return [reduction_item]
+
         trade_qty = target_qty - current_hedge_qty
         projected_cash = float(live_account.cash) - max(0.0, trade_qty) * float(
             spot

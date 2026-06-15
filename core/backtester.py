@@ -146,6 +146,7 @@ def execute_delta_hedge(
 
     if target_qty is None:
         target_qty = -greeks["delta"]
+    target_qty = strategy.round_etf_hedge_target(target_qty)
     if target_qty == 0:
         underlying_order_book_id = current_underlying_order_book_id
     if current_price is None:
@@ -927,6 +928,7 @@ class BacktestEngine:
             record["pnl_call_iv"] = greeks["call_iv"]
             record["pnl_put_iv"] = greeks["put_iv"]
             record["pnl_greeks"] = greeks.copy()
+            self._refresh_short_margin(day, state, side, call_row, put_row)
             self._set_side_eod(
                 day,
                 state,
@@ -936,6 +938,28 @@ class BacktestEngine:
                 int(call_row["dte"]),
             )
         self._update_day_aggregates(day, state)
+
+    def _refresh_short_margin(self, day, state, side, call_row, put_row):
+        position = state.positions.get(side)
+        if position is None or position.get("side", "long") != "short":
+            return
+        underlying_price = call_row.get("underlying_close")
+        if pd.isna(underlying_price):
+            underlying_price = self._position_underlying_price(
+                day,
+                position,
+                day["spot"],
+            )
+        old_margin = float(position.get("option_margin", 0.0) or 0.0)
+        new_margin = opt_position.calc_short_margin(
+            call_row,
+            put_row,
+            position["call_qty"],
+            position["put_qty"],
+            underlying_price,
+        )
+        state.cash -= new_margin - old_margin
+        position["option_margin"] = new_margin
 
     def _entry_target_qty(self, feature_row, max_qty, side):
         if side == "short":
@@ -1292,7 +1316,19 @@ class BacktestEngine:
             signed_value = self._single_option_signed_value(hedge_position, row)
             option_value += signed_value
             if side == "short":
-                margin += hedge_position.get("option_margin", 0.0)
+                old_margin = float(hedge_position.get("option_margin", 0.0) or 0.0)
+                underlying_price = row.get("underlying_close")
+                if pd.isna(underlying_price):
+                    underlying_price = day["spot"]
+                new_margin = opt_position.margin_call(
+                    float(underlying_price),
+                    float(row["strike_price"]),
+                    float(row["mid"]),
+                    float(row["contract_multiplier"]),
+                ) * qty
+                state.cash -= new_margin - old_margin
+                hedge_position["option_margin"] = new_margin
+                margin += new_margin
             hedge_position["last_price"] = float(row["mid"])
             hedge_position["last_option_value"] = signed_value
             greeks_list.append(single_call_greeks(row, qty, side))
@@ -1303,6 +1339,12 @@ class BacktestEngine:
     def _update_day_aggregates(self, day, state=None):
         if state is not None:
             self._update_option_hedge_marks(day, state)
+            for side in POSITION_SIDES:
+                if state.positions.get(side) is None:
+                    record = day["side_records"][side]
+                    record["option_value"] = 0.0
+                    record["greeks"] = empty_greeks()
+                    record["eod_position_dte"] = None
         side_records = day["side_records"]
         day["core_option_value"] = sum(
             side_records[side]["option_value"] for side in POSITION_SIDES
@@ -1648,7 +1690,12 @@ class BacktestEngine:
             self._option_hedge_capital_occupation(position)
             for position in state.option_hedges
         )
-        occupation += float(state.hedge_margin)
+        hedge_price = self._get_hedge_price(
+            day["date"],
+            state.hedge_underlying_order_book_id,
+            day["spot"],
+        )
+        occupation += abs(float(state.hedge_etf_qty)) * float(hedge_price)
         return nav, occupation
 
     def _reduce_position_for_margin(self, day, state, side, target_qty):
@@ -1810,7 +1857,16 @@ class BacktestEngine:
                 nav, occupation = self._current_nav_and_occupation(day, state)
                 occupation_limit = max(0.0, nav * ratio_limit)
                 if nav > 0 and occupation <= occupation_limit + 1e-6:
-                    self._hedge_to(day["date"], day["spot"], state, day, day["greeks"])
+                    self._hedge_to(
+                        day["date"],
+                        day["spot"],
+                        state,
+                        day,
+                        day["greeks"],
+                        target_qty=strategy.round_etf_hedge_target(
+                            -float(day["greeks"]["delta"])
+                        ),
+                    )
                     changed = True
                     continue
 
@@ -1825,16 +1881,28 @@ class BacktestEngine:
             current_qty = min(int(position["call_qty"]), int(position["put_qty"]))
             if current_qty <= 0:
                 break
-            scale = max(
-                0.0,
-                min(0.99, occupation_limit / max(occupation, 1.0)),
+            target_qty = self._dynamic_reduction_target_qty(
+                day,
+                state,
+                side,
+                position,
+                current_qty,
+                occupation_limit,
             )
-            target_qty = min(current_qty - 1, int(math.floor(current_qty * scale)))
             if not self._reduce_position_for_margin(day, state, side, target_qty):
                 break
             changed = True
             self._update_day_aggregates(day, state)
-            self._hedge_to(day["date"], day["spot"], state, day, day["greeks"])
+            self._hedge_to(
+                day["date"],
+                day["spot"],
+                state,
+                day,
+                day["greeks"],
+                target_qty=strategy.round_etf_hedge_target(
+                    -float(day["greeks"]["delta"])
+                ),
+            )
 
         nav, occupation = self._current_nav_and_occupation(day, state)
         state.trades.append(
@@ -1848,6 +1916,46 @@ class BacktestEngine:
             }
         )
         return changed
+
+    def _dynamic_reduction_target_qty(
+        self,
+        day,
+        state,
+        side,
+        position,
+        current_qty,
+        occupation_limit,
+    ):
+        position_occupation = self._position_capital_occupation(position)
+        other_occupation = sum(
+            self._position_capital_occupation(candidate)
+            for candidate_side, candidate in state.positions.items()
+            if candidate is not None and candidate_side != side
+        )
+        other_occupation += sum(
+            self._option_hedge_capital_occupation(candidate)
+            for candidate in state.option_hedges
+        )
+
+        position_delta = float(
+            day["side_records"].get(side, {}).get("greeks", {}).get("delta", 0.0)
+            or 0.0
+        )
+        other_delta = float(day["greeks"]["delta"]) - position_delta
+        for target_qty in range(current_qty - 1, -1, -1):
+            remaining_ratio = target_qty / current_qty
+            projected_option_delta = other_delta + position_delta * remaining_ratio
+            projected_hedge_qty = strategy.round_etf_hedge_target(
+                -projected_option_delta
+            )
+            projected_occupation = (
+                other_occupation
+                + position_occupation * remaining_ratio
+                + abs(projected_hedge_qty) * float(day["spot"])
+            )
+            if projected_occupation <= occupation_limit + 1e-6:
+                return target_qty
+        return 0
 
     def _close_option_delta_hedges(self, date, state, day):
         if not state.option_hedges:
@@ -2147,7 +2255,9 @@ class BacktestEngine:
             if delta_capacity > 0 and abs(normalized_delta) <= tolerance_ratio:
                 return
 
-        projected_target_qty = -option_delta if target_qty is None else float(target_qty)
+        projected_target_qty = strategy.round_etf_hedge_target(
+            -option_delta if target_qty is None else float(target_qty)
+        )
         if (
             self.config.get("allow_etf_short_hedge", True)
             or projected_target_qty >= 0
