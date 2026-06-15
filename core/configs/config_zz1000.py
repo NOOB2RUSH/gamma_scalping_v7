@@ -77,7 +77,7 @@ CONFIG = AppConfig(
         dividend_yield=0.0,
     ),
     report=ReportConfig(
-        output_root="output",
+        output_root="output/backtest",
         daily_feature_cols=("yz_hv60", "atm_iv_percentile"),
     ),
     reference=ReferenceCurveConfig(

@@ -151,7 +151,7 @@ def make_output_dir(args):
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = Path("output") / (
+        output_dir = Path("output") / "backtest" / (
             f"optimize_{args.product}_abs_remote_{timestamp()}"
         )
     output_dir.mkdir(parents=True, exist_ok=True)

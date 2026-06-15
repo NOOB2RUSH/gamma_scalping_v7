@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -10,7 +10,12 @@ from .runtime import PROJECT_ROOT
 
 
 def utc_now_text():
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 def local_now_stamp():
@@ -35,6 +40,12 @@ def feature_history_path(product):
     path = PROJECT_ROOT / "state" / "live" / product
     path.mkdir(parents=True, exist_ok=True)
     return path / "feature_history.parquet"
+
+
+def historical_atm_cache_path(product):
+    path = PROJECT_ROOT / "state" / "live" / product
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "historical_atm_cache.csv"
 
 
 def account_report_summary_history_path(product, account_id="default"):

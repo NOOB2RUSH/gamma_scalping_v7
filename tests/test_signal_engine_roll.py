@@ -10,6 +10,54 @@ from core.live import signal_engine
 
 
 class SignalEngineRollTest(unittest.TestCase):
+    def test_atm_strike_falls_back_to_akshare_historical_market_data(self):
+        with (
+            mock.patch.object(
+                signal_engine.core.data_loader,
+                "load_etf_series",
+                side_effect=ValueError("ETF data is empty"),
+            ),
+            mock.patch.object(
+                signal_engine.market_data,
+                "fetch_historical_atm_strike",
+                return_value={
+                    "strike": 1.75,
+                    "source": "akshare_historical_market_data",
+                },
+            ) as fallback,
+        ):
+            strike, source = signal_engine._atm_strike_for_roll_check(
+                "kc50etf",
+                pd.DataFrame(),
+                pd.Timestamp("2026-06-09"),
+                pd.Timestamp("2026-06-10"),
+            )
+
+        self.assertEqual(strike, 1.75)
+        self.assertEqual(source, "akshare_historical_market_data")
+        fallback.assert_called_once_with("kc50etf", pd.Timestamp("2026-06-09"))
+
+    def test_atm_strike_reports_local_and_akshare_failures(self):
+        with (
+            mock.patch.object(
+                signal_engine.core.data_loader,
+                "load_etf_series",
+                side_effect=ValueError("ETF data is empty"),
+            ),
+            mock.patch.object(
+                signal_engine.market_data,
+                "fetch_historical_atm_strike",
+                side_effect=ValueError("AKShare unavailable"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "AKShare historical market data"):
+                signal_engine._atm_strike_for_roll_check(
+                    "kc50etf",
+                    pd.DataFrame(),
+                    pd.Timestamp("2026-06-09"),
+                    pd.Timestamp("2026-06-10"),
+                )
+
     def test_roll_check_skips_history_when_current_strike_matches_atm(self):
         config = SimpleNamespace(
             strategy=SimpleNamespace(
