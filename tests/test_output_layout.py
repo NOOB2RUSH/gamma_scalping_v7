@@ -14,6 +14,7 @@ class OutputLayoutTest(unittest.TestCase):
         live_root = storage.output_dir("kc50etf").parent
         self.assertEqual(live_root.name, "live")
         self.assertEqual(live_root.parent.name, "output")
+        self.assertEqual(storage.portfolio_output_dir().parent, live_root)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ from core.live import report, signal_engine, storage
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate one simulated live signal.")
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--date", default=None)
     parser.add_argument("--json", action="store_true")

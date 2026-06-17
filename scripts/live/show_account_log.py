@@ -12,7 +12,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Show live account state, confirmed fills, and reconciliation history."
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(

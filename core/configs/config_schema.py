@@ -117,35 +117,9 @@ class ReportConfig:
 
 
 @dataclass(frozen=True)
-class ReferenceCurveConfig:
-    # 参考曲线只用于图表和 CSV 对比，不影响主策略 baseline。
-    enable_always_atm: bool = True
-    always_atm_side: str = "short"
-    always_atm_qty: int = 25
-    always_atm_enable_delta_hedge: bool = False
-
-    # 实验曲线用于后续试验，默认与主策略方向一致。
-    enable_experiment: bool = True
-    experiment_short_signal_mode: str = "absolute"
-    experiment_enable_delta_hedge: bool = False
-    experiment_enable_long_straddle: bool = True
-    experiment_enable_short_straddle: bool = True
-    experiment_short_stop_loss_enabled: bool = False
-    experiment_short_volume_spike_exit_enabled: bool = True
-    experiment_short_cooldown_after_long_iv_high_exit_days: int = 3
-    experiment_short_low_iv_open_threshold: float | None = None
-    experiment_short_low_iv_close_threshold: float | None = None
-    experiment_short_low_iv_hv_spread_threshold: float | None = None
-    experiment_short_low_iv_close_spread_threshold: float | None = None
-    experiment_long_qty: int | None = None
-    experiment_short_qty: int | None = None
-
-
-@dataclass(frozen=True)
 class AppConfig:
     data: DataConfig
     backtest: BacktestConfig
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
     vol: VolConfig = field(default_factory=VolConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
-    reference: ReferenceCurveConfig = field(default_factory=ReferenceCurveConfig)

@@ -10,7 +10,7 @@ from core.live.runtime import load_product_config
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Initialize a live shadow account.")
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--cash", type=float, default=None)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--reset", action="store_true")

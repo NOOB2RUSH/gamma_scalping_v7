@@ -25,7 +25,7 @@ def parse_args():
             "touching live account state."
         )
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument(
         "--interval-seconds",

@@ -10,13 +10,19 @@ import pandas as pd
 import core
 from . import account as account_store
 from . import market_data
+from . import portfolio_account
 from . import storage
 from .runtime import load_product_config
 
 
+LIVE_ENTRY_QTY_PER_LEG = 10
+
+
 def generate_signal(product, account_id="default", date=None, quote_snapshot=None):
+    market_data.require_live_product(product)
     config = load_product_config(product)
     live_account = account_store.load_account(product, account_id=account_id)
+    live_account.cash = portfolio_account.shared_cash(account_id=account_id)
     market = _load_market_context(
         config,
         date,
@@ -157,6 +163,7 @@ def preview_signal(product, account_id="default", date=None, quote_snapshot=None
 
 
 def _load_market_context(config, date, quote_snapshot=None):
+    market_data.require_live_product(config.data.product)
     start = config.backtest.start
     end = pd.Timestamp.now().normalize() if date is None else date
     etf_by_date = core.data_loader.load_etf_series(start, end)
@@ -188,6 +195,10 @@ def _load_market_context(config, date, quote_snapshot=None):
         latest_opt_by_date,
         trading_calendar,
         latest_date,
+    )
+    latest_enriched = market_data.attach_live_underlying_id(
+        config.data.product,
+        latest_enriched,
     )
     latest_features = core.vol_engine.build_vol_features(
         etf_by_date,
@@ -644,8 +655,8 @@ def _entry_advice(config, feature_row, atm, spot, strategy_state):
 
     advice = []
     for side, signal_col, action, qty in [
-        ("long", "long_open_signal", "OPEN_LONG_STRADDLE", config.backtest.long_qty),
-        ("short", "short_open_signal", "OPEN_SHORT_STRADDLE", config.backtest.short_qty),
+        ("long", "long_open_signal", "OPEN_LONG_STRADDLE", LIVE_ENTRY_QTY_PER_LEG),
+        ("short", "short_open_signal", "OPEN_SHORT_STRADDLE", LIVE_ENTRY_QTY_PER_LEG),
     ]:
         if not bool(feature_row.get(signal_col, False)):
             continue
@@ -1013,11 +1024,6 @@ def _build_execution_plan(
     )
     if planned_greeks is None:
         return plan, account_greeks
-    if any(
-        str(item.get("action") or "").startswith(("OPEN_", "ROLL_"))
-        for item in option_actions
-    ):
-        return plan, planned_greeks
 
     final_hedge = _final_hedge_advice(
         config,
@@ -1542,10 +1548,12 @@ def _final_hedge_advice(
 
     planned_option_delta = float(planned_greeks["delta"])
     planned_account_delta = planned_option_delta + live_account.hedge.qty
-    planned_positions = dict(live_account.positions)
-    for item in option_actions:
-        if str(item.get("action") or "").startswith("CLOSE_"):
-            planned_positions[item.get("side")] = None
+    planned_positions = _positions_after_option_actions(
+        config,
+        live_account.positions,
+        option_actions,
+        chain_df,
+    )
     normalized_delta, delta_capacity = core.strategy.normalized_account_delta(
         planned_account_delta,
         planned_positions,
@@ -1588,6 +1596,38 @@ def _final_hedge_advice(
         item.setdefault("delta_hedge_tolerance_ratio", tolerance_ratio)
         item.setdefault("delta_hedge_capacity", delta_capacity)
     return plan
+
+
+def _positions_after_option_actions(config, current_positions, option_actions, chain_df):
+    planned_positions = dict(current_positions)
+    for item in option_actions:
+        action = str(item.get("action") or "")
+        side = item.get("side")
+        if side not in account_store.POSITION_SIDES:
+            continue
+        if action.startswith("CLOSE_"):
+            planned_positions[side] = None
+            continue
+
+        leg_fields = _planned_leg_fields(item)
+        if leg_fields is None:
+            continue
+        call_code, put_code, call_qty, put_qty = leg_fields
+        try:
+            call_row = _chain_row(chain_df, call_code)
+        except IndexError:
+            continue
+        planned_positions[side] = {
+            "call_code": call_code,
+            "put_code": put_code,
+            "call_qty": int(call_qty or 0),
+            "put_qty": int(put_qty or 0),
+            "contract_multiplier": float(
+                call_row.get("contract_multiplier", config.vol.contract_multiplier)
+                or config.vol.contract_multiplier
+            ),
+        }
+    return planned_positions
 
 
 def _delta_hedge_plan(
@@ -2224,7 +2264,7 @@ def _short_call_delta_hedge_item(
 def _light_itm_call_candidates(config, calls, spot):
     if calls.empty:
         return calls
-    calls = calls.copy()
+    calls = core.vol_engine.filter_standard_option_contracts(calls).copy()
     calls["_strike"] = pd.to_numeric(calls["strike_price"], errors="coerce")
     calls["_volume"] = pd.to_numeric(calls.get("volume"), errors="coerce").fillna(-1.0)
     max_itm_ratio = float(

@@ -38,7 +38,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Reconcile daily PnL with 5-minute intraday Greeks integration."
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)

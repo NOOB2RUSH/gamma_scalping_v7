@@ -10,13 +10,13 @@ from core.live import holding_importer
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Import broker holding snapshot and auto-confirm supported live fills."
+        description="Import broker real-time positions and trade details."
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument(
         "--file",
         default=None,
-        help="Holding CSV path. Defaults to the newest CSV under live_hold/.",
+        help="Real-time holding CSV. Defaults to newest live_hold/实时持仓*.csv.",
     )
     parser.add_argument("--account-id", default="default")
     parser.add_argument(

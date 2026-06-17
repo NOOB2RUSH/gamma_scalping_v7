@@ -2,18 +2,16 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
-
-import pandas as pd
 
 import _bootstrap  # noqa: F401
 import core
 from core.live import (
     account,
-    account_report,
-    hedge_importer,
+    etf_importer,
     holding_importer,
     market_data,
+    portfolio_account,
+    portfolio_report,
     reconciler,
     report,
     signal_engine,
@@ -24,8 +22,8 @@ from core.live.runtime import load_product_config
 
 def main():
     session = {
-        "product": _choose_product(),
-        "account_id": _prompt("账户ID", "default"),
+        "products": tuple(core.config.available_live_products()),
+        "account_id": "default",
     }
     while True:
         _print_header(session)
@@ -39,7 +37,6 @@ def main():
                 ("6", "查看成交记录"),
                 ("7", "重建账户状态"),
                 ("8", "账户对账"),
-                ("9", "切换品种/账户"),
                 ("0", "退出"),
             ]
         )
@@ -60,9 +57,6 @@ def main():
                 _action_rebuild_account(session)
             elif action == "8":
                 _action_reconcile(session)
-            elif action == "9":
-                session["product"] = _choose_product(session["product"])
-                session["account_id"] = _prompt("账户ID", session["account_id"])
             elif action == "0":
                 print("已退出。")
                 return
@@ -72,119 +66,129 @@ def main():
 
 
 def _action_init_account(session):
-    product = session["product"]
-    config = load_product_config(product)
-    cash = _prompt_float("初始现金", config.backtest.initial_cash)
-    reset = _confirm("是否重置已有账户并清空持仓/fills", False)
-    state = account.initialize_account(
-        product,
-        cash,
-        account_id=session["account_id"],
-        reset=reset,
-    )
-    _print_account_state(state)
+    reset = _confirm("是否重置四个子账户并清空持仓/fills", False)
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            config = load_product_config(product)
+            state = account.initialize_account(
+                product,
+                config.backtest.initial_cash,
+                account_id=session["account_id"],
+                reset=reset,
+            )
+            _print_account_state(state)
+        except Exception as exc:
+            print(f"FAILED {exc}")
 
 
 def _action_quote_signal(session):
     source = _prompt_choice("行情源", ["akshare", "local", "none"], "akshare")
-    if source == "none":
-        date = _prompt_optional("日期，留空则使用已有数据最新日期")
-        snapshot = None
-        signal_date = date or None
-    else:
-        date = _prompt("行情日期", "latest")
-        snapshot = market_data.fetch_quote_snapshot(session["product"], source, date)
-        signal_date = snapshot["quote_date"]
-        print("snapshot saved")
-        _print_dict(snapshot)
-
-    payload = signal_engine.generate_signal(
-        session["product"],
-        session["account_id"],
-        signal_date,
-        quote_snapshot=snapshot,
+    date = (
+        _prompt_optional("日期，留空则使用已有数据最新日期")
+        if source == "none"
+        else _prompt("行情日期", "latest")
     )
-    if snapshot is not None:
-        payload["quote_snapshot"] = snapshot
-    report_path = report.write_signal_report(session["product"], payload)
-    json_path = report_path.with_suffix(".json")
-    storage.write_json(json_path, payload)
-    print(f"quote_date={payload['date']}")
-    print(f"signal_report={report_path}")
-    print(f"signal_json={json_path}")
-    print("read_only=True")
-    for line in report.format_signal_summary(payload):
-        print(line)
-
-
-def _action_confirm_fill(session):
-    payload = _read_fill_or_signal_payload()
-    fill = _select_fill_payload(payload)
-    fill = _edit_fill_payload(fill)
-    print("")
-    print("即将确认成交：")
-    _print_dict(account.normalize_fill(fill))
-    if not _confirm("确认写入账户", False):
-        print("已取消。")
-        return
-    state = account.record_fill(
-        session["product"],
-        fill,
-        account_id=session["account_id"],
-    )
-    print(f"fill_applied={account.normalize_fill(fill)['action']}")
-    _print_account_state(state)
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            snapshot = (
+                None
+                if source == "none"
+                else market_data.fetch_quote_snapshot(product, source, date)
+            )
+            signal_date = (date or None) if snapshot is None else snapshot["quote_date"]
+            payload = signal_engine.generate_signal(
+                product,
+                session["account_id"],
+                signal_date,
+                quote_snapshot=snapshot,
+            )
+            if snapshot is not None:
+                payload["quote_snapshot"] = snapshot
+            report_path = report.write_signal_report(product, payload)
+            json_path = report_path.with_suffix(".json")
+            storage.write_json(json_path, payload)
+            print(f"quote_date={payload['date']}")
+            print(f"signal_report={report_path}")
+            print(f"signal_json={json_path}")
+            print("read_only=True")
+            for line in report.format_signal_summary(payload):
+                print(line)
+        except Exception as exc:
+            print(f"FAILED {exc}")
 
 
 def _action_import_holdings(session):
-    date = _prompt_optional("交易日期，留空则分别自动选择最新 option/hedge 导出")
+    date = _prompt_optional("交易日期，留空则自动选择最新实时持仓和成交明细")
     include_existing = _confirm("导入总持仓，而不是仅导入今日开仓", False)
     dry_run = _confirm("先预览，不写入账户", True)
-    results = _run_auto_imports(
-        session,
-        date=date or None,
-        include_existing=include_existing,
-        dry_run=dry_run,
-    )
-    _print_auto_import_results(results)
-
-    if dry_run and _auto_import_has_writes(results) and _confirm("是否将上述内容写入账户", False):
+    results_by_product = {}
+    for product in session["products"]:
+        print(f"\n## {product}")
         results = _run_auto_imports(
-            session,
+            product,
+            session["account_id"],
             date=date or None,
             include_existing=include_existing,
-            dry_run=False,
-            only_kinds=_auto_import_writable_kinds(results),
+            dry_run=dry_run,
         )
+        results_by_product[product] = results
         _print_auto_import_results(results)
 
+    has_writes = any(
+        _auto_import_has_writes(results)
+        for results in results_by_product.values()
+    )
+    if dry_run and has_writes:
+        if not _confirm("是否将上述内容写入四个子账户", False):
+            print("PREVIEW_ONLY 未写入任何账户；如需导入，请在写入确认时输入 y。")
+            return
+        for product, results in results_by_product.items():
+            kinds = _auto_import_writable_kinds(results)
+            if not kinds:
+                continue
+            print(f"\n## {product}")
+            confirmed = _run_auto_imports(
+                product,
+                session["account_id"],
+                date=date or None,
+                include_existing=include_existing,
+                dry_run=False,
+                only_kinds=kinds,
+            )
+            _print_auto_import_results(confirmed)
+        print("IMPORT_CONFIRMED 已完成账户写入。")
+    elif dry_run:
+        print("PREVIEW_ONLY 没有识别到需要写入账户的新内容。")
 
-def _run_auto_imports(session, date, include_existing, dry_run, only_kinds=None):
-    kinds = set(only_kinds or ["option", "hedge"])
+
+def _run_auto_imports(product, account_id, date, include_existing, dry_run, only_kinds=None):
+    kinds = set(only_kinds or ["options", "etf"])
     results = []
-    if "option" in kinds:
+    if "options" in kinds:
         results.append(
             _try_auto_import(
-                "option",
+                "options",
                 lambda: holding_importer.import_holding_file(
-                    session["product"],
+                    product,
                     file_path=None,
-                    account_id=session["account_id"],
+                    account_id=account_id,
                     date=date,
                     include_existing=include_existing,
                     dry_run=dry_run,
                 ),
             )
         )
-    if "hedge" in kinds:
+    if "etf" in kinds:
         results.append(
             _try_auto_import(
-                "hedge",
-                lambda: hedge_importer.import_hedge_files(
-                    session["product"],
+                "etf",
+                lambda: etf_importer.import_etf_files(
+                    product,
                     holding_file=None,
                     trade_file=None,
-                    account_id=session["account_id"],
+                    account_id=account_id,
                     date=date,
                     dry_run=dry_run,
                 ),
@@ -228,85 +232,37 @@ def _auto_import_writable_kinds(results):
     ]
 
 
-def _action_import_option(session):
-    file_path = _prompt_optional("实时持仓导出文件，留空则自动选择 live_hold/ 最新实时持仓文件")
-    date = _prompt_optional("交易日期，留空则从文件名解析")
-    include_existing = _confirm("导入总持仓，而不是仅导入今日开仓", False)
-    dry_run = _confirm("先预览，不写入账户", True)
-    result = holding_importer.import_holding_file(
-        session["product"],
-        file_path=file_path or None,
-        account_id=session["account_id"],
-        date=date or None,
-        include_existing=include_existing,
-        dry_run=dry_run,
-    )
-    _print_import_result(result)
-    if dry_run and _confirm_import_write(result):
-        result = holding_importer.import_holding_file(
-            session["product"],
-            file_path=file_path or None,
-            account_id=session["account_id"],
-            date=date or None,
-            include_existing=include_existing,
-            dry_run=False,
-        )
-        _print_import_result(result)
-
-
-def _action_import_hedge(session):
-    holding_file = _prompt_optional("证券持仓查询文件，留空则自动选择 live_hold/ 最新证券持仓查询文件")
-    trade_file = _prompt_optional("证券委托查询文件，留空则自动选择 live_hold/ 最新证券委托文件")
-    date = _prompt_optional("交易日期，留空则从文件名解析")
-    dry_run = _confirm("先预览，不写入账户", True)
-    result = hedge_importer.import_hedge_files(
-        session["product"],
-        holding_file=holding_file or None,
-        trade_file=trade_file or None,
-        account_id=session["account_id"],
-        date=date or None,
-        dry_run=dry_run,
-    )
-    _print_import_result(result)
-    if dry_run and _confirm_import_write(result):
-        result = hedge_importer.import_hedge_files(
-            session["product"],
-            holding_file=holding_file or None,
-            trade_file=trade_file or None,
-            account_id=session["account_id"],
-            date=date or None,
-            dry_run=False,
-        )
-        _print_import_result(result)
-
-
 def _action_account_report(session):
     source = _prompt_choice("行情源", ["akshare", "local", "none"], "akshare")
     date = _prompt_optional("日期，留空则最新")
-    report_mode = _prompt_choice("报告模式", ["default", "diagnose"], "default")
     persist_history = _confirm("更新累计账户/持仓历史", True)
-    write_files = _confirm("写出报告文件", True)
-    payload = account_report.build_live_account_report(
-        session["product"],
+    write_files = _confirm("写出组合报告文件", True)
+    payload = portfolio_report.build_portfolio_report(
         account_id=session["account_id"],
+        products=session["products"],
         source=source,
         date=date or None,
         persist_history=persist_history,
     )
     if write_files:
-        paths = account_report.write_live_account_report(
-            session["product"],
-            payload,
-            mode=report_mode,
-        )
+        paths = portfolio_report.write_portfolio_report(payload)
         _print_report_paths(paths)
-    for line in account_report.format_terminal_summary(payload, mode=report_mode):
+    for line in portfolio_report.format_terminal_summary(payload):
         print(line)
 
 
 def _action_show_positions(session):
-    state = account.load_account(session["product"], account_id=session["account_id"])
-    _print_account_state(state)
+    print(
+        f"\nshared_account={session['account_id']} "
+        f"cash={portfolio_account.shared_cash(session['account_id'], session['products']):.2f}"
+    )
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            state = account.load_account(product, account_id=session["account_id"])
+            _print_account_state(state, show_cash=False, show_account=False)
+        except Exception as exc:
+            print(f"FAILED {exc}")
 
 
 def _action_show_fills(session):
@@ -314,78 +270,44 @@ def _action_show_fills(session):
     active_only = _confirm("只显示有效成交", False)
     table = _confirm("使用统一表格展示成交", True)
     include_voided = not active_only
-    if table:
-        rows = account.list_fill_table(
-            session["product"],
-            account_id=session["account_id"],
-            include_voided=include_voided,
-            limit=limit,
-            order="desc",
-            expand_security_trades=True,
+    rows = []
+    for product in session["products"]:
+        product_rows = (
+            account.list_fill_table(
+                product,
+                account_id=session["account_id"],
+                include_voided=include_voided,
+                limit=limit,
+                order="desc",
+                expand_security_trades=True,
+            )
+            if table
+            else account.list_fills(
+                product,
+                account_id=session["account_id"],
+                include_voided=include_voided,
+                limit=limit,
+                order="desc",
+            )
         )
-        _print_table(rows)
-    else:
-        rows = account.list_fills(
-            session["product"],
-            account_id=session["account_id"],
-            include_voided=include_voided,
-            limit=limit,
-            order="desc",
-        )
-        _print_json_rows(rows)
-
-
-def _action_export_fills(session):
-    active_only = _confirm("只导出有效成交", False)
-    limit = _prompt_int_optional("最多导出多少条，留空则全部")
-    out = _prompt_optional("输出 CSV 路径，留空则写到 output/live/<product>")
-    rows = account.list_fill_table(
-        session["product"],
-        account_id=session["account_id"],
-        include_voided=not active_only,
-        limit=limit,
-    )
-    df = pd.DataFrame(rows)
-    path = Path(out) if out else storage.output_dir(session["product"]) / f"{storage.local_now_stamp()}_fill_table.csv"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-    print(f"fill_table_csv={path}")
-    print(f"rows={len(df)}")
-
-
-def _action_amend_fill(session):
-    fill_id = _prompt_int("要作废/修改的 fill id")
-    reason = _prompt("原因", "amended_by_user")
-    replacement = None
-    if _confirm("是否插入替换成交", False):
-        replacement = _select_fill_payload(_read_fill_or_signal_payload())
-        replacement = _edit_fill_payload(replacement)
-    initial_cash = _prompt_float_optional("重建账户使用的初始现金，留空则使用产品配置")
-    result = account.amend_fill(
-        session["product"],
-        fill_id,
-        replacement_fill=replacement,
-        reason=reason,
-        account_id=session["account_id"],
-        initial_cash=initial_cash,
-    )
-    print(f"voided_fill_id={result['voided_fill_id']}")
-    if result["replacement_fill_id"] is not None:
-        print(f"replacement_fill_id={result['replacement_fill_id']}")
-    _print_account_state(result["account"])
+        rows.extend([{"品种": product, **row} for row in product_rows])
+    _print_table(rows) if table else _print_json_rows(rows)
 
 
 def _action_rebuild_account(session):
-    initial_cash = _prompt_float_optional("重建账户使用的初始现金，留空则使用产品配置")
-    if not _confirm("确认按有效 fills 重建账户状态", False):
+    if not _confirm("确认按有效 fills 重建四个子账户状态", False):
         print("已取消。")
         return
-    state = account.rebuild_account(
-        session["product"],
-        account_id=session["account_id"],
-        initial_cash=initial_cash,
-    )
-    _print_account_state(state)
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            state = account.rebuild_account(
+                product,
+                account_id=session["account_id"],
+            )
+            _print_account_state(state)
+        except Exception as exc:
+            print(f"FAILED {exc}")
 
 
 def _action_reconcile(session):
@@ -399,124 +321,30 @@ def _action_reconcile(session):
         "相对残差容忍度",
         reconciler.DEFAULT_REL_TOLERANCE,
     )
-    payload = reconciler.reconcile(
-        session["product"],
-        account_id=session["account_id"],
-        start_date=start_date,
-        end_date=end_date,
-        abs_tolerance=abs_tolerance,
-        rel_tolerance=rel_tolerance,
-    )
-    report_path = reconciler.write_reconcile_report(session["product"], payload)
-    storage.write_json(report_path.with_suffix(".json"), payload)
-    print(f"reconcile_report={report_path}")
-    for line in reconciler.format_terminal_summary(payload):
-        print(line)
-
-
-def _read_fill_or_signal_payload():
-    path = _prompt_optional("成交/信号 JSON 文件路径，留空则直接粘贴 JSON")
-    if path:
-        return storage.read_json(path)
-    text = _prompt("粘贴一行 JSON")
-    return json.loads(text)
-
-
-def _select_fill_payload(payload):
-    if isinstance(payload, dict) and "advice" in payload:
-        advice = [
-            item for item in payload["advice"]
-            if item.get("priority") == "action"
-        ]
-        if not advice:
-            raise ValueError("Signal JSON does not contain actionable advice.")
-        print("可确认的策略建议：")
-        for idx, item in enumerate(advice, start=1):
-            side = f" side={item.get('side')}" if item.get("side") else ""
-            reason = item.get("reason", "")
-            print(f"{idx}. {item.get('action')}{side} reason={reason}")
-        index = _prompt_int("选择建议序号", 1)
-        if index < 1 or index > len(advice):
-            raise ValueError("Invalid advice index.")
-        fill = dict(advice[index - 1])
-        fill.setdefault("date", payload.get("date"))
-        return fill
-    if isinstance(payload, dict):
-        return payload
-    raise ValueError("Payload must be a JSON object.")
-
-
-def _edit_fill_payload(fill):
-    result = dict(fill)
-    action = str(result.get("action", "")).lower()
-    result["date"] = _prompt("成交日期", result.get("date") or pd.Timestamp.today().date())
-
-    if "straddle" in action:
-        result["side"] = _prompt_choice("方向", ["short", "long"], result.get("side") or "short")
-        for key, label in [
-            ("call_code", "Call 合约代码"),
-            ("put_code", "Put 合约代码"),
-            ("strike", "行权价"),
-            ("expiry", "到期日"),
-        ]:
-            default = result.get(key) or result.get(f"target_{key}")
-            result[key] = _prompt(label, default)
-        result["call_qty"] = _prompt_int("Call 张数", result.get("call_qty") or result.get("target_call_qty") or result.get("qty") or 0)
-        result["put_qty"] = _prompt_int("Put 张数", result.get("put_qty") or result.get("target_put_qty") or result.get("qty") or 0)
-        result["entry_call_price"] = _prompt_float(
-            "实际 Call 成交价",
-            result.get("entry_call_price", result.get("estimated_call_price", result.get("call_price", 0))),
-        )
-        result["entry_put_price"] = _prompt_float(
-            "实际 Put 成交价",
-            result.get("entry_put_price", result.get("estimated_put_price", result.get("put_price", 0))),
-        )
-        result["entry_option_value"] = _prompt_float(
-            "成交权利金合计/期权价值",
-            result.get("entry_option_value", result.get("estimated_trade_value", 0)),
-        )
-        result["option_margin"] = _prompt_float(
-            "占用保证金",
-            result.get("option_margin", result.get("estimated_option_margin", 0)),
-        )
-        result["cash_delta"] = _prompt_float(
-            "现金变动 cash_delta",
-            result.get("cash_delta", result.get("estimated_cash_effect", 0)),
-        )
-    elif "hedge" in action:
-        result["new_etf_qty"] = _prompt_float(
-            "对冲后目标 ETF 持仓数量",
-            result.get("new_etf_qty", result.get("target_hedge_qty", result.get("qty", 0))),
-        )
-        result["qty"] = result["new_etf_qty"]
-        result["price"] = _prompt_float(
-            "实际 ETF 成交价",
-            result.get("price", result.get("entry_price", result.get("estimated_price", 0))),
-        )
-        result["entry_price"] = result["price"]
-        result["margin"] = _prompt_float("对冲保证金", result.get("margin", 0))
-        result["cash_delta"] = _prompt_float("现金变动 cash_delta", result.get("cash_delta", 0))
-        underlying = result.get("underlying_order_book_id")
-        result["underlying_order_book_id"] = _prompt("标的代码", underlying or "")
-    elif action == "cash_adjustment":
-        result["cash_delta"] = _prompt_float("现金变动 cash_delta", result.get("cash_delta", 0))
-    else:
-        if _confirm("是否逐字段确认/编辑 JSON", False):
-            text = _prompt("粘贴修改后的完整 JSON")
-            result = json.loads(text)
-    return result
-
-
-def _choose_product(default=None):
-    products = list(core.config.available_products())
-    default = default or ("kc50etf" if "kc50etf" in products else products[0])
-    return _prompt_choice("品种", products, default)
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            payload = reconciler.reconcile(
+                product,
+                account_id=session["account_id"],
+                start_date=start_date,
+                end_date=end_date,
+                abs_tolerance=abs_tolerance,
+                rel_tolerance=rel_tolerance,
+            )
+            report_path = reconciler.write_reconcile_report(product, payload)
+            storage.write_json(report_path.with_suffix(".json"), payload)
+            print(f"reconcile_report={report_path}")
+            for line in reconciler.format_terminal_summary(payload):
+                print(line)
+        except Exception as exc:
+            print(f"FAILED {exc}")
 
 
 def _print_header(session):
     print("")
     print("=" * 72)
-    print(f"Live 账户管理 | product={session['product']} account={session['account_id']}")
+    print(f"Live 组合管理 | products={','.join(session['products'])}")
     print("=" * 72)
 
 
@@ -555,15 +383,6 @@ def _prompt_choice(label, choices, default=None):
         print(f"请输入：{', '.join(choices)}")
 
 
-def _prompt_int(label, default=None):
-    while True:
-        value = _prompt(label, default)
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            print("请输入整数。")
-
-
 def _prompt_int_optional(label):
     value = _prompt_optional(label)
     if value is None:
@@ -578,13 +397,6 @@ def _prompt_float(label, default=None):
             return float(value)
         except (TypeError, ValueError):
             print("请输入数字。")
-
-
-def _prompt_float_optional(label):
-    value = _prompt_optional(label)
-    if value is None:
-        return None
-    return float(value)
 
 
 def _confirm(label, default=False):
@@ -698,9 +510,11 @@ def _consume_escape_sequence():
         sys.stdin.read(1)
 
 
-def _print_account_state(state):
-    print(f"account={state.product}/{state.account_id}")
-    print(f"cash={state.cash:.2f}")
+def _print_account_state(state, show_cash=True, show_account=True):
+    if show_account:
+        print(f"account={state.product}/{state.account_id}")
+    if show_cash:
+        print(f"cash={state.cash:.2f}")
     print(
         "hedge="
         f"qty={state.hedge.qty} "
@@ -712,10 +526,12 @@ def _print_account_state(state):
         if position is None:
             print(f"position.{side}=None")
         else:
+            expiry = position.get("expiry", position.get("maturity_date"))
+            strike = position.get("strike", position.get("strike_price"))
             print(
-                f"position.{side}={position['call_code']}/{position['put_code']} "
-                f"qty={position['call_qty']}/{position['put_qty']} "
-                f"strike={position['strike']} expiry={position['expiry']}"
+                f"position.{side}={position.get('call_code')}/{position.get('put_code')} "
+                f"qty={position.get('call_qty')}/{position.get('put_qty')} "
+                f"strike={strike} expiry={expiry}"
             )
     if not state.option_hedges:
         print("option_hedges=None")
@@ -727,15 +543,6 @@ def _print_account_state(state):
                 f"type={hedge.get('option_type')} strike={hedge.get('strike')} "
                 f"expiry={hedge.get('expiry')}"
             )
-
-
-def _confirm_import_write(result):
-    if not result.get("applied"):
-        print("没有可写入账户的导入项。")
-        return False
-    if all(item.get("dry_run") is False for item in result["applied"]):
-        return False
-    return _confirm("是否将上述内容写入账户", False)
 
 
 def _print_import_result(result):
@@ -830,9 +637,9 @@ def _fmt_optional(value):
 
 def _print_report_paths(paths):
     if "total_excel" in paths:
-        print(f"account_report_total_excel={paths['total_excel']}")
+        print(f"portfolio_report_total_excel={paths['total_excel']}")
     if "json" in paths:
-        print(f"account_report_json={paths['json']}")
+        print(f"portfolio_report_json={paths['json']}")
 
 
 def _print_dict(payload):

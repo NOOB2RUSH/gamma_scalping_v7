@@ -27,8 +27,6 @@ def _product_label():
 def plot_vol_features(
     features_df,
     backtest_df=None,
-    benchmark_df=None,
-    experiment_backtest_df=None,
     absolute_backtest_df=None,
     percentile_backtest_df=None,
     no_delta_hedge_df=None,
@@ -301,24 +299,6 @@ def plot_vol_features(
             color="black",
             linewidth=1.5,
         )
-        if benchmark_df is not None and "nav" in benchmark_df.columns:
-            ax_nav.plot(
-                benchmark_df.index,
-                benchmark_df["nav"],
-                label="Always ATM Benchmark NAV",
-                color="tab:blue",
-                linewidth=1.4,
-                linestyle="--",
-            )
-        if experiment_backtest_df is not None and "nav" in experiment_backtest_df.columns:
-            ax_nav.plot(
-                experiment_backtest_df.index,
-                experiment_backtest_df["nav"],
-                label="Low IV Short Experiment NAV",
-                color="tab:green",
-                linewidth=1.4,
-                linestyle="-.",
-            )
         if absolute_backtest_df is not None and "nav" in absolute_backtest_df.columns:
             ax_nav.plot(
                 absolute_backtest_df.index,

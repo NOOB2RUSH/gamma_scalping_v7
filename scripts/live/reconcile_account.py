@@ -11,7 +11,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Validate Greeks PnL explainability against fee-adjusted NAV changes."
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument(
         "--snapshot",
         default=None,

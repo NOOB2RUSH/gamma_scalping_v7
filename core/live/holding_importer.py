@@ -6,10 +6,17 @@ from pathlib import Path
 import pandas as pd
 
 from . import account as account_store
+from . import market_data
 from .runtime import load_product_config, project_path
 
 
 OPTION_TYPE_MAP = {"C": "call", "P": "put"}
+PRODUCT_CONTRACT_NAME_MARKERS = {
+    "50etf": "50ETF",
+    "300etf": "300ETF",
+    "500etf": "500ETF",
+    "kc50etf": "科创50",
+}
 
 
 def import_holding_file(
@@ -20,6 +27,7 @@ def import_holding_file(
     include_existing=False,
     dry_run=False,
 ):
+    market_data.require_live_product(product)
     config = load_product_config(product)
     path = _resolve_holding_file(file_path, date)
     trade_date = date or _parse_date_from_filename(path) or pd.Timestamp.today().strftime(
@@ -27,9 +35,9 @@ def import_holding_file(
     )
     source_timestamp = _parse_timestamp_from_filename(path)
     raw = _read_holding_csv(path)
-    rows = _normalize_rows(raw, include_existing)
-    snapshot_rows = _normalize_rows(raw, True)
-    trade_summary_path = _resolve_trade_summary_file(trade_date)
+    rows = _rows_for_product(_normalize_rows(raw, include_existing), product)
+    snapshot_rows = _rows_for_product(_normalize_rows(raw, True), product)
+    trade_summary_path = _resolve_trade_detail_file(trade_date)
     trade_summary = (
         _read_holding_csv(trade_summary_path)
         if trade_summary_path is not None
@@ -52,7 +60,7 @@ def import_holding_file(
             for row in [*rows, *snapshot_rows]
         }
     )
-    metadata = _load_contract_metadata(config, codes)
+    metadata = _load_contract_metadata(config, codes, trade_date=trade_date)
 
     warnings = []
     candidates = _build_straddle_candidates(
@@ -223,7 +231,7 @@ def _apply_existing_position_rebalances(
     warnings,
     config,
 ):
-    summary_by_code = _trade_summary_by_code(trade_summary)
+    summary_by_code = _trade_detail_by_code(trade_summary)
     for candidate in snapshot_candidates:
         if candidate.get("kind") != "straddle":
             continue
@@ -251,7 +259,7 @@ def _apply_existing_position_rebalances(
                     "side": side,
                     "reason": (
                         "broker snapshot changed straddle leg quantities, but matching "
-                        "trade summary does not prove the quantity adjustment"
+                        "trade detail does not prove the quantity adjustment"
                     ),
                     "local_position": existing,
                     "snapshot_fill": snapshot_fill,
@@ -319,7 +327,7 @@ def _straddle_leg_rebalance_fill(
         "source_timestamp": source_timestamp,
         "source_file": snapshot_fill.get("source_file"),
         "trade_source_file": str(trade_summary_path) if trade_summary_path is not None else None,
-        "import_source": "broker_holding_and_trade_summary_leg_rebalance",
+        "import_source": "broker_holding_and_trade_detail_leg_rebalance",
     }
 
 
@@ -364,7 +372,7 @@ def _apply_missing_option_hedge_closes(
     warnings,
 ):
     snapshot_codes = {str(row["order_book_id"]) for row in snapshot_rows}
-    summary_by_code = _trade_summary_by_code(trade_summary)
+    summary_by_code = _trade_detail_by_code(trade_summary)
     for hedge in list(getattr(local, "option_hedges", []) or []):
         code = str(hedge.get("order_book_id") or "")
         if not code or code in snapshot_codes:
@@ -376,7 +384,7 @@ def _apply_missing_option_hedge_closes(
                     "order_book_id": code,
                     "reason": (
                         "local option hedge is absent from holding snapshot, but no "
-                        "matching option trade summary was found; close was not applied"
+                        "matching option trade detail was found; close was not applied"
                     ),
                 }
             )
@@ -393,10 +401,10 @@ def _apply_missing_option_hedge_closes(
                 {
                     "order_book_id": code,
                     "reason": (
-                        "matching option trade summary does not prove a full close; "
+                        "matching option trade detail does not prove a full close; "
                         "close was not applied"
                     ),
-                    "trade_summary": summary,
+                    "trade_detail": summary,
                 }
             )
             continue
@@ -408,7 +416,10 @@ def _apply_missing_option_hedge_closes(
     return local
 
 
-def _trade_summary_by_code(df):
+def _trade_detail_by_code(df):
+    if not _is_trade_detail_export(df):
+        return {}
+    df = _aggregate_trade_detail(df)
     result = {}
     if df is None or df.empty or "合约代码" not in df.columns:
         return result
@@ -420,8 +431,39 @@ def _trade_summary_by_code(df):
     return result
 
 
+def _is_trade_detail_export(df):
+    required = {"合约代码", "开平", "买卖", "成交数量", "成交价格"}
+    return df is not None and required.issubset(df.columns)
+
+
+def _aggregate_trade_detail(df):
+    rows = []
+    for code, trades in df.groupby(df["合约代码"].astype(str).str.strip()):
+        summary = {"合约代码": code}
+        for direction in ("买开", "买平", "卖开", "卖平"):
+            matched = trades[
+                trades["买卖"].astype(str).str.strip().str.cat(
+                    trades["开平"].astype(str).str.strip().str.replace(
+                        "仓", "", regex=False
+                    )
+                ).eq(direction)
+            ]
+            quantities = matched["成交数量"].map(lambda value: _number(value, 0.0) or 0.0)
+            prices = matched["成交价格"].map(lambda value: _number(value))
+            valid = prices.notna() & quantities.gt(0)
+            qty = float(quantities[valid].sum())
+            summary[direction] = qty
+            summary[f"{direction}均价"] = (
+                float((prices[valid] * quantities[valid]).sum() / qty)
+                if qty > 0
+                else None
+            )
+        rows.append(summary)
+    return pd.DataFrame(rows)
+
+
 def _remove_rows_fully_closed_after_snapshot(rows, trade_summary):
-    summary_by_code = _trade_summary_by_code(trade_summary)
+    summary_by_code = _trade_detail_by_code(trade_summary)
     result = []
     for row in rows:
         summary = summary_by_code.get(str(row.get("order_book_id")))
@@ -449,7 +491,7 @@ def _apply_missing_straddle_closes(
     warnings,
 ):
     snapshot_codes = {str(row["order_book_id"]) for row in snapshot_rows}
-    summary_by_code = _trade_summary_by_code(trade_summary)
+    summary_by_code = _trade_detail_by_code(trade_summary)
     for side, position in list(local.positions.items()):
         if position is None:
             continue
@@ -470,7 +512,7 @@ def _apply_missing_straddle_closes(
                     "side": side,
                     "reason": (
                         "local straddle is absent from effective holding snapshot, "
-                        "but matching trade summary does not prove both legs were "
+                        "but matching trade detail does not prove both legs were "
                         "fully closed"
                     ),
                     "local_position": position,
@@ -531,10 +573,10 @@ def _straddle_close_fill(position, summary_by_code, trade_date, source_file, con
         "cash_delta": cash_delta,
         "leg_closes": legs,
         "source_timestamp": _parse_timestamp_from_filename(source_file),
-        "import_source": "broker_option_trade_summary",
+        "import_source": "broker_option_trade_detail",
         "source_file": str(source_file),
         "source_limitations": [
-            "option trade summary is aggregated and has no per-fill execution id/time",
+            "option trade detail is aggregated by contract for close confirmation",
             "configured local option fee is used because broker export fee is unavailable",
         ],
     }
@@ -585,10 +627,10 @@ def _option_hedge_close_fill(hedge, summary, trade_date, source_file, config):
         "realized_pnl": _number(summary.get("平仓盈亏")),
         "cash_delta": cash_delta,
         "source_timestamp": _parse_timestamp_from_filename(source_file),
-        "import_source": "broker_option_trade_summary",
+        "import_source": "broker_option_trade_detail",
         "source_file": str(source_file),
         "source_limitations": [
-            "option trade summary is aggregated and has no per-fill execution id/time",
+            "option trade detail is aggregated by contract for close confirmation",
             "configured local option fee is used because broker export fee is unavailable",
         ],
     }
@@ -596,7 +638,10 @@ def _option_hedge_close_fill(hedge, summary, trade_date, source_file, config):
 
 def _resolve_holding_file(file_path, report_date=None):
     if file_path is not None:
-        return Path(file_path)
+        path = Path(file_path)
+        if not path.name.startswith("实时持仓"):
+            raise ValueError(f"Option import requires 实时持仓*.csv: {path}")
+        return path
     files = sorted(
         Path("live_hold").glob("实时持仓*.csv"),
         key=lambda item: item.stat().st_mtime,
@@ -609,9 +654,9 @@ def _resolve_holding_file(file_path, report_date=None):
     return files[-1]
 
 
-def _resolve_trade_summary_file(report_date=None):
+def _resolve_trade_detail_file(report_date=None):
     files = sorted(
-        Path("live_hold").glob("成交汇总*.csv"),
+        Path("live_hold").glob("成交明细*.csv"),
         key=lambda item: item.stat().st_mtime,
     )
     if report_date is not None:
@@ -676,6 +721,13 @@ def _total_positive_holding_qty(df):
     return total
 
 
+def _rows_for_product(rows, product):
+    marker = PRODUCT_CONTRACT_NAME_MARKERS.get(product)
+    if marker is None:
+        return rows
+    return [row for row in rows if marker in row["contract_name"]]
+
+
 def _side_from_row(row):
     buy_sell = str(row.get("买卖", "")).strip()
     position_type = str(row.get("持仓类型", "")).strip()
@@ -684,11 +736,16 @@ def _side_from_row(row):
     return "long"
 
 
-def _load_contract_metadata(config, codes):
+def _load_contract_metadata(config, codes, trade_date=None):
     opt_dir = project_path(config.data.opt_dir)
+    live_quote_dir = project_path(f"data/live/{config.data.product}/quotes")
     metadata = {}
     remaining = {str(code) for code in codes}
-    for path in sorted(opt_dir.glob("*_chain.parquet"), reverse=True):
+    paths = {
+        *opt_dir.glob("*_chain.parquet"),
+        *live_quote_dir.rglob("*_option_chain.parquet"),
+    }
+    for path in sorted(paths, key=lambda item: item.stat().st_mtime, reverse=True):
         if not remaining:
             break
         df = pd.read_parquet(path)
@@ -704,8 +761,24 @@ def _load_contract_metadata(config, codes):
                 "option_type": str(row["option_type"]).upper(),
                 "contract_multiplier": int(row.get("contract_multiplier", config.vol.contract_multiplier)),
                 "contract_symbol": row.get("contract_symbol"),
+                "underlying_order_book_id": market_data.option_underlying_order_book_id(
+                    config.data.product
+                ),
+                "metadata_source": "local_option_chain",
             }
             remaining.discard(code)
+    if remaining and trade_date is not None:
+        try:
+            metadata.update(
+                market_data.fetch_historical_option_metadata(
+                    config.data.product,
+                    trade_date,
+                    codes=remaining,
+                )
+            )
+        except Exception:
+            # Missing metadata is handled as a per-contract warning by the caller.
+            pass
     return metadata
 
 

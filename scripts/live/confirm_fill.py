@@ -9,7 +9,7 @@ from core.live import account, storage
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Apply a manually confirmed fill.")
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--fill", required=True, help="Path to fill JSON.")
     parser.add_argument("--account-id", default="default")
     return parser.parse_args()
