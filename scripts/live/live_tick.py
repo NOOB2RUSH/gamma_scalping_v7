@@ -9,7 +9,7 @@ from core.live import market_data, report, signal_engine, storage
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fetch quotes and generate one signal.")
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--source", default="local", choices=["local", "akshare"])
     parser.add_argument("--date", default="latest")

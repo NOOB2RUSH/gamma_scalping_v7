@@ -314,6 +314,19 @@ def resolve_position_pair(position, chain_df):
     return call_rows.iloc[0], put_rows.iloc[0]
 
 
+def filter_standard_option_contracts(chain_df):
+    """Exclude dividend-adjusted SSE ETF options from new contract selection."""
+    if chain_df is None or chain_df.empty or "contract_symbol" not in chain_df.columns:
+        return chain_df
+
+    symbols = chain_df["contract_symbol"].fillna("").astype(str).str.strip()
+    adjusted = symbols.str.upper().str.endswith("A") | symbols.str.contains(
+        "调整",
+        regex=False,
+    )
+    return chain_df.loc[~adjusted]
+
+
 def _make_atm_result(strike, expiry, call_row, put_row):
     return {
         "strike": strike,
@@ -571,6 +584,7 @@ def select_atm_from_chain(
             "'target_dte' 或 'near_month_min_dte'"
         )
 
+    chain_df = filter_standard_option_contracts(chain_df)
     chain_df = chain_df[
         chain_df["contract_multiplier"] == CONFIG.vol.contract_multiplier
     ]
@@ -606,10 +620,11 @@ def calc_atm_pool_volume(
     if atm_moneyness_tol is None:
         atm_moneyness_tol = CONFIG.vol.atm_moneyness_tol
 
-    pool = chain_df[
-        (chain_df["contract_multiplier"] == CONFIG.vol.contract_multiplier)
-        & (chain_df["dte"] >= target_dte_min)
-        & (chain_df["dte"] <= target_dte_max)
+    pool = filter_standard_option_contracts(chain_df)
+    pool = pool[
+        (pool["contract_multiplier"] == CONFIG.vol.contract_multiplier)
+        & (pool["dte"] >= target_dte_min)
+        & (pool["dte"] <= target_dte_max)
     ]
     if "pricing_spot" in pool.columns:
         ref_spot = pool["pricing_spot"]

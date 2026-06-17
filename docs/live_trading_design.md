@@ -7,6 +7,15 @@ confirmation. It does not place broker orders. It produces actionable advice,
 keeps a local shadow account, and reconciles that account against a broker
 snapshot supplied by the user.
 
+Supported live products are the four SSE ETF option products: `50etf`,
+`300etf`, `500etf`, and `kc50etf`. `zz1000` remains available to the backtest
+layer but is intentionally excluded from live commands until a dedicated
+index-option quote and hedge workflow is implemented.
+
+To add another ETF option product to the live system, follow
+[`add_live_product.md`](add_live_product.md). That checklist is the source of
+truth for required config, quote, broker-import, report, and test mappings.
+
 The live layer is intentionally separate from the backtest layer. It reuses
 product config, option selection, IV/Greeks, strategy predicates, and position
 valuation helpers, but it does not reuse or mutate the backtest state machine.
@@ -73,9 +82,20 @@ repeatable tests.
 
 `source=akshare` currently supports SSE ETF options: `50etf`, `300etf`,
 `500etf`, and `kc50etf`. It pulls the latest ETF daily bar and the current SSE
-option board through AKShare, writes immutable live snapshots, and also updates
-the canonical product parquet files so the existing signal pipeline can include
-the newest date.
+option board through AKShare and writes immutable live snapshots without
+modifying the canonical research/backtest parquet files.
+
+All new straddle entries use 10 call contracts and 10 put contracts. Existing
+positions retain their actual imported quantities for close, roll, reduction,
+and hedge calculations.
+
+Each live option chain is tagged with its executable ETF hedge:
+`510050.XSHG`, `510300.XSHG`, `510500.XSHG`, or `588000.XSHG`. When a broker
+holding import references a contract absent from local historical chains, the
+importer queries the exact trade date through AKShare's SSE risk indicator and
+caches the resulting daily contract metadata, close, and volume under
+`state/live/<product>/`. This cache is intentionally separate from the complete
+canonical research option chain.
 
 Live signal generation is read-only. It enriches the latest option chain with
 IV/Greeks and builds the latest signal row without mutating the shadow account
@@ -126,33 +146,25 @@ By default it imports only rows with today's open quantity (`今开仓 > 0`) so 
 old overnight holding is not repeatedly confirmed. `--include-existing` imports
 the total holding quantity and is intended for one-time shadow-account seeding.
 
-The broker holding export is not a per-fill execution report. It has no unique
-execution id, execution time, exact commission, or exact cash movement.
-Therefore generated fills use open average price, configured option fee, and
-occupied margin to estimate `cash_delta`. Account reconciliation now checks
-Greeks PnL explainability against fee-adjusted NAV changes instead of comparing
-to a separate broker account snapshot. Close/roll confirmations cannot be
-inferred safely from a holding snapshot alone when the position is absent or
-changed; those still need explicit fill JSON or a real transaction export.
+`实时持仓*.csv` is the only supported broker position snapshot, and
+`成交明细*.csv` is the only supported broker execution export. The importer
+uses the holding snapshot for current option quantities and the matching trade
+detail for opens, closes, and leg quantity changes. Legacy `成交汇总` is
+intentionally unsupported.
 
-## ETF Hedge Snapshot Import
+ETF hedge imports have their own two standard files:
 
-`import_hedge.py` reads the newest `证券持仓查询*.csv` and
-`证券委托查询_实时成交*.csv` under `live_hold/` by default and can auto-confirm
-the ETF delta hedge state into the shadow account.
+- `证券持仓查询(信息导出)*.csv`: authoritative current ETF holding snapshot.
+- `证券委托查询_实时成交(信息导出)*.csv`: report-date ETF execution details.
 
 ```bash
-python scripts/live/import_hedge.py --product kc50etf --dry-run
-python scripts/live/import_hedge.py --product kc50etf
+python scripts/live/import_etf.py --product kc50etf --dry-run
+python scripts/live/import_etf.py --product kc50etf
 ```
 
-The holding export supplies the final ETF hedge quantity, cost price, market
-value, and ETF code. The trade export supplies the report-date ETF executions
-used to estimate `cash_delta`. The generated fill is a `delta_hedge` fill: it
-sets the local hedge to the broker-reported target quantity while recording the
-matched ETF execution rows for audit. If no matching trade rows are found,
-`cash_delta` falls back to an estimate from holding cost and the import result
-emits a warning.
+No other ETF holding or trade export filename is accepted. When a matching
+report-date ETF execution file is unavailable, the holding snapshot may update
+the target quantity and mark, but no cash movement is invented.
 
 ## Live Account Report
 
@@ -172,13 +184,32 @@ timestamped cumulative Excel workbook with separate sheets:
 - `账户总体情况`: one row per report date since the account report history began.
 - `持仓记录`: position snapshots accumulated by report date. Contract names are
   read from the broker holding export when available.
-- `交易记录`: cumulative trade rows from `live_hold/成交明细*.csv` and supported summary exports.
+- `交易记录`: cumulative trade rows from `live_hold/成交明细*.csv`.
 
 The default report mode shows the operator-facing account, daily PnL, Greeks,
 position, and trade fields. `--mode diagnose` adds internal PnL decomposition,
 broker reconciliation, and Greeks-explanation fields. Current option positions
 are revalued against current mid prices, with IV and Greeks calculated through
 the same project valuation functions used by live signals.
+
+`live_portfolio_report.py` keeps the four product shadow accounts independent
+but combines their output into one cumulative workbook:
+
+```bash
+python scripts/live/live_portfolio_report.py
+python scripts/live/live_portfolio_report.py --source none
+```
+
+The workbook is written under `output/live/portfolio` with `组合汇总`,
+`子账户汇总`, `持仓记录`, and `交易记录` sheets. Positions and trades include a
+`品种` column. Cash, NAV, margin, fees, and PnL are summed at portfolio level;
+Greeks remain separated by product because their raw units are not directly
+comparable across underlyings.
+
+`live_console.py` is the portfolio-level operator interface. It always operates
+on all four live products using their independent `default` subaccounts, so the
+operator no longer selects a product or account before generating signals,
+viewing positions, importing holdings, reporting, rebuilding, or reconciling.
 
 ## Planned Hedge Advice
 

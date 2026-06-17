@@ -31,15 +31,200 @@ SSE_ETF_OPTION_SPECS = {
     "500etf": SseEtfOptionSpec("510500", "510500.XSHG", "500ETF_OPTION"),
     "kc50etf": SseEtfOptionSpec("588000", "588000.XSHG", "KC50ETF_OPTION"),
 }
+LIVE_PRODUCTS = frozenset(SSE_ETF_OPTION_SPECS)
+
+
+def require_live_product(product):
+    if product not in LIVE_PRODUCTS:
+        raise ValueError(
+            f"Live trading currently supports: {', '.join(sorted(LIVE_PRODUCTS))}"
+        )
+    return SSE_ETF_OPTION_SPECS[product]
+
+
+def option_underlying_order_book_id(product):
+    return require_live_product(product).etf_file_prefix
+
+
+def attach_live_underlying_id(product, chain_df):
+    result = chain_df.copy()
+    result["underlying_order_book_id"] = option_underlying_order_book_id(product)
+    return result
+
+
+def fetch_historical_option_metadata(product, date, codes=None):
+    """Return exact-date SSE option metadata from AKShare risk indicators."""
+    spec = require_live_product(product)
+    target = pd.Timestamp(date).normalize()
+    wanted = None if codes is None else {str(code) for code in codes}
+    cache_path = storage.historical_option_metadata_cache_path(product)
+    cached = _read_historical_option_metadata_cache(cache_path)
+    matched = cached[cached["date"].eq(target)] if not cached.empty else cached
+    if wanted is not None:
+        matched = matched[matched["order_book_id"].astype(str).isin(wanted)]
+    cached_metadata = _historical_option_metadata_rows_to_dict(matched)
+    if wanted is not None and wanted.issubset(cached_metadata):
+        return cached_metadata
+
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError("akshare is required for historical option metadata.") from exc
+
+    risk_df = _ak_call(
+        ak.option_risk_indicator_sse,
+        date=target.strftime("%Y%m%d"),
+    )
+    required = {"SECURITY_ID", "CONTRACT_ID", "CONTRACT_SYMBOL"}
+    missing = required - set(risk_df.columns)
+    if missing:
+        raise ValueError(f"AKShare option risk data is missing columns: {sorted(missing)}")
+
+    rows = risk_df[
+        risk_df["CONTRACT_ID"].astype(str).str.startswith(spec.etf_symbol)
+    ].copy()
+    if wanted is not None:
+        rows = rows[rows["SECURITY_ID"].astype(str).isin(wanted)]
+
+    fetched_rows = []
+    trading_calendar = _load_local_trading_calendar()
+    for _, row in rows.iterrows():
+        parsed = _parse_sse_option_contract(row["CONTRACT_ID"], spec.etf_symbol)
+        if parsed is None:
+            continue
+        option_type, maturity, raw_strike = parsed
+        maturity = _adjust_to_trading_day(maturity, trading_calendar)
+        code = str(row["SECURITY_ID"])
+        daily = _fetch_historical_option_daily_quote(ak, code, target)
+        fetched_rows.append(
+            {
+                "date": target,
+                "order_book_id": code,
+                "strike": _parse_contract_symbol_strike(
+                    row["CONTRACT_SYMBOL"],
+                    raw_strike,
+                ),
+                "expiry": str(pd.Timestamp(maturity).date()),
+                "option_type": option_type,
+                "contract_multiplier": 10000,
+                "contract_symbol": row["CONTRACT_SYMBOL"],
+                "underlying_order_book_id": spec.etf_file_prefix,
+                "metadata_source": "akshare_option_risk_indicator_sse",
+                "bid": daily.get("close"),
+                "ask": daily.get("close"),
+                "close": daily.get("close"),
+                "volume": daily.get("volume"),
+                "daily_data_source": daily.get("source"),
+                "fetched_at": storage.utc_now_text(),
+            }
+        )
+    if fetched_rows:
+        fetched = pd.DataFrame(fetched_rows)
+        updated = fetched if cached.empty else pd.concat([cached, fetched], ignore_index=True)
+        updated = updated.drop_duplicates(
+            subset=["date", "order_book_id"],
+            keep="last",
+        ).sort_values(["date", "order_book_id"])
+        updated.to_csv(cache_path, index=False)
+        cached_metadata.update(_historical_option_metadata_rows_to_dict(fetched))
+    return cached_metadata
+
+
+def _read_historical_option_metadata_cache(path):
+    columns = [
+        "date",
+        "order_book_id",
+        "strike",
+        "expiry",
+        "option_type",
+        "contract_multiplier",
+        "contract_symbol",
+        "underlying_order_book_id",
+        "metadata_source",
+        "bid",
+        "ask",
+        "close",
+        "volume",
+        "daily_data_source",
+        "fetched_at",
+    ]
+    if not Path(path).exists():
+        return pd.DataFrame(columns=columns)
+    df = pd.read_csv(path)
+    required = {
+        "date",
+        "order_book_id",
+        "strike",
+        "expiry",
+        "option_type",
+        "contract_multiplier",
+        "underlying_order_book_id",
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"Historical option metadata cache is missing columns: {sorted(missing)}"
+        )
+    for column in set(columns) - set(df.columns):
+        df[column] = None
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    return df[columns]
+
+
+def _historical_option_metadata_rows_to_dict(rows):
+    result = {}
+    for _, row in rows.iterrows():
+        code = str(row["order_book_id"])
+        result[code] = {
+            "strike": float(row["strike"]),
+            "expiry": str(pd.Timestamp(row["expiry"]).date()),
+            "option_type": str(row["option_type"]).upper(),
+            "contract_multiplier": int(row["contract_multiplier"]),
+            "contract_symbol": row.get("contract_symbol"),
+            "underlying_order_book_id": row.get("underlying_order_book_id"),
+            "metadata_source": row.get("metadata_source"),
+            "bid": _number(row.get("bid")),
+            "ask": _number(row.get("ask")),
+            "close": _number(row.get("close")),
+            "volume": _number(row.get("volume")),
+            "daily_data_source": row.get("daily_data_source"),
+        }
+    return result
+
+
+def _fetch_historical_option_daily_quote(ak, code, date):
+    try:
+        daily = _ak_call(ak.option_sse_daily_sina, symbol=code)
+    except Exception:
+        return {"close": None, "volume": None, "source": "akshare_daily_unavailable"}
+    if daily.empty:
+        return {"close": None, "volume": None, "source": "akshare_daily_empty"}
+
+    date_col = _first_column(daily, "日期", "date")
+    close_col = _first_column(daily, "收盘", "close")
+    volume_col = _first_column(daily, "成交量", "volume")
+    if date_col is None or close_col is None:
+        return {
+            "close": None,
+            "volume": None,
+            "source": "akshare_daily_missing_columns",
+        }
+    rows = daily.copy()
+    rows[date_col] = pd.to_datetime(rows[date_col], errors="coerce").dt.normalize()
+    rows = rows[rows[date_col].eq(pd.Timestamp(date).normalize())]
+    if rows.empty:
+        return {"close": None, "volume": None, "source": "akshare_daily_date_missing"}
+    row = rows.iloc[-1]
+    return {
+        "close": _number(row.get(close_col)),
+        "volume": _number(row.get(volume_col)) if volume_col is not None else None,
+        "source": "akshare_option_sse_daily_sina",
+    }
 
 
 def fetch_historical_atm_strike(product, date):
     """Return the exact-date ATM strike from AKShare, with a persistent cache."""
-    if product not in SSE_ETF_OPTION_SPECS:
-        raise ValueError(
-            f"AKShare historical ATM source currently supports: "
-            f"{', '.join(sorted(SSE_ETF_OPTION_SPECS))}"
-        )
+    require_live_product(product)
 
     target = pd.Timestamp(date).normalize()
     cache_path = storage.historical_atm_cache_path(product)
@@ -214,6 +399,7 @@ def fetch_quote_snapshot(product, source="local", date="latest"):
     snapshots. Canonical research/backtest parquet files are not modified by
     live quote pulls.
     """
+    require_live_product(product)
     if source == "akshare":
         return _fetch_akshare_sse_snapshot(product)
     if source != "local":
@@ -252,11 +438,7 @@ def fetch_quote_snapshot(product, source="local", date="latest"):
 
 
 def _fetch_akshare_sse_snapshot(product):
-    if product not in SSE_ETF_OPTION_SPECS:
-        raise ValueError(
-            f"AKShare live source currently supports: "
-            f"{', '.join(sorted(SSE_ETF_OPTION_SPECS))}"
-        )
+    require_live_product(product)
 
     try:
         import akshare as ak
@@ -267,7 +449,8 @@ def _fetch_akshare_sse_snapshot(product):
     spec = SSE_ETF_OPTION_SPECS[product]
     etf_df, quote_date = _fetch_latest_etf_bar(ak, spec.etf_symbol)
     trading_calendar = _load_local_trading_calendar()
-    chain_df = _fetch_sse_option_chain(ak, spec, trading_calendar)
+    chain_df = _fetch_sse_option_chain(ak, spec, trading_calendar, quote_date)
+    chain_df = attach_live_underlying_id(product, chain_df)
     chain_df = chain_df.sort_values(
         ["maturity_date", "strike_price", "option_type", "order_book_id"]
     ).reset_index(drop=True)
@@ -366,26 +549,20 @@ def _fetch_latest_etf_bar(ak, etf_symbol):
     return row.drop(columns=["date"]).reset_index(drop=True), quote_date
 
 
-def _fetch_sse_option_chain(ak, spec, trading_calendar):
-    tasks = []
-    months = _ak_call(ak.option_sse_list_sina, symbol=spec.etf_symbol)
-    for month in months:
-        maturity = _adjust_to_trading_day(
-            _fourth_wednesday(int(str(month)[:4]), int(str(month)[4:6])),
+def _fetch_sse_option_chain(ak, spec, trading_calendar, quote_date=None):
+    try:
+        tasks = _sse_option_tasks_from_list_sina(ak, spec, trading_calendar)
+    except Exception:
+        if quote_date is None:
+            raise
+        tasks = _sse_option_tasks_from_risk_indicator(
+            ak,
+            spec,
             trading_calendar,
+            quote_date,
         )
-        for symbol_text, option_type in [(CALL_TEXT, "C"), (PUT_TEXT, "P")]:
-            codes = _ak_call(
-                ak.option_sse_codes_sina,
-                symbol=symbol_text,
-                trade_date=month,
-                underlying=spec.etf_symbol,
-            )
-            if codes.empty:
-                continue
-            code_col = codes.columns[1]
-            for code in codes[code_col].astype(str):
-                tasks.append((code, maturity, option_type))
+    if not tasks:
+        raise ValueError(f"AKShare returned no SSE option codes for {spec.etf_symbol}.")
 
     rows = []
     with ThreadPoolExecutor(max_workers=AKSHARE_OPTION_WORKERS) as executor:
@@ -423,6 +600,58 @@ def _fetch_sse_option_chain(ak, spec, trading_calendar):
     if chain.empty:
         raise ValueError("AKShare returned empty SSE option chain.")
     return chain
+
+
+def _sse_option_tasks_from_list_sina(ak, spec, trading_calendar):
+    tasks = []
+    months = [
+        str(month)
+        for month in _ak_call(ak.option_sse_list_sina, symbol=spec.etf_symbol)
+        if month is not None and str(month).strip()
+    ]
+    for month in months:
+        maturity = _adjust_to_trading_day(
+            _fourth_wednesday(int(str(month)[:4]), int(str(month)[4:6])),
+            trading_calendar,
+        )
+        for symbol_text, option_type in [(CALL_TEXT, "C"), (PUT_TEXT, "P")]:
+            codes = _ak_call(
+                ak.option_sse_codes_sina,
+                symbol=symbol_text,
+                trade_date=month,
+                underlying=spec.etf_symbol,
+            )
+            if codes.empty:
+                continue
+            code_col = codes.columns[1]
+            for code in codes[code_col].astype(str):
+                tasks.append((code, maturity, option_type))
+    return tasks
+
+
+def _sse_option_tasks_from_risk_indicator(ak, spec, trading_calendar, quote_date):
+    risk_df = _ak_call(
+        ak.option_risk_indicator_sse,
+        date=pd.Timestamp(quote_date).strftime("%Y%m%d"),
+    )
+    required = {"SECURITY_ID", "CONTRACT_ID"}
+    missing = required - set(risk_df.columns)
+    if missing:
+        raise ValueError(
+            f"AKShare option risk data is missing columns: {sorted(missing)}"
+        )
+    tasks = []
+    for _, row in risk_df.iterrows():
+        contract_id = str(row.get("CONTRACT_ID") or "")
+        if not contract_id.startswith(spec.etf_symbol):
+            continue
+        parsed = _parse_sse_option_contract(contract_id, spec.etf_symbol)
+        if parsed is None:
+            continue
+        option_type, maturity, _ = parsed
+        maturity = _adjust_to_trading_day(maturity, trading_calendar)
+        tasks.append((str(row["SECURITY_ID"]), maturity, option_type))
+    return tasks
 
 
 def _fetch_sse_option_row(ak, code, maturity, option_type):

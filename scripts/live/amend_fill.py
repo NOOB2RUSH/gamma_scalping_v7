@@ -11,7 +11,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Void a confirmed fill, optionally insert a replacement, and rebuild account state."
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--fill-id", type=int, required=True)
     parser.add_argument("--replacement-fill", help="Path to corrected fill JSON.")
     parser.add_argument("--reason", default="amended_by_user")

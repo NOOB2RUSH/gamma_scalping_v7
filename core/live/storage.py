@@ -48,6 +48,12 @@ def historical_atm_cache_path(product):
     return path / "historical_atm_cache.csv"
 
 
+def historical_option_metadata_cache_path(product):
+    path = PROJECT_ROOT / "state" / "live" / product
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "historical_option_metadata.csv"
+
+
 def account_report_summary_history_path(product, account_id="default"):
     path = PROJECT_ROOT / "state" / "live" / product
     path.mkdir(parents=True, exist_ok=True)
@@ -70,6 +76,12 @@ def clear_account_report_history(product, account_id="default"):
 
 def output_dir(product):
     path = PROJECT_ROOT / "output" / "live" / product
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def portfolio_output_dir():
+    path = PROJECT_ROOT / "output" / "live" / "portfolio"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

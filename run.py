@@ -50,7 +50,7 @@ def parse_args():
 
 
 def sync_config(config):
-    """把临时配置同步到各模块；调对比账户时需要切换信号口径。"""
+    """把运行时配置同步到各模块。"""
     global CONFIG
     CONFIG = config
     core.config.CONFIG = config
@@ -84,56 +84,6 @@ def select_runtime_config(args):
             backtest=replace(selected_config.backtest, **backtest_updates),
         )
     return selected_config
-
-
-def run_backtest_with_strategy_mode(
-    mode,
-    features,
-    etf_by_date,
-    opt_by_date,
-    hedge_by_date,
-    trading_calendar,
-    enriched_opt_by_date,
-    enable_delta_hedge=None,
-    strategy_overrides=None,
-    backtest_overrides=None,
-):
-    """用指定 short 信号口径跑一份独立对比账户，运行后恢复主配置。"""
-    original_config = core.config.CONFIG
-    strategy_updates = {"short_signal_mode": mode}
-    if enable_delta_hedge is not None:
-        strategy_updates["enable_delta_hedge"] = enable_delta_hedge
-    if strategy_overrides:
-        strategy_updates.update(strategy_overrides)
-    backtest_updates = {
-        key: value
-        for key, value in (backtest_overrides or {}).items()
-        if value is not None
-    }
-
-    new_backtest = (
-        replace(original_config.backtest, **backtest_updates)
-        if backtest_updates
-        else original_config.backtest
-    )
-    temp_config = replace(
-        original_config,
-        strategy=replace(original_config.strategy, **strategy_updates),
-        backtest=new_backtest,
-    )
-    sync_config(temp_config)
-    try:
-        signals = core.strategy.build_signals(features)
-        return core.backtester.run_backtest(
-            etf_by_date,
-            opt_by_date,
-            signals,
-            trading_calendar=trading_calendar,
-            enriched_opt_by_date=enriched_opt_by_date,
-            hedge_by_date=hedge_by_date,
-        )
-    finally:
-        sync_config(original_config)
 
 
 def load_data():
@@ -888,105 +838,15 @@ def main():
         enriched_opt_by_date=enriched_opt_by_date,
         hedge_by_date=hedge_by_date,
     )
-    reference_config = CONFIG.reference
-    benchmark_pnl = None
-    benchmark_trades = None
-    if reference_config.enable_always_atm:
-        benchmark_pnl, benchmark_trades = core.backtester.run_always_atm_benchmark(
-            etf_by_date,
-            opt_by_date,
-            signals,
-            benchmark_side=reference_config.always_atm_side,
-            always_atm_qty=reference_config.always_atm_qty,
-            enable_delta_hedge=reference_config.always_atm_enable_delta_hedge,
-            trading_calendar=trading_calendar,
-            enriched_opt_by_date=enriched_opt_by_date,
-            hedge_by_date=hedge_by_date,
-        )
-
-    experiment_pnl = None
-    experiment_trades = None
-    if reference_config.enable_experiment:
-        experiment_strategy_overrides = {
-            "enable_long_straddle": (
-                reference_config.experiment_enable_long_straddle
-            ),
-            "enable_short_straddle": (
-                reference_config.experiment_enable_short_straddle
-            ),
-            "short_stop_loss_enabled": (
-                reference_config.experiment_short_stop_loss_enabled
-            ),
-            "short_volume_spike_exit_enabled": (
-                reference_config.experiment_short_volume_spike_exit_enabled
-            ),
-            "short_cooldown_after_long_iv_high_exit_days": (
-                reference_config.experiment_short_cooldown_after_long_iv_high_exit_days
-            ),
-        }
-        for config_field, strategy_field in {
-            "experiment_short_low_iv_open_threshold": "short_low_iv_open_threshold",
-            "experiment_short_low_iv_close_threshold": "short_low_iv_close_threshold",
-            "experiment_short_low_iv_hv_spread_threshold": (
-                "short_low_iv_hv_spread_threshold"
-            ),
-            "experiment_short_low_iv_close_spread_threshold": (
-                "short_low_iv_close_spread_threshold"
-            ),
-        }.items():
-            value = getattr(reference_config, config_field)
-            if value is not None:
-                experiment_strategy_overrides[strategy_field] = value
-
-        experiment_pnl, experiment_trades = run_backtest_with_strategy_mode(
-            reference_config.experiment_short_signal_mode,
-            features,
-            etf_by_date,
-            opt_by_date,
-            hedge_by_date,
-            trading_calendar,
-            enriched_opt_by_date,
-            enable_delta_hedge=reference_config.experiment_enable_delta_hedge,
-            strategy_overrides=experiment_strategy_overrides,
-            backtest_overrides={
-                "long_qty": reference_config.experiment_long_qty,
-                "short_qty": reference_config.experiment_short_qty,
-            },
-        )
-
     output_dir = make_output_dir()
     save_runtime_config(output_dir)
 
     daily_report = build_daily_report(features, daily_pnl)
     daily_report.to_csv(output_dir / "daily_feature_position.csv", encoding="utf-8-sig")
     trades.to_csv(output_dir / "trades.csv", index=False, encoding="utf-8-sig")
-    if benchmark_pnl is not None:
-        benchmark_pnl.to_csv(
-            output_dir / "always_atm_benchmark.csv",
-            encoding="utf-8-sig",
-        )
-    if benchmark_trades is not None:
-        benchmark_trades.to_csv(
-            output_dir / "always_atm_benchmark_trades.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
-    if experiment_pnl is not None:
-        experiment_pnl.to_csv(
-            output_dir / "experiment_backtest.csv",
-            encoding="utf-8-sig",
-        )
-    if experiment_trades is not None:
-        experiment_trades.to_csv(
-            output_dir / "experiment_trades.csv",
-            index=False,
-            encoding="utf-8-sig",
-        )
     core.analytics.plot_vol_features(
         features,
         backtest_df=daily_pnl,
-        benchmark_df=benchmark_pnl,
-        experiment_backtest_df=experiment_pnl,
         output_path=output_dir / "vol_features.png",
         show=False,
     )

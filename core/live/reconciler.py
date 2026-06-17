@@ -7,11 +7,35 @@ from pathlib import Path
 import pandas as pd
 
 from . import account as account_store
+from . import account_report
 from . import storage
 
 
 DEFAULT_ABS_TOLERANCE = 100.0
 DEFAULT_REL_TOLERANCE = 0.25
+
+
+CHECK_DEFINITIONS = {
+    "total_vs_legs": "总单日盈亏 = 期权单日盈亏 + ETF单日盈亏",
+    "net_after_fee": "净单日盈亏 = 总单日盈亏 - 当日手续费",
+    "nav_change": "估算权益变化 = 净单日盈亏",
+    "equity_formula": "估算权益 = 初始资金 + 期权总盈亏 + ETF总盈亏 - 手续费",
+    "option_daily_change": "期权单日盈亏 = 期权总盈亏变化",
+    "hedge_daily_change": "ETF单日盈亏 = ETF总盈亏变化",
+    "summary_decomposition": "总单日盈亏 = 持仓盈亏 + 当日盯市交易盈亏",
+    "summary_decomposition_residual": "当日盈亏对账差额 = 总单日盈亏 - 分解合计",
+    "position_holding_sum": "汇总持仓盈亏 = 持仓记录持仓盈亏合计",
+    "position_trade_sum": "汇总交易盈亏 = 持仓记录交易盈亏合计",
+    "position_mark_trade_sum": "汇总盯市交易盈亏 = 持仓记录盯市交易盈亏合计",
+    "position_decomposition_sum": "汇总分解合计 = 持仓记录分解合计",
+    "position_option_split": "期权单日盈亏 = 期权持仓记录分解合计",
+    "position_hedge_split": "ETF单日盈亏 = ETF持仓记录分解合计",
+    "trade_fee_sum": "当日手续费 = 交易记录手续费合计",
+    "account_position_snapshot": "账户当前持仓 = 最新持仓记录",
+    "greeks_explainability": "总单日盈亏 = 单日GreeksPnL",
+    "option_greeks_explainability": "期权单日盈亏 = 期权单日GreeksPnL",
+    "hedge_greeks_explainability": "ETF单日盈亏 = ETF单日GreeksPnL",
+}
 
 
 def reconcile(
@@ -23,7 +47,7 @@ def reconcile(
     abs_tolerance=DEFAULT_ABS_TOLERANCE,
     rel_tolerance=DEFAULT_REL_TOLERANCE,
 ):
-    """Validate how well daily Greeks PnL explains actual daily trading PnL.
+    """Run account-level reconciliation checks for one live product.
 
     The broker_snapshot argument is kept for compatibility with older callers and
     is intentionally ignored by the current broker-import-driven workflow.
@@ -44,25 +68,34 @@ def reconcile(
     if account_history.empty:
         raise ValueError(f"No summary history for account_id={account_id}")
 
-    rows = _build_greeks_explainability_rows(
+    summary_frame = _merge_latest_report_summary(product, account_history)
+    position_frame = _load_position_report_frame(product, account_id)
+    trade_frame = _load_trade_report_frame(product, account_id)
+
+    rows = _build_daily_rows(
         product,
-        account_history,
+        summary_frame,
+        position_frame,
+        trade_frame,
+        account_id=account_id,
         start_date=start_date,
         end_date=end_date,
         abs_tolerance=abs_tolerance,
         rel_tolerance=rel_tolerance,
     )
-    metrics = _aggregate_metrics(rows)
+    checks = _aggregate_checks(rows)
+    metrics = _aggregate_metrics(rows, checks)
     payload = {
         "product": product,
         "account_id": account_id,
-        "ok": bool(rows) and all(row["ok"] for row in rows),
-        "mode": "greeks_daily_pnl_explainability",
+        "ok": bool(rows) and all(check["ok"] for check in checks if not check["skipped"]),
+        "mode": "account_reconciliation",
         "start_date": start_date,
         "end_date": end_date,
         "abs_tolerance": abs_tolerance,
         "rel_tolerance": rel_tolerance,
         "metrics": metrics,
+        "checks": checks,
         "rows": rows,
         "summary_history_path": str(summary_path),
     }
@@ -75,7 +108,7 @@ def write_reconcile_report(product, payload):
     path = storage.output_dir(product) / f"{stamp}_reconcile.md"
     metrics = payload.get("metrics", {})
     lines = [
-        f"# Greeks PnL Reconciliation: {product}",
+        f"# Account Reconciliation: {product}",
         "",
         f"- account_id: {payload['account_id']}",
         f"- mode: {payload.get('mode')}",
@@ -83,83 +116,47 @@ def write_reconcile_report(product, payload):
         f"- tolerance: abs<={_fmt(payload.get('abs_tolerance'))}, "
         f"rel<={_fmt(payload.get('rel_tolerance'))}",
         f"- rows: {metrics.get('row_count', 0)}",
-        f"- total_daily_pnl: {_fmt(metrics.get('total_daily_pnl'))}",
-        f"- total_greeks_pnl: {_fmt(metrics.get('total_greeks_pnl'))}",
-        f"- total_residual: {_fmt(metrics.get('total_residual'))}",
-        f"- option_daily_pnl: {_fmt(metrics.get('total_option_daily_pnl'))}",
-        f"- option_greeks_pnl: {_fmt(metrics.get('total_option_greeks_pnl'))}",
-        f"- option_residual: {_fmt(metrics.get('total_option_residual'))}",
-        f"- hedge_daily_pnl: {_fmt(metrics.get('total_hedge_daily_pnl'))}",
-        f"- hedge_greeks_pnl: {_fmt(metrics.get('total_hedge_greeks_pnl'))}",
-        f"- hedge_residual: {_fmt(metrics.get('total_hedge_residual'))}",
-        f"- mean_abs_residual: {_fmt(metrics.get('mean_abs_residual'))}",
-        f"- rmse_residual: {_fmt(metrics.get('rmse_residual'))}",
-        f"- explained_ratio: {_fmt(metrics.get('explained_ratio'))}",
         "",
-        "## Daily Checks",
+        "## Check Summary",
         "",
-        (
-            "| date | option_daily_pnl | hedge_daily_pnl | total_daily_pnl "
-            "| greeks_pnl | residual | residual_ratio | fee_compensation | ok |"
-        ),
-        "|---|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        "| check | residual | ratio | rows | skipped | ok |",
+        "|---|---:|---:|---:|---:|:---:|",
     ]
-    for row in payload.get("rows", []):
+    for check in payload.get("checks", []):
         lines.append(
-            "| {date} | {option_daily_pnl} | {hedge_daily_pnl} | "
-            "{total_daily_pnl} | {greeks_pnl} | {residual} | "
-            "{residual_ratio} | {fee_compensation} | {ok} |".format(
-                date=row["date"],
-                option_daily_pnl=_fmt(row["option_daily_pnl"]),
-                hedge_daily_pnl=_fmt(row["hedge_daily_pnl"]),
-                total_daily_pnl=_fmt(row["total_daily_pnl"]),
-                fee_compensation=_fmt(row["fee_compensation"]),
-                greeks_pnl=_fmt(row["greeks_pnl"]),
-                residual=_fmt(row["residual"]),
-                residual_ratio=_fmt(row["residual_ratio"]),
-                ok="Y" if row["ok"] else "N",
+            "| {label} | {residual} | {ratio} | {rows} | {skipped} | {ok} |".format(
+                label=check.get("label", check.get("name")),
+                residual=_fmt(check.get("residual")),
+                ratio=_fmt(check.get("ratio")),
+                rows=check.get("row_count", 0),
+                skipped=check.get("skipped_count", 0),
+                ok="Y" if check.get("ok") else "N",
             )
         )
+
     lines.extend(
         [
             "",
-            "## Option Leg Checks",
+            "## Daily Checks",
             "",
-            "| date | option_daily_pnl | option_greeks_pnl | option_residual | option_residual_ratio |",
-            "|---|---:|---:|---:|---:|",
+            "| date | check | actual | expected | residual | ratio | ok | note |",
+            "|---|---|---:|---:|---:|---:|:---:|---|",
         ]
     )
     for row in payload.get("rows", []):
-        lines.append(
-            "| {date} | {actual} | {greeks} | {residual} | {ratio} |".format(
-                date=row["date"],
-                actual=_fmt(row.get("option_daily_pnl")),
-                greeks=_fmt(row.get("option_greeks_pnl")),
-                residual=_fmt(row.get("option_residual")),
-                ratio=_fmt(row.get("option_residual_ratio")),
+        for check in row.get("checks", []):
+            lines.append(
+                "| {date} | {label} | {actual} | {expected} | {residual} | {ratio} | {ok} | {note} |".format(
+                    date=row["date"],
+                    label=check.get("label", check.get("name")),
+                    actual=_fmt(check.get("actual")),
+                    expected=_fmt(check.get("expected")),
+                    residual=_fmt(check.get("residual")),
+                    ratio=_fmt(check.get("ratio")),
+                    ok="Y" if check.get("ok") else "N",
+                    note=str(check.get("note") or ""),
+                )
             )
-        )
-    lines.extend(
-        [
-            "",
-            "## Hedge Leg Checks",
-            "",
-            "| date | hedge_daily_pnl | hedge_greeks_pnl | hedge_residual | hedge_residual_ratio | previous_hedge_qty | spot_change |",
-            "|---|---:|---:|---:|---:|---:|---:|",
-        ]
-    )
-    for row in payload.get("rows", []):
-        lines.append(
-            "| {date} | {actual} | {greeks} | {residual} | {ratio} | {qty} | {spot_change} |".format(
-                date=row["date"],
-                actual=_fmt(row.get("hedge_daily_pnl")),
-                greeks=_fmt(row.get("hedge_greeks_pnl")),
-                residual=_fmt(row.get("hedge_residual")),
-                ratio=_fmt(row.get("hedge_residual_ratio")),
-                qty=_fmt(row.get("previous_hedge_qty")),
-                spot_change=_fmt(row.get("spot_change")),
-            )
-        )
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
 
@@ -168,77 +165,38 @@ def format_terminal_summary(payload):
     metrics = payload.get("metrics", {})
     lines = [
         (
-            f"Greeks解释能力对账={payload['product']}/{payload['account_id']} "
+            f"账户对账 {payload['product']}/{payload['account_id']} "
             f"ok={payload['ok']} rows={metrics.get('row_count', 0)}"
-        ),
-        (
-            "合计: "
-            f"总单日盈亏={_fmt(metrics.get('total_daily_pnl'))} "
-            f"GreeksPnL={_fmt(metrics.get('total_greeks_pnl'))} "
-            f"残差={_fmt(metrics.get('total_residual'))} "
-            f"解释比例={_fmt(metrics.get('explained_ratio'))}"
-        ),
-        (
-            f"平均绝对残差={_fmt(metrics.get('mean_abs_residual'))} "
-            f"RMSE={_fmt(metrics.get('rmse_residual'))}"
-        ),
-        (
-            "Option腿合计: "
-            f"单日盈亏={_fmt(metrics.get('total_option_daily_pnl'))} "
-            f"Greeks={_fmt(metrics.get('total_option_greeks_pnl'))} "
-            f"残差={_fmt(metrics.get('total_option_residual'))} "
-            f"解释比例={_fmt(metrics.get('total_option_explained_ratio'))}"
-        ),
-        (
-            "Hedge腿合计: "
-            f"单日盈亏={_fmt(metrics.get('total_hedge_daily_pnl'))} "
-            f"Greeks={_fmt(metrics.get('total_hedge_greeks_pnl'))} "
-            f"残差={_fmt(metrics.get('total_hedge_residual'))} "
-            f"解释比例={_fmt(metrics.get('total_hedge_explained_ratio'))}"
-        ),
-        "",
-        "逐日检查",
+        )
     ]
-    if not payload.get("rows"):
+    checks = payload.get("checks", [])
+    if not checks:
         lines.append("(none)")
         return lines
-    for row in payload["rows"]:
-        marker = "OK" if row["ok"] else "FAIL"
+    for check in checks:
+        status = "OK" if check.get("ok") else "FAIL"
+        if check.get("skipped"):
+            status = "SKIP"
         lines.append(
-            f"{row['date']} {marker} "
-            f"期权单日盈亏={_fmt(row['option_daily_pnl'])} "
-            f"对冲单日盈亏={_fmt(row['hedge_daily_pnl'])} "
-            f"总单日盈亏={_fmt(row['total_daily_pnl'])} "
-            f"GreeksPnL={_fmt(row['greeks_pnl'])} "
-            f"残差={_fmt(row['residual'])} "
-            f"残差比例={_fmt(row['residual_ratio'])} "
-            f"手续费补偿={_fmt(row['fee_compensation'])}"
-        )
-        lines.append(
-            f"  Option腿: 单日盈亏={_fmt(row.get('option_daily_pnl'))} "
-            f"Greeks={_fmt(row.get('option_greeks_pnl'))} "
-            f"残差={_fmt(row.get('option_residual'))} "
-            f"残差比例={_fmt(row.get('option_residual_ratio'))}"
-        )
-        lines.append(
-            f"  Hedge腿: 单日盈亏={_fmt(row.get('hedge_daily_pnl'))} "
-            f"Greeks={_fmt(row.get('hedge_greeks_pnl'))} "
-            f"残差={_fmt(row.get('hedge_residual'))} "
-            f"残差比例={_fmt(row.get('hedge_residual_ratio'))} "
-            f"前日hedge={_fmt(row.get('previous_hedge_qty'))}"
+            f"{status} {check.get('label', check.get('name'))}: "
+            f"残差={_fmt(check.get('residual'))} "
+            f"比例={_fmt(check.get('ratio'))}"
         )
     return lines
 
 
-def _build_greeks_explainability_rows(
+def _build_daily_rows(
     product,
     history,
+    position_frame,
+    trade_frame,
+    account_id,
     start_date=None,
     end_date=None,
     abs_tolerance=DEFAULT_ABS_TOLERANCE,
     rel_tolerance=DEFAULT_REL_TOLERANCE,
 ):
-    required = ["日期", "单日GreeksPnL"]
+    required = ["日期"]
     missing = [column for column in required if column not in history.columns]
     if missing:
         raise ValueError(f"Summary history missing columns: {missing}")
@@ -250,167 +208,695 @@ def _build_greeks_explainability_rows(
     start = _date_or_none(start_date)
     end = _date_or_none(end_date)
 
-    for i in range(1, len(frame)):
-        prev = frame.iloc[i - 1]
+    for i in range(len(frame)):
+        prev = frame.iloc[i - 1] if i > 0 else None
         current = frame.iloc[i]
         current_date = current["_date"].date()
         if start is not None and current_date < start:
             continue
         if end is not None and current_date > end:
             continue
+        if prev is None:
+            continue
+
+        checks = []
+        total_daily_pnl = _summary_total_daily_pnl(current)
+        option_daily_pnl = _number(current.get("期权单日盈亏"))
+        hedge_daily_pnl = _summary_hedge_daily_pnl(current)
+        daily_fee = _number(current.get("当日手续费")) or 0.0
+        net_daily_pnl = _summary_net_daily_pnl(current)
+        nav_change = _value_change(prev, current, "估算权益")
+
+        checks.append(
+            _check_value(
+                "total_vs_legs",
+                current_date,
+                total_daily_pnl,
+                _sum_optional(option_daily_pnl, hedge_daily_pnl),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _check_value(
+                "net_after_fee",
+                current_date,
+                net_daily_pnl,
+                None if total_daily_pnl is None else total_daily_pnl - daily_fee,
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _check_value(
+                "nav_change",
+                current_date,
+                nav_change,
+                net_daily_pnl,
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _check_value(
+                "equity_formula",
+                current_date,
+                _number(current.get("估算权益")),
+                _equity_formula_value(current),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _check_value(
+                "option_daily_change",
+                current_date,
+                option_daily_pnl,
+                _value_change(prev, current, "期权总盈亏"),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _check_value(
+                "hedge_daily_change",
+                current_date,
+                hedge_daily_pnl,
+                _value_change(prev, current, "对冲总盈亏"),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+
+        decomposition = _number(current.get("当日盈亏分解合计"))
+        holding_pnl = _number(current.get("持仓盈亏"))
+        mark_trade_pnl = _number(current.get("当日盯市交易盈亏"))
+        checks.append(
+            _check_value(
+                "summary_decomposition",
+                current_date,
+                total_daily_pnl,
+                _sum_optional(holding_pnl, mark_trade_pnl, fallback=decomposition),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _check_value(
+                "summary_decomposition_residual",
+                current_date,
+                _number(current.get("当日盈亏对账差额")),
+                _difference(total_daily_pnl, decomposition),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+
+        date_positions = _rows_for_date(position_frame, current_date)
+        checks.extend(
+            _position_checks(
+                current_date,
+                current,
+                date_positions,
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+
+        date_trades = _rows_for_date(trade_frame, current_date)
+        checks.append(
+            _check_value(
+                "trade_fee_sum",
+                current_date,
+                daily_fee,
+                _sum_numeric_column(date_trades, "手续费"),
+                abs_tolerance,
+                rel_tolerance,
+                note="no_trade_rows" if date_trades.empty else None,
+            )
+        )
 
         greeks_pnl = _number(current.get("单日GreeksPnL"))
-        if greeks_pnl is None:
-            continue
-
-        fee_compensation = _daily_fee_compensation(prev, current)
-        nav_change = _value_change(prev, current, "估算权益")
-        fee_adjusted_nav_change = (
-            nav_change + fee_compensation if nav_change is not None else None
+        checks.append(
+            _check_value(
+                "greeks_explainability",
+                current_date,
+                total_daily_pnl,
+                greeks_pnl,
+                abs_tolerance,
+                rel_tolerance,
+            )
         )
-        option_daily_pnl = _daily_pnl(current, "期权单日盈亏")
-        if option_daily_pnl is None:
-            option_daily_pnl = _value_change(prev, current, "期权浮盈亏")
-        hedge_daily_pnl = _daily_pnl(current, "对冲单日盈亏")
-        if hedge_daily_pnl is None:
-            hedge_daily_pnl = _hedge_actual_change(prev, current)
-        total_daily_pnl = _daily_pnl(current, "总单日盈亏")
-        if total_daily_pnl is None:
-            total_daily_pnl = _sum_optional(option_daily_pnl, hedge_daily_pnl)
-        if total_daily_pnl is None:
-            total_daily_pnl = fee_adjusted_nav_change
-        if total_daily_pnl is None:
-            continue
-        spot_change = _value_change(prev, current, "标的价格")
-        option_greeks_pnl = _option_greeks_pnl(prev, current)
-        hedge_greeks_pnl = _hedge_greeks_pnl(product, prev, current, spot_change)
-        option_residual = _difference(option_daily_pnl, option_greeks_pnl)
-        hedge_residual = _difference(hedge_daily_pnl, hedge_greeks_pnl)
-        residual = total_daily_pnl - greeks_pnl
-        residual_ratio = _safe_ratio(abs(residual), abs(total_daily_pnl))
-        tolerance = max(abs_tolerance, abs(total_daily_pnl) * rel_tolerance)
+        checks.append(
+            _check_value(
+                "option_greeks_explainability",
+                current_date,
+                option_daily_pnl,
+                _option_greeks_pnl(prev, current),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _check_value(
+                "hedge_greeks_explainability",
+                current_date,
+                hedge_daily_pnl,
+                _hedge_greeks_pnl(product, prev, current),
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
 
         rows.append(
             {
                 "date": str(current_date),
                 "previous_date": str(prev["_date"].date()),
-                "nav_previous": _number(prev.get("估算权益")),
-                "nav_current": _number(current.get("估算权益")),
-                "nav_change": nav_change,
-                "fee_compensation": fee_compensation,
-                "fee_adjusted_nav_change": fee_adjusted_nav_change,
+                "total_daily_pnl": total_daily_pnl,
+                "net_daily_pnl": net_daily_pnl,
                 "option_daily_pnl": option_daily_pnl,
                 "hedge_daily_pnl": hedge_daily_pnl,
-                "total_daily_pnl": total_daily_pnl,
+                "daily_fee": daily_fee,
+                "nav_change": nav_change,
                 "greeks_pnl": greeks_pnl,
-                "residual": residual,
-                "abs_residual": abs(residual),
-                "residual_ratio": residual_ratio,
-                "option_actual_change": option_daily_pnl,
-                "option_greeks_pnl": option_greeks_pnl,
-                "option_residual": option_residual,
-                "option_residual_ratio": _safe_ratio(
-                    _abs_or_none(option_residual), _abs_or_none(option_daily_pnl)
-                ),
-                "hedge_actual_change": hedge_daily_pnl,
-                "hedge_greeks_pnl": hedge_greeks_pnl,
-                "hedge_residual": hedge_residual,
-                "hedge_residual_ratio": _safe_ratio(
-                    _abs_or_none(hedge_residual), _abs_or_none(hedge_daily_pnl)
-                ),
-                "spot_change": spot_change,
-                "previous_hedge_qty": _number(prev.get("对冲持仓")) or 0.0,
-                "tolerance": tolerance,
-                "ok": abs(residual) <= tolerance,
+                "checks": checks,
+                "ok": all(check["ok"] for check in checks if not check["skipped"]),
             }
         )
+
+    snapshot_check = _account_position_snapshot_check(
+        product,
+        account_id,
+        frame,
+        position_frame,
+        abs_tolerance,
+        rel_tolerance,
+    )
+    if snapshot_check is not None:
+        if rows and rows[-1]["date"] == snapshot_check["date"]:
+            rows[-1]["checks"].append(snapshot_check)
+            rows[-1]["ok"] = all(
+                check["ok"] for check in rows[-1]["checks"] if not check["skipped"]
+            )
+        else:
+            rows.append(
+                {
+                    "date": snapshot_check["date"],
+                    "previous_date": None,
+                    "checks": [snapshot_check],
+                    "ok": snapshot_check["ok"],
+                }
+            )
     return rows
 
 
-def _aggregate_metrics(rows):
-    if not rows:
-        return {
-            "row_count": 0,
-            "total_daily_pnl": 0.0,
-            "total_fee_compensated_nav_change": 0.0,
-            "total_greeks_pnl": 0.0,
-            "total_residual": 0.0,
-            "total_option_daily_pnl": 0.0,
-            "total_option_actual_change": 0.0,
-            "total_option_greeks_pnl": 0.0,
-            "total_option_residual": 0.0,
-            "total_option_explained_ratio": None,
-            "total_hedge_daily_pnl": 0.0,
-            "total_hedge_actual_change": 0.0,
-            "total_hedge_greeks_pnl": 0.0,
-            "total_hedge_residual": 0.0,
-            "total_hedge_explained_ratio": None,
-            "mean_abs_residual": None,
-            "rmse_residual": None,
-            "explained_ratio": None,
-        }
-    total_actual = sum(row["total_daily_pnl"] for row in rows)
-    total_greeks = sum(row["greeks_pnl"] for row in rows)
-    total_option_actual = sum(_zero_if_none(row.get("option_daily_pnl")) for row in rows)
-    total_option_greeks = sum(_zero_if_none(row.get("option_greeks_pnl")) for row in rows)
-    total_hedge_actual = sum(_zero_if_none(row.get("hedge_daily_pnl")) for row in rows)
-    total_hedge_greeks = sum(_zero_if_none(row.get("hedge_greeks_pnl")) for row in rows)
-    residuals = [row["residual"] for row in rows]
-    abs_residuals = [abs(value) for value in residuals]
+def _position_checks(date, summary_row, position_frame, abs_tolerance, rel_tolerance):
+    if position_frame is None or position_frame.empty:
+        return [
+            _skipped_check(name, date, "no_position_rows")
+            for name in [
+                "position_holding_sum",
+                "position_trade_sum",
+                "position_mark_trade_sum",
+                "position_decomposition_sum",
+                "position_option_split",
+                "position_hedge_split",
+            ]
+        ]
+
+    position_decomposition = _position_decomposition_series(position_frame)
+    option_mask = _position_option_mask(position_frame)
+    hedge_mask = ~option_mask
+    return [
+        _check_value(
+            "position_holding_sum",
+            date,
+            _number(summary_row.get("持仓盈亏")),
+            _sum_numeric_column(position_frame, "持仓盈亏"),
+            abs_tolerance,
+            rel_tolerance,
+        ),
+        _check_value(
+            "position_trade_sum",
+            date,
+            _number(summary_row.get("交易盈亏")),
+            _sum_numeric_column(position_frame, "交易盈亏"),
+            abs_tolerance,
+            rel_tolerance,
+        ),
+        _check_value(
+            "position_mark_trade_sum",
+            date,
+            _number(summary_row.get("当日盯市交易盈亏")),
+            _sum_numeric_column(position_frame, "当日盯市交易盈亏"),
+            abs_tolerance,
+            rel_tolerance,
+        ),
+        _check_value(
+            "position_decomposition_sum",
+            date,
+            _number(summary_row.get("当日盈亏分解合计")),
+            float(position_decomposition.sum()) if position_decomposition is not None else None,
+            abs_tolerance,
+            rel_tolerance,
+        ),
+        _check_value(
+            "position_option_split",
+            date,
+            _number(summary_row.get("期权单日盈亏")),
+            (
+                float(position_decomposition.loc[option_mask].sum())
+                if position_decomposition is not None
+                else None
+            ),
+            abs_tolerance,
+            rel_tolerance,
+        ),
+        _check_value(
+            "position_hedge_split",
+            date,
+            _summary_hedge_daily_pnl(summary_row),
+            (
+                float(position_decomposition.loc[hedge_mask].sum())
+                if position_decomposition is not None
+                else None
+            ),
+            abs_tolerance,
+            rel_tolerance,
+        ),
+    ]
+
+
+def _account_position_snapshot_check(
+    product,
+    account_id,
+    summary_frame,
+    position_frame,
+    abs_tolerance,
+    rel_tolerance,
+):
+    if summary_frame.empty or position_frame is None or position_frame.empty:
+        return None
+    latest_date = summary_frame["_date"].max().date()
+    current_positions = _rows_for_date(position_frame, latest_date)
+    if current_positions.empty:
+        return _skipped_check("account_position_snapshot", latest_date, "no_position_rows")
+
+    expected = _expected_account_quantities(product, account_id)
+    actual = _actual_position_quantities(current_positions)
+    codes = sorted(set(expected) | set(actual))
+    if not codes:
+        return _skipped_check("account_position_snapshot", latest_date, "no_active_positions")
+    residual = sum(abs(actual.get(code, 0.0) - expected.get(code, 0.0)) for code in codes)
+    denominator = sum(abs(value) for value in expected.values())
+    return _check_value(
+        "account_position_snapshot",
+        latest_date,
+        residual,
+        0.0,
+        abs_tolerance,
+        rel_tolerance,
+        denominator=denominator,
+    )
+
+
+def _aggregate_checks(rows):
+    by_name = {name: [] for name in CHECK_DEFINITIONS}
+    for row in rows:
+        for check in row.get("checks", []):
+            by_name.setdefault(check["name"], []).append(check)
+
+    aggregates = []
+    for name, checks in by_name.items():
+        non_skipped = [check for check in checks if not check.get("skipped")]
+        skipped_count = len(checks) - len(non_skipped)
+        if not non_skipped:
+            aggregates.append(
+                {
+                    "name": name,
+                    "label": CHECK_DEFINITIONS.get(name, name),
+                    "residual": None,
+                    "abs_residual": None,
+                    "ratio": None,
+                    "row_count": 0,
+                    "skipped_count": skipped_count,
+                    "skipped": True,
+                    "ok": True,
+                }
+            )
+            continue
+        residual = sum(check["residual"] for check in non_skipped)
+        abs_residual = sum(abs(check["residual"]) for check in non_skipped)
+        denominator = sum(abs(check.get("denominator") or 0.0) for check in non_skipped)
+        aggregates.append(
+            {
+                "name": name,
+                "label": CHECK_DEFINITIONS.get(name, name),
+                "residual": abs_residual,
+                "signed_residual": residual,
+                "abs_residual": abs_residual,
+                "ratio": _safe_ratio(abs_residual, denominator),
+                "row_count": len(non_skipped),
+                "skipped_count": skipped_count,
+                "skipped": False,
+                "ok": all(check["ok"] for check in non_skipped),
+            }
+        )
+    return aggregates
+
+
+def _aggregate_metrics(rows, checks):
+    total_daily_pnl = sum(
+        _zero_if_none(row.get("total_daily_pnl")) for row in rows
+    )
+    total_greeks_pnl = sum(_zero_if_none(row.get("greeks_pnl")) for row in rows)
+    greeks_check = next(
+        (check for check in checks if check["name"] == "greeks_explainability"),
+        None,
+    )
+    residuals = [
+        check["residual"]
+        for row in rows
+        for check in row.get("checks", [])
+        if not check.get("skipped")
+    ]
     return {
         "row_count": len(rows),
-        "total_daily_pnl": total_actual,
-        "total_fee_compensated_nav_change": total_actual,
-        "total_greeks_pnl": total_greeks,
-        "total_residual": total_actual - total_greeks,
-        "total_option_daily_pnl": total_option_actual,
-        "total_option_actual_change": total_option_actual,
-        "total_option_greeks_pnl": total_option_greeks,
-        "total_option_residual": total_option_actual - total_option_greeks,
-        "total_option_explained_ratio": _safe_ratio(total_option_greeks, total_option_actual),
-        "total_hedge_daily_pnl": total_hedge_actual,
-        "total_hedge_actual_change": total_hedge_actual,
-        "total_hedge_greeks_pnl": total_hedge_greeks,
-        "total_hedge_residual": total_hedge_actual - total_hedge_greeks,
-        "total_hedge_explained_ratio": _safe_ratio(total_hedge_greeks, total_hedge_actual),
-        "mean_abs_residual": sum(abs_residuals) / len(abs_residuals),
-        "rmse_residual": math.sqrt(
-            sum(value * value for value in residuals) / len(residuals)
+        "check_count": sum(check["row_count"] for check in checks),
+        "failed_check_count": sum(
+            1 for check in checks if not check["skipped"] and not check["ok"]
         ),
-        "explained_ratio": _safe_ratio(total_greeks, total_actual),
+        "total_daily_pnl": total_daily_pnl,
+        "total_greeks_pnl": total_greeks_pnl,
+        "total_residual": None if greeks_check is None else greeks_check.get("residual"),
+        "explained_ratio": _safe_ratio(total_greeks_pnl, total_daily_pnl),
+        "mean_abs_residual": (
+            sum(abs(value) for value in residuals) / len(residuals)
+            if residuals
+            else None
+        ),
+        "rmse_residual": (
+            math.sqrt(sum(value * value for value in residuals) / len(residuals))
+            if residuals
+            else None
+        ),
     }
 
 
-def _daily_fee_compensation(prev, current):
-    daily_fee = _number(current.get("当日手续费"))
-    if daily_fee is not None:
-        return daily_fee
+def _check_value(
+    name,
+    date,
+    actual,
+    expected,
+    abs_tolerance,
+    rel_tolerance,
+    denominator=None,
+    note=None,
+):
+    label = CHECK_DEFINITIONS.get(name, name)
+    if actual is None or expected is None:
+        return _skipped_check(name, date, "missing_value" if note is None else note)
+    residual = float(actual) - float(expected)
+    if abs(residual) < 1e-8:
+        residual = 0.0
+    denominator_value = (
+        abs(float(denominator))
+        if denominator is not None
+        else max(abs(float(actual)), abs(float(expected)))
+    )
+    ratio = _safe_ratio(abs(residual), denominator_value)
+    tolerance = max(abs_tolerance, denominator_value * rel_tolerance)
+    return {
+        "name": name,
+        "label": label,
+        "date": str(date),
+        "actual": float(actual),
+        "expected": float(expected),
+        "residual": residual,
+        "abs_residual": abs(residual),
+        "denominator": denominator_value,
+        "ratio": ratio,
+        "tolerance": tolerance,
+        "skipped": False,
+        "ok": abs(residual) <= tolerance,
+        "note": note,
+    }
 
-    prev_fee = _number(prev.get("手续费"))
-    current_fee = _number(current.get("手续费"))
-    if prev_fee is None or current_fee is None:
-        return 0.0
-    return current_fee - prev_fee
+
+def _skipped_check(name, date, note):
+    return {
+        "name": name,
+        "label": CHECK_DEFINITIONS.get(name, name),
+        "date": str(date),
+        "actual": None,
+        "expected": None,
+        "residual": None,
+        "abs_residual": None,
+        "denominator": None,
+        "ratio": None,
+        "tolerance": None,
+        "skipped": True,
+        "ok": True,
+        "note": note,
+    }
 
 
-def _daily_pnl(row, column):
-    value = _number(row.get(column))
-    return value
+def _merge_latest_report_summary(product, history):
+    report = _latest_portfolio_report_frames(product)
+    if report is None:
+        return history
+    summary = report.get("账户总体情况")
+    if summary is None or summary.empty:
+        return history
+    product_summary = _filter_portfolio_product_rows(summary, product)
+    if product_summary.empty:
+        return history
+
+    result = history.copy()
+    result["_merge_date"] = pd.to_datetime(result["日期"], errors="coerce").dt.strftime(
+        "%Y-%m-%d"
+    )
+    product_summary = product_summary.copy()
+    product_summary["_merge_date"] = pd.to_datetime(
+        product_summary["日期"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    product_summary = product_summary.drop_duplicates("_merge_date", keep="last")
+    for column in product_summary.columns:
+        if column in {"_merge_date", "策略名称", "合约代码", "备注"}:
+            continue
+        if column not in result.columns:
+            result[column] = None
+        updates = product_summary.set_index("_merge_date")[column]
+        mask = result["_merge_date"].isin(updates.index)
+        result.loc[mask, column] = result.loc[mask, "_merge_date"].map(updates)
+    return result.drop(columns=["_merge_date"])
 
 
-def _sum_optional(*values):
-    valid = [value for value in values if value is not None]
-    if not valid:
+def _load_position_report_frame(product, account_id):
+    report = _latest_portfolio_report_frames(product)
+    if report is not None:
+        positions = report.get("持仓记录")
+        if positions is not None and not positions.empty:
+            filtered = _filter_portfolio_product_rows(positions, product)
+            if not filtered.empty:
+                return filtered
+
+    position_path = storage.account_report_position_history_path(product, account_id)
+    if not Path(position_path).exists():
+        return pd.DataFrame()
+    frame = pd.read_csv(position_path, encoding="utf-8-sig")
+    if frame.empty:
+        return frame
+    return _position_history_to_report_frame(frame)
+
+
+def _load_trade_report_frame(product, account_id):
+    rows = []
+    try:
+        live_account = account_store.load_account(product, account_id=account_id)
+        rows.extend(
+            account_report._all_trade_rows_from_exports(
+                product,
+                not_before=live_account.reset_at,
+            )
+        )
+        rows.extend(
+            account_report._all_etf_trade_rows_from_exports(
+                product,
+                not_before=live_account.reset_at,
+            )
+        )
+    except Exception:
+        pass
+    if not rows:
+        report = _latest_portfolio_report_frames(product)
+        if report is not None:
+            trades = report.get("交易记录")
+            if trades is not None and not trades.empty:
+                return _filter_trade_rows_for_product(trades, product)
+    return pd.DataFrame(rows, columns=account_report.TRADE_COLUMNS)
+
+
+def _latest_portfolio_report_frames(product):
+    try:
+        from . import portfolio_report
+    except Exception:
         return None
-    return sum(valid)
-
-
-def _value_change(prev, current, column):
-    prev_value = _number(prev.get(column))
-    current_value = _number(current.get(column))
-    if prev_value is None or current_value is None:
+    out_dir = storage.portfolio_output_dir()
+    path = portfolio_report._latest_account_report_path(out_dir)
+    if path is None or not Path(path).exists():
         return None
-    return current_value - prev_value
+    try:
+        return account_report._read_report_workbook(path)
+    except Exception:
+        return None
+
+
+def _filter_portfolio_product_rows(frame, product):
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    if "策略名称" not in frame.columns:
+        return frame.copy()
+    try:
+        from . import portfolio_report
+
+        mask = frame["策略名称"].map(
+            lambda value: portfolio_report._strategy_name_matches(value, product)
+        )
+    except Exception:
+        mask = frame["策略名称"].astype(str).eq(str(product))
+    return frame.loc[mask].copy()
+
+
+def _filter_trade_rows_for_product(frame, product):
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=account_report.TRADE_COLUMNS)
+    result = frame.copy()
+    marker = account_report.PRODUCT_CONTRACT_NAME_MARKERS.get(product)
+    if marker is not None and "合约名称" in result.columns:
+        result = result[
+            result["合约名称"].astype(str).str.contains(marker, na=False)
+            | result["类型"].astype(str).eq("ETF对冲")
+        ]
+    return result.reindex(columns=account_report.TRADE_COLUMNS)
+
+
+def _position_history_to_report_frame(frame):
+    result = pd.DataFrame()
+    result["日期"] = frame.get("日期")
+    result["合约代码"] = frame.get("合约代码")
+    result["合约名称"] = frame.get("合约名称")
+    result["交易方向"] = frame.get("方向").map(
+        lambda value: "空" if str(value) == "short" else "多"
+    )
+    result["总持仓张数"] = frame.get("总持仓")
+    result["AUM"] = frame.get("AUM")
+    result["今日变化"] = None
+    result["最新价"] = frame.get("最新价")
+    result["持仓均价"] = frame.get("持仓均价")
+    result["持仓盈亏"] = frame.get("持仓盈亏")
+    result["交易盈亏"] = None
+    result["到期日"] = frame.get("到期日")
+    result["IV"] = frame.get("IV")
+    result["当日盯市交易盈亏"] = None
+    result["当日盈亏分解合计"] = None
+    return result
+
+
+def _rows_for_date(frame, date):
+    if frame is None or frame.empty or "日期" not in frame.columns:
+        return pd.DataFrame()
+    dates = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return frame.loc[dates.eq(str(pd.Timestamp(date).date()))].copy()
+
+
+def _position_decomposition_series(frame):
+    if frame is None or frame.empty:
+        return None
+    if "当日盈亏分解合计" in frame.columns:
+        values = pd.to_numeric(frame["当日盈亏分解合计"], errors="coerce")
+        if values.notna().any():
+            return values.fillna(0.0)
+    if "持仓盈亏" not in frame.columns:
+        return None
+    holding = pd.to_numeric(frame["持仓盈亏"], errors="coerce")
+    if not holding.notna().any():
+        return None
+    mark_trade = (
+        pd.to_numeric(frame["当日盯市交易盈亏"], errors="coerce").fillna(0.0)
+        if "当日盯市交易盈亏" in frame.columns
+        else pd.Series(0.0, index=frame.index)
+    )
+    return holding.fillna(0.0) + mark_trade
+
+
+def _position_option_mask(frame):
+    if "到期日" not in frame.columns:
+        return pd.Series(False, index=frame.index)
+    return frame["到期日"].notna() & frame["到期日"].astype(str).str.strip().ne("")
+
+
+def _expected_account_quantities(product, account_id):
+    state = account_store.load_account(product, account_id=account_id)
+    expected = {}
+    for position in state.positions.values():
+        if not position:
+            continue
+        for code_key, qty_key in [("call_code", "call_qty"), ("put_code", "put_qty")]:
+            code = _position_code_key(position.get(code_key))
+            qty = _number(position.get(qty_key)) or 0.0
+            if code:
+                expected[code] = expected.get(code, 0.0) + abs(qty)
+    for hedge in state.option_hedges:
+        code = _position_code_key(hedge.get("order_book_id"))
+        qty = _number(hedge.get("qty")) or 0.0
+        if code:
+            expected[code] = expected.get(code, 0.0) + abs(qty)
+    hedge_code = _position_code_key(state.hedge.underlying_order_book_id)
+    if hedge_code and abs(state.hedge.qty) > 1e-9:
+        expected[hedge_code] = expected.get(hedge_code, 0.0) + abs(state.hedge.qty)
+    return expected
+
+
+def _actual_position_quantities(frame):
+    actual = {}
+    if frame is None or frame.empty:
+        return actual
+    for _, row in frame.iterrows():
+        code = _position_code_key(row.get("合约代码"))
+        qty = _number(row.get("总持仓张数"))
+        if not code or qty is None:
+            continue
+        actual[code] = actual.get(code, 0.0) + abs(qty)
+    return actual
+
+
+def _summary_total_daily_pnl(row):
+    return _first_number(row, "总单日盈亏(手续费前)", "总单日盈亏")
+
+
+def _summary_net_daily_pnl(row):
+    explicit = _number(row.get("净单日盈亏"))
+    if explicit is not None:
+        return explicit
+    total = _summary_total_daily_pnl(row)
+    if total is None:
+        return None
+    return total - (_number(row.get("当日手续费")) or 0.0)
+
+
+def _summary_hedge_daily_pnl(row):
+    return _first_number(row, "ETF单日盈亏", "对冲单日盈亏")
+
+
+def _equity_formula_value(row):
+    initial = _number(row.get("初始资金"))
+    option_total = _number(row.get("期权总盈亏"))
+    hedge_total = _number(row.get("对冲总盈亏"))
+    fee = _number(row.get("手续费")) or 0.0
+    if initial is None or option_total is None or hedge_total is None:
+        return None
+    return initial + option_total + hedge_total - fee
 
 
 def _option_greeks_pnl(prev, current):
@@ -421,42 +907,26 @@ def _option_greeks_pnl(prev, current):
     spot_change = _value_change(prev, current, "标的价格")
     if spot_change is None:
         return None
-
     call_delta = _number(prev.get("Call Delta")) or 0.0
     put_delta = _number(prev.get("Put Delta")) or 0.0
-    option_delta_pnl = (call_delta + put_delta) * spot_change
-    gamma_pnl = _number(current.get("单日GammaPnL")) or 0.0
-    vega_pnl = _number(current.get("单日VegaPnL")) or 0.0
-    theta_pnl = _number(current.get("单日ThetaPnL")) or 0.0
-    return option_delta_pnl + gamma_pnl + vega_pnl + theta_pnl
+    return (
+        (call_delta + put_delta) * spot_change
+        + (_number(current.get("期权单日GammaPnL")) or 0.0)
+        + (_number(current.get("期权单日VegaPnL")) or 0.0)
+        + (_number(current.get("期权单日ThetaPnL")) or 0.0)
+    )
 
 
-def _hedge_actual_change(prev, current):
-    total_change = _value_change(prev, current, "对冲总盈亏")
-    if total_change is not None:
-        return total_change
-    return _value_change(prev, current, "对冲浮盈亏")
-
-
-def _hedge_greeks_pnl(product, prev, current, spot_change):
+def _hedge_greeks_pnl(product, prev, current):
     explicit = _number(current.get("对冲单日GreeksPnL"))
     if explicit is not None:
         return explicit
-
-    if spot_change is None:
-        return None
-    previous_qty = _number(prev.get("对冲持仓")) or 0.0
-    start_price = _number(prev.get("对冲最新价"))
-    end_price = _number(current.get("对冲最新价"))
-    if start_price is None:
-        start_price = _number(prev.get("标的价格"))
-    if end_price is None:
-        end_price = _number(current.get("标的价格"))
+    start_price = _first_number(prev, "对冲最新价", "标的价格")
+    end_price = _first_number(current, "对冲最新价", "标的价格")
     if start_price is None or end_price is None:
         return None
+    previous_qty = _number(prev.get("对冲持仓")) or 0.0
     try:
-        from . import account_report
-
         trade_rows = account_report._security_trade_rows_by_date(product).get(
             str(current.get("日期")),
             [],
@@ -470,7 +940,52 @@ def _hedge_greeks_pnl(product, prev, current, spot_change):
             )
     except Exception:
         pass
-    return previous_qty * spot_change
+    return previous_qty * (end_price - start_price)
+
+
+def _first_number(row, *columns):
+    for column in columns:
+        value = _number(row.get(column))
+        if value is not None:
+            return value
+    return None
+
+
+def _daily_fee_compensation(prev, current):
+    daily_fee = _number(current.get("当日手续费"))
+    if daily_fee is not None:
+        return daily_fee
+    prev_fee = _number(prev.get("手续费"))
+    current_fee = _number(current.get("手续费"))
+    if prev_fee is None or current_fee is None:
+        return 0.0
+    return current_fee - prev_fee
+
+
+def _sum_optional(*values, fallback=None):
+    valid = [value for value in values if value is not None]
+    if valid:
+        return sum(valid)
+    return fallback
+
+
+def _sum_numeric_column(frame, column):
+    if frame is None or frame.empty or column not in frame.columns:
+        return 0.0
+    values = pd.to_numeric(frame[column], errors="coerce")
+    if not values.notna().any():
+        return None
+    return float(values.fillna(0.0).sum())
+
+
+def _value_change(prev, current, column):
+    if prev is None:
+        return None
+    prev_value = _number(prev.get(column))
+    current_value = _number(current.get(column))
+    if prev_value is None or current_value is None:
+        return None
+    return current_value - prev_value
 
 
 def _difference(left, right):
@@ -483,10 +998,6 @@ def _zero_if_none(value):
     return 0.0 if value is None else float(value)
 
 
-def _abs_or_none(value):
-    return None if value is None else abs(value)
-
-
 def _date_or_none(value):
     if value is None or value == "":
         return None
@@ -497,7 +1008,7 @@ def _number(value):
     if value is None or pd.isna(value):
         return None
     text = str(value).strip().replace(",", "").replace("%", "")
-    if text in {"", "--", "待设置", "全部", "nan"}:
+    if text in {"", "--", "待设置", "全部", "nan", "NaN", "None"}:
         return None
     try:
         return float(text)
@@ -506,9 +1017,26 @@ def _number(value):
 
 
 def _safe_ratio(numerator, denominator):
-    if numerator is None or denominator is None or abs(float(denominator)) < 1e-12:
+    if numerator is None or denominator is None:
         return None
+    if abs(float(denominator)) < 1e-12:
+        return 0.0 if abs(float(numerator)) < 1e-12 else None
     return float(numerator) / float(denominator)
+
+
+def _position_code_key(value):
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if "." in text:
+        text = text.split(".", 1)[0]
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    if number.is_integer():
+        return str(int(number))
+    return text
 
 
 def _fmt(value):

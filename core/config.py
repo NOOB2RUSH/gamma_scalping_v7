@@ -11,7 +11,6 @@ from .configs.config_schema import (
     AppConfig,
     BacktestConfig,
     DataConfig,
-    ReferenceCurveConfig,
     ReportConfig,
     StrategyConfig,
     VolConfig,
@@ -29,6 +28,14 @@ PRODUCT_CONFIG_MODULES = {
 
 def available_products():
     return tuple(PRODUCT_CONFIG_MODULES)
+
+
+def available_live_products():
+    return tuple(
+        product
+        for product in available_products()
+        if product in {"50etf", "300etf", "500etf", "kc50etf"}
+    )
 
 
 def load_config(product):

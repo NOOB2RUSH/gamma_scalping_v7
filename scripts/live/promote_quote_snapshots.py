@@ -20,7 +20,7 @@ def parse_args():
             "ETF/option parquet files."
         )
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--start-date", default=None)
     parser.add_argument("--end-date", default=None)
     parser.add_argument("--date", action="append", default=[])

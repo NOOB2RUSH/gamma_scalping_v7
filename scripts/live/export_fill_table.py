@@ -13,7 +13,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Export confirmed fills as one flat trade table."
     )
-    parser.add_argument("--product", choices=core.config.available_products(), required=True)
+    parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument(
