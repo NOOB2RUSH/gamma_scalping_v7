@@ -19,6 +19,7 @@ class AccountReportExcelFormatTest(unittest.TestCase):
                             "日期": "2026-06-11",
                             "估算权益": 10_003_595.33782,
                             "账户Gamma": -4_375_159.3513,
+                            "单日盈亏/AUM": 0.00125,
                             "备注": None,
                         }
                     ]
@@ -47,11 +48,22 @@ class AccountReportExcelFormatTest(unittest.TestCase):
         positions = workbook["持仓记录"]
         self.assertEqual(summary.freeze_panes, "A2")
         self.assertEqual(positions.freeze_panes, "A2")
-        self.assertIsNone(summary.auto_filter.ref)
+        self.assertEqual(summary.auto_filter.ref, f"A1:E{summary.max_row}")
+        self.assertEqual(positions.auto_filter.ref, f"A1:E{positions.max_row}")
+        self.assertEqual(summary.row_dimensions[1].height, 22)
         self.assertIsNone(summary["A1"].fill.fill_type)
         self.assertEqual(summary["B2"].value, 10_003_595.33782)
         self.assertEqual(summary["B2"].number_format, "#,##0.00;-#,##0.00;0.00")
         self.assertEqual(summary["C2"].number_format, "#,##0.00;-#,##0.00;0.00")
+        ratio_column = next(
+            cell.column_letter
+            for cell in summary[1]
+            if cell.value == "单日盈亏/AUM"
+        )
+        self.assertEqual(
+            summary[f"{ratio_column}2"].number_format,
+            "0.00%;-0.00%;0.00%",
+        )
         self.assertEqual(positions["C2"].number_format, "#,##0;-#,##0;0")
         self.assertEqual(positions["D2"].number_format, "0.00000;-0.00000;0.00000")
         self.assertEqual(positions["E2"].number_format, "0.00%;-0.00%;0.00%")

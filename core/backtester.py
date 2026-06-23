@@ -829,8 +829,23 @@ class BacktestEngine:
 
         if side == "short":
             current_market_value = opt_position.value(position, call_row, put_row)
-            if strategy.is_short_stop_loss(position, current_market_value):
-                close_reason = "short_stop_loss"
+            previous_market_value = abs(
+                float(position.get("last_option_value", 0.0) or 0.0)
+            )
+            daily_pnl = previous_market_value - current_market_value
+            aum = (
+                max(
+                    abs(float(position.get("call_qty", 0.0) or 0.0)),
+                    abs(float(position.get("put_qty", 0.0) or 0.0)),
+                )
+                * float(
+                    position.get("contract_multiplier")
+                    or CONFIG.vol.contract_multiplier
+                )
+                * float(spot)
+            )
+            if strategy.is_short_daily_loss_aum_stop(daily_pnl, aum):
+                close_reason = "short_daily_loss_aum_stop"
             else:
                 close_reason = strategy.get_short_close_reason(
                     feature_row,
@@ -1040,10 +1055,11 @@ class BacktestEngine:
 
         position = state.positions[side]
         dte_too_low = position_dte <= CONFIG.strategy.roll_dte_threshold
-        strike_roll_ready = (
-            position["strike"] != day["feature_row"]["atm_strike"]
-            and state.strike_mismatch_days[side]
-            >= CONFIG.strategy.roll_strike_mismatch_days
+        strike_roll_ready = vol_engine.spot_exceeds_one_strike_step(
+            position["strike"],
+            day["spot"],
+            day.get("chain_df"),
+            fallback_atm_strike=day["feature_row"]["atm_strike"],
         )
         if not (dte_too_low or strike_roll_ready):
             return False

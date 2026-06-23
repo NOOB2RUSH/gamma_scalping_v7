@@ -16,9 +16,9 @@ def parse_args():
     parser.add_argument("--account-id", default="default")
     parser.add_argument(
         "--source",
-        choices=["akshare", "local", "none"],
-        default="akshare",
-        help="akshare fetches latest quotes; local snapshots existing data; none uses existing canonical data.",
+        choices=["snapshot", "akshare", "local", "none"],
+        default="snapshot",
+        help="snapshot uses the latest saved AKShare quote without network I/O.",
     )
     parser.add_argument("--date", default=None)
     parser.add_argument(

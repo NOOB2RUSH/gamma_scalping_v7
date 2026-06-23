@@ -43,6 +43,14 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
     position_greeks = []
     position_greeks_by_side = {}
     position_values = []
+    previous_close_date, previous_close_chain = _load_previous_close_chain(
+        product,
+        market["date"],
+        enabled=(
+            config.strategy.short_stop_loss_enabled
+            and live_account.positions.get("short") is not None
+        ),
+    )
 
     for side, position in live_account.positions.items():
         if position is None:
@@ -59,6 +67,8 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
             spot,
             signal_state,
             config,
+            previous_close_chain,
+            previous_close_date,
         )
         strategy_advice.extend(side_advice)
         if greeks is not None:
@@ -165,21 +175,21 @@ def preview_signal(product, account_id="default", date=None, quote_snapshot=None
 def _load_market_context(config, date, quote_snapshot=None):
     market_data.require_live_product(config.data.product)
     start = config.backtest.start
-    end = pd.Timestamp.now().normalize() if date is None else date
-    etf_by_date = core.data_loader.load_etf_series(start, end)
-    trading_calendar = core.data_loader.load_etf_trading_calendar()
+    trading_calendar = market_data.load_live_trading_calendar()
+    history = _load_feature_history(config.data.product)
+    seeded_history = False
     data_mode = "daily_eod_reference_incremental"
 
     if quote_snapshot is not None:
         latest_date = pd.Timestamp(quote_snapshot["quote_date"]).normalize()
-        etf_by_date[latest_date], latest_opt_by_date = _load_snapshot_quote_series(
+        snapshot_etf, latest_opt_by_date = _load_snapshot_quote_series(
             quote_snapshot,
             latest_date,
         )
         trading_calendar = _append_calendar_date(trading_calendar, latest_date)
         data_mode = "live_snapshot_incremental"
     else:
-        latest_date = _resolve_latest_signal_date(config, etf_by_date, date)
+        latest_date = _resolve_latest_signal_date(config, date=date)
         latest_opt_by_date = core.data_loader.load_opt_series(latest_date, latest_date)
         latest_hedge_by_date = core.data_loader.load_hedge_series(
             latest_date,
@@ -189,6 +199,23 @@ def _load_market_context(config, date, quote_snapshot=None):
             latest_opt_by_date,
             latest_hedge_by_date,
         )
+
+    if history is None:
+        etf_by_date = core.data_loader.load_etf_series(start, latest_date)
+        if quote_snapshot is not None:
+            etf_by_date[latest_date] = snapshot_etf
+    else:
+        incremental_start = _incremental_etf_start_date(
+            trading_calendar,
+            latest_date,
+            config,
+        )
+        etf_by_date = core.data_loader.load_etf_series(
+            incremental_start,
+            latest_date,
+        )
+        if quote_snapshot is not None:
+            etf_by_date[latest_date] = snapshot_etf
 
     latest_enriched = _build_latest_enriched_chain(
         etf_by_date,
@@ -207,8 +234,6 @@ def _load_market_context(config, date, quote_snapshot=None):
         enriched_opt_by_date={latest_date: latest_enriched},
     )
 
-    seeded_history = False
-    history = _load_feature_history(config.data.product)
     if history is None:
         history = _seed_feature_history(
             config,
@@ -263,19 +288,44 @@ def _append_calendar_date(trading_calendar, latest_date):
     return pd.DatetimeIndex(sorted(set(dates) | {pd.Timestamp(latest_date).normalize()}))
 
 
-def _resolve_latest_signal_date(config, etf_by_date, date):
+def _resolve_latest_signal_date(config, date=None, etf_by_date=None):
     if date is not None:
         return pd.Timestamp(date).normalize()
 
+    etf_dir = core.data_loader._resolve_data_dir(config.data.etf_dir)
     opt_dir = core.data_loader._resolve_data_dir(config.data.opt_dir)
+    if etf_by_date is None:
+        etf_dates = {
+            core.data_loader._parse_date_from_file(path, "_price")
+            for path in sorted(etf_dir.glob("*_price.parquet"))
+        }
+    else:
+        etf_dates = set(etf_by_date)
     opt_dates = [
         core.data_loader._parse_date_from_file(path, "_chain")
         for path in sorted(opt_dir.glob("*_chain.parquet"))
     ]
-    common_dates = sorted(set(etf_by_date) & set(opt_dates))
+    common_dates = sorted(etf_dates & set(opt_dates))
     if not common_dates:
         raise ValueError("No common ETF/option date available for live signal.")
     return common_dates[-1]
+
+
+def _incremental_etf_start_date(trading_calendar, latest_date, config):
+    dates = (
+        pd.DatetimeIndex(pd.to_datetime(trading_calendar))
+        .normalize()
+        .drop_duplicates()
+        .sort_values()
+    )
+    latest_date = pd.Timestamp(latest_date).normalize()
+    dates = pd.DatetimeIndex(sorted(set(dates) | {latest_date}))
+    dates = dates[dates <= latest_date]
+    if len(dates) == 0:
+        return latest_date
+    hv_windows = getattr(config.vol, "hv_windows", (60,))
+    lookback = max(int(window) for window in hv_windows) + 2
+    return dates[max(0, len(dates) - lookback)]
 
 
 def _build_latest_enriched_chain(etf_by_date, latest_opt_by_date, trading_calendar, latest_date):
@@ -725,6 +775,8 @@ def _advice_for_existing_position(
     spot,
     strategy_state,
     config,
+    previous_close_chain=None,
+    previous_close_date=None,
 ):
     try:
         call_row, put_row = core.vol_engine.resolve_position_pair(position, chain_df)
@@ -752,18 +804,40 @@ def _advice_for_existing_position(
     )
     position_dte = int(call_row.get("dte", 0))
     advice = []
+    stop_loss_metrics = None
 
     if side == "short":
         close_reason = core.strategy.get_short_close_reason(feature_row, position_dte, position)
-        if core.strategy.is_short_stop_loss(position, option_value):
-            close_reason = "short_stop_loss"
+        stop_loss_metrics = _short_daily_loss_aum_metrics(
+            position,
+            option_value,
+            previous_close_chain,
+            previous_close_date,
+            spot,
+            config,
+        )
+        if stop_loss_metrics and core.strategy.is_short_daily_loss_aum_stop(
+            stop_loss_metrics["short_daily_pnl"],
+            stop_loss_metrics["short_stop_loss_aum"],
+        ):
+            close_reason = "short_daily_loss_aum_stop"
         if core.position.has_short_volume_spike(position, call_row, put_row):
             close_reason = "short_volume_spike"
     else:
         close_reason = core.strategy.get_close_reason(feature_row, position_dte)
 
     if close_reason:
-        advice.append(_close_advice(side, position, call_row, put_row, option_value, close_reason))
+        item = _close_advice(
+            side,
+            position,
+            call_row,
+            put_row,
+            option_value,
+            close_reason,
+        )
+        if close_reason == "short_daily_loss_aum_stop":
+            item.update(stop_loss_metrics)
+        advice.append(item)
     else:
         roll_payload = _roll_payload(
             config,
@@ -801,6 +875,82 @@ def _advice_for_existing_position(
             advice.append(item)
 
     return advice, greeks, core.position.signed_value(position, call_row, put_row)
+
+
+def _load_previous_close_chain(product, current_date, enabled=True):
+    if not enabled:
+        return None, None
+    try:
+        snapshot = market_data.load_previous_quote_snapshot(product, current_date)
+        snapshot_time = pd.to_datetime(
+            snapshot.get("snapshot_stamp"),
+            format="%Y%m%d_%H%M%S",
+            errors="coerce",
+        )
+        if pd.isna(snapshot_time) or snapshot_time.time() < pd.Timestamp(
+            "15:00"
+        ).time():
+            return None, None
+        chain = pd.read_parquet(snapshot["option_snapshot"]).copy()
+    except (FileNotFoundError, OSError, ValueError, KeyError):
+        return None, None
+    if not {"order_book_id", "bid", "ask"}.issubset(chain.columns):
+        return None, None
+    chain["order_book_id"] = chain["order_book_id"].astype(str)
+    bid = pd.to_numeric(chain["bid"], errors="coerce")
+    ask = pd.to_numeric(chain["ask"], errors="coerce")
+    midpoint = (bid + ask) / 2.0
+    valid_midpoint = bid.gt(0) & ask.gt(0)
+    close = pd.to_numeric(chain.get("close"), errors="coerce")
+    chain["mid"] = midpoint.where(valid_midpoint, close)
+    return pd.Timestamp(snapshot["quote_date"]).normalize(), chain
+
+
+def _short_daily_loss_aum_metrics(
+    position,
+    current_market_value,
+    previous_close_chain,
+    previous_close_date,
+    spot,
+    config,
+):
+    if previous_close_chain is None or previous_close_date is None:
+        return None
+    try:
+        previous_call, previous_put = core.vol_engine.resolve_position_pair(
+            position,
+            previous_close_chain,
+        )
+        previous_market_value = core.position.value(
+            position,
+            previous_call,
+            previous_put,
+        )
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+    if pd.isna(previous_market_value) or pd.isna(current_market_value):
+        return None
+
+    call_qty = abs(float(position.get("call_qty", 0.0) or 0.0))
+    put_qty = abs(float(position.get("put_qty", 0.0) or 0.0))
+    multiplier = float(
+        position.get("contract_multiplier") or config.vol.contract_multiplier
+    )
+    aum = max(call_qty, put_qty) * multiplier * float(spot)
+    if aum <= 0:
+        return None
+    daily_pnl = float(previous_market_value) - float(current_market_value)
+    return {
+        "short_stop_loss_previous_date": str(previous_close_date.date()),
+        "short_previous_close_value": float(previous_market_value),
+        "short_current_market_value": float(current_market_value),
+        "short_daily_pnl": daily_pnl,
+        "short_stop_loss_aum": aum,
+        "short_daily_pnl_aum_ratio": daily_pnl / aum,
+        "short_daily_loss_aum_threshold": (
+            config.strategy.short_daily_loss_aum_threshold
+        ),
+    }
 
 
 def _close_advice(side, position, call_row, put_row, option_value, reason):
@@ -849,31 +999,17 @@ def _roll_payload(
         )
 
     dte_too_low = position_dte <= config.strategy.roll_dte_threshold
-    current_strike_differs = _strike_differs(
+    strike_roll_ready = core.vol_engine.spot_exceeds_one_strike_step(
         position.get("strike"),
-        feature_atm_strike,
+        spot,
+        chain_df,
+        fallback_atm_strike=feature_atm_strike,
     )
-    if not dte_too_low and not current_strike_differs:
+    if not dte_too_low and not strike_roll_ready:
         return None
 
-    mismatch = _historical_strike_mismatch(
-        product,
-        side,
-        position,
-        signals,
-        latest_date,
-        current_atm_strike=feature_atm_strike,
-    )
-    mismatch_days = mismatch["days"]
-    strike_roll_ready = (
-        current_strike_differs
-        and mismatch_days >= config.strategy.roll_strike_mismatch_days
-    )
+    mismatch_days = 1 if strike_roll_ready else 0
     if not (dte_too_low or strike_roll_ready):
-        return None
-
-    max_qty = config.backtest.short_qty if side == "short" else config.backtest.long_qty
-    if _entry_target_qty(feature_row, max_qty, side) <= 0:
         return None
 
     target_atm = core.vol_engine.select_atm_from_chain(
@@ -886,10 +1022,10 @@ def _roll_payload(
             "reason": "roll_condition_active_but_no_valid_target_atm",
             "roll_cooldown_left": cooldown_left,
             "strike_mismatch_days": mismatch_days,
-            "strike_mismatch_days_source": "broker_holding_history",
-            "strike_mismatch_trace": mismatch["trace"],
-            "latest_holding_snapshot_date": mismatch["latest_holding_snapshot_date"],
-            "snapshot_lag_days": mismatch["snapshot_lag_days"],
+            "strike_mismatch_days_source": "current_signal_row",
+            "strike_mismatch_trace": [],
+            "latest_holding_snapshot_date": None,
+            "snapshot_lag_days": None,
             "target_strike": None,
             "target_expiry": None,
         }
@@ -899,14 +1035,15 @@ def _roll_payload(
         reasons.append("dte_below_roll_threshold")
     if strike_roll_ready:
         reasons.append("held_strike_differs_from_current_atm")
+    max_qty = config.backtest.short_qty if side == "short" else config.backtest.long_qty
     return {
         "reason": "+".join(reasons),
         "roll_cooldown_left": cooldown_left,
         "strike_mismatch_days": mismatch_days,
-        "strike_mismatch_days_source": "broker_holding_history",
-        "strike_mismatch_trace": mismatch["trace"],
-        "latest_holding_snapshot_date": mismatch["latest_holding_snapshot_date"],
-        "snapshot_lag_days": mismatch["snapshot_lag_days"],
+        "strike_mismatch_days_source": "current_signal_row",
+        "strike_mismatch_trace": [],
+        "latest_holding_snapshot_date": None,
+        "snapshot_lag_days": None,
         "target_call_code": target_atm["call"]["order_book_id"],
         "target_put_code": target_atm["put"]["order_book_id"],
         "target_strike": float(target_atm["strike"]),
@@ -1085,6 +1222,7 @@ def _projected_cash_after_option_actions(
             "call": call_row,
             "put": put_row,
             "strike": float(call_row.get("strike_price")),
+            "expiry": item.get("target_expiry") or call_row.get("maturity_date"),
         }
         target_position = core.position.open_straddle(
             pd.Timestamp.now(),

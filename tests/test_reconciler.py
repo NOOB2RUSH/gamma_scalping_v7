@@ -123,6 +123,9 @@ def test_reconcile_builds_account_closure_checks(tmp_path):
         payload = reconciler.reconcile("300etf")
 
     assert payload["ok"] is True
+    assert payload["start_date"] == "2026-06-17"
+    assert payload["end_date"] == "2026-06-17"
+    assert [row["date"] for row in payload["rows"]] == ["2026-06-17"]
     checks = {check["name"]: check for check in payload["checks"]}
     for name in [
         "total_vs_legs",
@@ -130,12 +133,26 @@ def test_reconcile_builds_account_closure_checks(tmp_path):
         "nav_change",
         "equity_formula",
         "position_decomposition_sum",
-        "trade_fee_sum",
-        "account_position_snapshot",
     ]:
         assert checks[name]["ok"] is True
         assert checks[name]["residual"] == 0.0
+        assert checks[name]["group"] == "report_check"
+    for name in ["trade_fee_sum", "account_position_snapshot"]:
+        assert checks[name]["ok"] is True
+        assert checks[name]["residual"] == 0.0
+        assert checks[name]["group"] == "source_check"
+    assert checks["greeks_explainability"]["group"] == "greeks_check"
+    assert "option_greeks_explainability" not in checks
+    assert "hedge_greeks_explainability" not in checks
 
     lines = reconciler.format_terminal_summary(payload)
+    assert "[Source Check]" in lines
+    assert "[Report Check]" in lines
+    assert "[Greeks Check]" in lines
     assert any("残差=0.000000 比例=0.000000" in line for line in lines)
     assert all("actual" not in line.lower() for line in lines)
+    report_index = lines.index("[Report Check]")
+    greeks_index = lines.index("[Greeks Check]")
+    assert greeks_index - report_index == 2
+    greeks_lines = lines[greeks_index + 1 :]
+    assert len(greeks_lines) == 1

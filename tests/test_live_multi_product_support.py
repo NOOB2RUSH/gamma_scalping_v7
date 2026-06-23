@@ -476,6 +476,113 @@ class LiveMultiProductSupportTest(unittest.TestCase):
         self.assertEqual(resolved, detail)
         glob.assert_called_once_with("成交明细*.csv")
 
+    def test_holding_import_roll_closes_old_position_before_opening_snapshot(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "account.sqlite"
+            holding_path = root / "实时持仓(信息导出)_2026_06_17-14_48_14.csv"
+            detail_path = root / "成交明细(信息导出)_2026_06_17-14_48_28.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "合约代码": "10011740",
+                        "合约名称": "科创50购7月1950",
+                        "买卖": "卖",
+                        "持仓类型": "义务仓",
+                        "总持仓": 10,
+                        "今开仓": 10,
+                        "开仓均价": 0.1011,
+                        "最新价": 0.1009,
+                        "占用保证金": 18845.0,
+                    },
+                    {
+                        "合约代码": "10011749",
+                        "合约名称": "科创50沽7月1950",
+                        "买卖": "卖",
+                        "持仓类型": "义务仓",
+                        "总持仓": 10,
+                        "今开仓": 10,
+                        "开仓均价": 0.1385,
+                        "最新价": 0.1380,
+                        "占用保证金": 40430.0,
+                    },
+                ]
+            ).to_csv(holding_path, index=False, encoding="utf-8-sig")
+            pd.DataFrame(
+                [
+                    {
+                        "合约代码": "10010393",
+                        "开平": "平仓",
+                        "买卖": "买",
+                        "成交数量": 80,
+                        "成交价格": 0.1853,
+                    },
+                    {
+                        "合约代码": "10010394",
+                        "开平": "平仓",
+                        "买卖": "买",
+                        "成交数量": 80,
+                        "成交价格": 0.0045,
+                    },
+                ]
+            ).to_csv(detail_path, index=False, encoding="utf-8-sig")
+
+            old_fill = {
+                "action": "open_short_straddle",
+                "side": "short",
+                "date": "2026-06-09",
+                "call_code": "10010393",
+                "put_code": "10010394",
+                "strike": 1.75,
+                "expiry": "2026-06-24",
+                "call_qty": 80,
+                "put_qty": 80,
+                "entry_call_price": 0.0517,
+                "entry_put_price": 0.0717,
+                "contract_multiplier": 10000,
+                "short_entry_regime": "absolute",
+                "entry_option_value": 98720.0,
+                "option_margin": 376608.0,
+                "cash_delta": 277568.0,
+            }
+            metadata = {
+                "10011740": {
+                    "strike": 1.95,
+                    "expiry": "2026-07-22",
+                    "option_type": "C",
+                    "contract_multiplier": 10000,
+                },
+                "10011749": {
+                    "strike": 1.95,
+                    "expiry": "2026-07-22",
+                    "option_type": "P",
+                    "contract_multiplier": 10000,
+                },
+            }
+
+            with (
+                mock.patch.object(account.storage, "account_db_path", return_value=db_path),
+                mock.patch.object(holding_importer, "_resolve_trade_detail_file", return_value=detail_path),
+                mock.patch.object(holding_importer, "_load_contract_metadata", return_value=metadata),
+            ):
+                account.record_fill("kc50etf", old_fill)
+                result = holding_importer.import_holding_file(
+                    "kc50etf",
+                    file_path=holding_path,
+                    date="2026-06-17",
+                )
+                local = account.load_account("kc50etf")
+
+        self.assertEqual(
+            [item["fill"]["action"] for item in result["applied"]],
+            ["close_short_straddle", "open_short_straddle"],
+        )
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(local.positions["short"]["call_code"], "10011740")
+        self.assertEqual(local.positions["short"]["put_code"], "10011749")
+        self.assertEqual(local.positions["short"]["call_qty"], 10)
+        self.assertEqual(local.positions["short"]["put_qty"], 10)
+
 
 if __name__ == "__main__":
     unittest.main()

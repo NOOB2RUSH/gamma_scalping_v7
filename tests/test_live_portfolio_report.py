@@ -63,7 +63,9 @@ def _portfolio_frames(payload):
     summary = frames.pop("账户总体情况")
     summary["策略名称"] = portfolio_report._strategy_display_name(payload["product"])
     summary["合约代码"] = portfolio_report._strategy_contract_code(payload["product"])
+    summary["AUM"] = None
     summary["备注"] = "new"
+    summary = summary.reindex(columns=portfolio_report._summary_report_columns())
     frames["持仓记录"] = portfolio_report._product_position_frame(
         payload["product"],
         frames["持仓记录"],
@@ -72,6 +74,31 @@ def _portfolio_frames(payload):
 
 
 class LivePortfolioReportTest(unittest.TestCase):
+    def test_terminal_summary_starts_with_used_snapshot_times(self):
+        payload = {
+            "date": "2026-06-22",
+            "products": ["300etf", "kc50etf"],
+            "subaccounts": {
+                "300etf": {
+                    "quote_snapshot": {"snapshot_stamp": "20260622_151219"}
+                },
+                "kc50etf": {
+                    "quote_snapshot": {"snapshot_stamp": "20260622_151240"}
+                },
+            },
+            "shared_cash": 1_000_000.0,
+            "frames": {portfolio_report.SUMMARY_TEMPLATE_SHEET: pd.DataFrame()},
+            "errors": {},
+        }
+
+        lines = portfolio_report.format_terminal_summary(payload)
+
+        self.assertEqual(
+            lines[0],
+            "报告快照时间: 300etf=2026-06-22 15:12:19 "
+            "kc50etf=2026-06-22 15:12:40",
+        )
+
     def test_build_rejects_incomplete_product_report(self):
         with mock.patch.object(
             portfolio_report.account_report,
@@ -130,7 +157,7 @@ class LivePortfolioReportTest(unittest.TestCase):
                 account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
                 "策略名称",
                 "合约代码",
-                *account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[1:],
+                *portfolio_report._portfolio_summary_value_columns()[1:],
                 "备注",
             ],
         )
@@ -149,8 +176,10 @@ class LivePortfolioReportTest(unittest.TestCase):
             {"上证50ETF华夏", "沪深300ETF华泰柏瑞"},
         )
         self.assertEqual(set(summary["合约代码"]), {"sh510050", "sh510300"})
-        self.assertEqual(list(summary["估算权益"]), [1_000_000.0, 1_000_000.0])
+        self.assertIn("AUM", summary.columns)
+        self.assertNotIn("估算权益", summary.columns)
         self.assertEqual(list(summary["账户Delta"]), [10.0, 10.0])
+        self.assertTrue(summary["备注"].isna().all())
         self.assertNotIn("50etf", frames)
         self.assertNotIn("300etf", frames)
         self.assertNotIn("品种", frames["持仓记录"].columns)
@@ -214,6 +243,105 @@ class LivePortfolioReportTest(unittest.TestCase):
         self.assertAlmostEqual(etf300_summary.iloc[-1]["单日GreeksPnL"], 0.0)
         self.assertAlmostEqual(kc50_summary.iloc[-1]["ETF单日盈亏"], 11.0)
         self.assertAlmostEqual(kc50_summary.iloc[-1]["净单日盈亏"], 98.0)
+
+    def test_combined_summary_aum_uses_final_open_position_after_roll(self):
+        payload = _payload("300etf", "2026-06-22", 1_000_000.0)
+        summary = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-22",
+                    "估算权益": 1_000_000.0,
+                    "账户Delta": 10.0,
+                }
+            ],
+            columns=account_report.DEFAULT_SUMMARY_REPORT_COLUMNS,
+        )
+        position = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-22",
+                    "合约代码": "old-call",
+                    "合约名称": "300ETF购7月4900",
+                    "交易方向": "空",
+                    "总持仓张数": 0,
+                    "AUM": 900_000.0,
+                    "到期日": "2026-07-22",
+                },
+                {
+                    "日期": "2026-06-22",
+                    "合约代码": "new-call",
+                    "合约名称": "300ETF购7月5000",
+                    "交易方向": "空",
+                    "总持仓张数": 12,
+                    "AUM": 596_880.0,
+                    "到期日": "2026-07-22",
+                },
+                {
+                    "日期": "2026-06-22",
+                    "合约代码": "new-put",
+                    "合约名称": "300ETF沽7月5000",
+                    "交易方向": "空",
+                    "总持仓张数": 12,
+                    "AUM": 596_880.0,
+                    "到期日": "2026-07-22",
+                },
+            ],
+            columns=account_report.DEFAULT_POSITION_REPORT_COLUMNS,
+        )
+        trade = pd.DataFrame(columns=account_report.TRADE_COLUMNS)
+        product_frames = {
+            "账户总体情况": summary,
+            "持仓记录": position,
+            "交易记录": trade,
+        }
+        with (
+            mock.patch.object(
+                portfolio_report.account_report,
+                "_report_frames",
+                return_value=product_frames,
+            ),
+            mock.patch.object(
+                portfolio_report.account_report,
+                "_daily_report_frames",
+                return_value=product_frames,
+            ),
+        ):
+            frames = portfolio_report._combined_daily_frames({"300etf": payload}, {})
+
+        summary_row = frames["账户总体情况"].iloc[0]
+        self.assertAlmostEqual(summary_row["AUM"], 596_880.0)
+        self.assertNotIn("估算权益", frames["账户总体情况"].columns)
+
+    def test_combined_report_filters_rows_before_product_reset(self):
+        payload = _payload("300etf", "2026-06-15", 1_000_000.0)
+        old_summary = payload["summary"].copy()
+        old_summary["日期"] = "2026-06-12"
+        payload["summary_history"] = pd.DataFrame(
+            [old_summary, payload["summary"]],
+            columns=account_report.SUMMARY_COLUMNS,
+        )
+        payload["_portfolio_reset_date"] = pd.Timestamp("2026-06-15")
+
+        with (
+            mock.patch.object(
+                portfolio_report.account_report,
+                "_report_frames",
+                side_effect=_report_frames,
+            ),
+            mock.patch.object(
+                portfolio_report.account_report,
+                "_daily_report_frames",
+                side_effect=_daily_frames,
+            ),
+        ):
+            frames = portfolio_report._combined_daily_frames({"300etf": payload}, {})
+
+        summary = frames["账户总体情况"]
+        self.assertEqual(list(summary["日期"]), ["2026-06-15"])
+        self.assertEqual(
+            set(summary["策略名称"]),
+            {"沪深300ETF华泰柏瑞"},
+        )
 
     def test_backfills_aum_for_existing_historical_position_rows(self):
         cols = account_report.DEFAULT_POSITION_REPORT_COLUMNS
@@ -334,6 +462,56 @@ class LivePortfolioReportTest(unittest.TestCase):
         self.assertAlmostEqual(result.iloc[2][holding_pnl_col], 0.0)
         self.assertAlmostEqual(result.iloc[3][holding_pnl_col], 4_672.8)
         self.assertEqual(result.iloc[3][change_col], 0)
+
+    def test_backfill_closed_old_position_uses_trade_price(self):
+        cols = account_report.DEFAULT_POSITION_REPORT_COLUMNS
+        frame = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-18",
+                    "合约代码": "10011741",
+                    "合约名称": "科创50购7月2000",
+                    "交易方向": "空",
+                    "总持仓张数": 10,
+                    "今日变化": 10,
+                    "最新价": 0.1170,
+                    "持仓均价": 0.1189,
+                    "持仓盈亏": 0.0,
+                    "到期日": "2026-07-22",
+                },
+                {
+                    "日期": "2026-06-22",
+                    "合约代码": "10011741",
+                    "合约名称": "科创50购7月2000",
+                    "交易方向": "空",
+                    "总持仓张数": 0,
+                    "今日变化": -10,
+                    "最新价": 0.1354,
+                    "持仓均价": 0.1189,
+                    "持仓盈亏": -1840.0,
+                    "到期日": "2026-07-22",
+                },
+            ],
+            columns=cols,
+        )
+        payloads = {
+            "kc50etf": {
+                "date": "2026-06-22",
+                "trade_rows": [
+                    {
+                        "日期": "2026-06-22",
+                        "合约代码": "10011741",
+                        "买卖": "买",
+                        "成交数量": 10,
+                        "成交价格": 0.1349,
+                    }
+                ],
+            }
+        }
+
+        result = portfolio_report._backfill_position_holding_pnl(frame, payloads)
+
+        self.assertAlmostEqual(result.iloc[1]["持仓盈亏"], -1790.0)
 
     def test_write_uses_template_then_appends_new_date(self):
         with TemporaryDirectory() as temp_dir:
@@ -461,7 +639,8 @@ class LivePortfolioReportTest(unittest.TestCase):
 
         self.assertIn("账户总体情况", combined)
         self.assertNotIn("300etf", combined)
-        self.assertEqual(combined["账户总体情况"].iloc[0]["估算权益"], 1_000_000.0)
+        self.assertIn("AUM", combined["账户总体情况"].columns)
+        self.assertNotIn("估算权益", combined["账户总体情况"].columns)
         self.assertEqual(combined["账户总体情况"].iloc[0]["策略名称"], "沪深300ETF华泰柏瑞")
 
     def test_merge_replaces_legacy_strategy_name_with_display_name(self):
@@ -469,7 +648,7 @@ class LivePortfolioReportTest(unittest.TestCase):
             account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
             "策略名称",
             "合约代码",
-            *account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[1:],
+            *portfolio_report._portfolio_summary_value_columns()[1:],
             "备注",
         ]
         current = pd.DataFrame(
@@ -478,7 +657,7 @@ class LivePortfolioReportTest(unittest.TestCase):
                     "日期": "2026-06-16",
                     "策略名称": "沪深300ETF华泰柏瑞",
                     "合约代码": "sh510300",
-                    "估算权益": 2.0,
+                    "AUM": 2.0,
                 }
             ],
             columns=columns,
@@ -489,7 +668,7 @@ class LivePortfolioReportTest(unittest.TestCase):
                     "日期": "2026-06-16",
                     "策略名称": "300etf",
                     "合约代码": "sh510300",
-                    "估算权益": 1.0,
+                    "AUM": 1.0,
                 }
             ],
             columns=columns,
@@ -519,7 +698,76 @@ class LivePortfolioReportTest(unittest.TestCase):
         summary = combined["账户总体情况"]
         self.assertEqual(len(summary), 1)
         self.assertEqual(summary.iloc[0]["策略名称"], "沪深300ETF华泰柏瑞")
-        self.assertEqual(summary.iloc[0]["估算权益"], 2.0)
+        self.assertEqual(summary.iloc[0]["AUM"], 2.0)
+
+    def test_merge_filters_existing_rows_before_product_reset(self):
+        current = _portfolio_frames(_payload("300etf", "2026-06-15", 1.0))
+        payloads = {
+            "300etf": {
+                "_portfolio_reset_date": pd.Timestamp("2026-06-15"),
+            }
+        }
+        columns = current["账户总体情况"].columns
+        old_summary = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-12",
+                    "策略名称": "沪深300ETF华泰柏瑞",
+                    "合约代码": "sh510300",
+                    "AUM": 9.0,
+                }
+            ],
+            columns=columns,
+        )
+        old_position = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-12",
+                    "策略名称": "沪深300ETF华泰柏瑞",
+                    "合约代码": "510300",
+                    "合约名称": "510300.XSHG",
+                }
+            ],
+            columns=portfolio_report._position_report_columns(),
+        )
+        old_trade = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-12",
+                    "合约代码": "510300",
+                    "合约名称": "510300.XSHG",
+                }
+            ],
+            columns=account_report.TRADE_COLUMNS,
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "existing.xlsx"
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                old_summary.to_excel(writer, sheet_name="账户总体情况", index=False)
+                old_position.to_excel(writer, sheet_name="持仓记录", index=False)
+                old_trade.to_excel(writer, sheet_name="交易记录", index=False)
+            with mock.patch.object(
+                portfolio_report,
+                "TEMPLATE_REPORT_PATH",
+                Path(temp_dir) / "missing-template.xlsx",
+            ):
+                combined = portfolio_report._merge_with_existing(
+                    current,
+                    path,
+                    payloads=payloads,
+                    products=["300etf"],
+                )
+
+        self.assertEqual(list(combined["账户总体情况"]["日期"]), ["2026-06-15"])
+        self.assertEqual(
+            set(combined["持仓记录"]["合约代码"]),
+            {"300etf-position"},
+        )
+        self.assertEqual(
+            set(combined["交易记录"]["合约代码"]),
+            {"300etf-trade"},
+        )
 
 
 if __name__ == "__main__":

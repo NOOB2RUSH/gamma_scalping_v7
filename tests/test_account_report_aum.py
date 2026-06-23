@@ -8,6 +8,59 @@ from core.live import account_report
 
 
 class AccountReportAumTest(unittest.TestCase):
+    def test_summary_reports_gross_daily_pnl_as_aum_ratio(self):
+        summary = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-16",
+                    "账户ID": "default",
+                    "标的价格": 4.9,
+                    "当日手续费": 100.0,
+                    "总单日盈亏": 1_000.0,
+                }
+            ]
+        )
+        positions = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-16",
+                    "账户ID": "default",
+                    "方向": "short",
+                    "合约代码": "call",
+                    "总持仓": 7,
+                    "行权价": 4.9,
+                    "到期日": "2026-07-22",
+                },
+                {
+                    "日期": "2026-06-16",
+                    "账户ID": "default",
+                    "方向": "short",
+                    "合约代码": "put",
+                    "总持仓": 10,
+                    "行权价": 4.9,
+                    "到期日": "2026-07-22",
+                },
+            ]
+        )
+        payload = {
+            "product": "300etf",
+            "date": "2026-06-16",
+            "spot": 4.9,
+            "summary_history": summary,
+            "position_history": positions,
+        }
+
+        aum_by_date = account_report._summary_aum_by_date(payload)
+        report = account_report._summary_report_frame(
+            summary,
+            aum_by_date=aum_by_date,
+        )
+
+        self.assertAlmostEqual(aum_by_date["2026-06-16"], 490_000.0)
+        self.assertAlmostEqual(report.iloc[0]["单日盈亏/AUM"], 1_000.0 / 490_000.0)
+        net_index = report.columns.get_loc("净单日盈亏")
+        self.assertEqual(report.columns[net_index + 1], "单日盈亏/AUM")
+
     def test_option_pair_rows_share_aum_from_larger_leg_qty(self):
         position = {
             "call_code": "call",

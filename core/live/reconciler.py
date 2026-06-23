@@ -15,6 +15,13 @@ DEFAULT_ABS_TOLERANCE = 100.0
 DEFAULT_REL_TOLERANCE = 0.25
 
 
+CHECK_GROUP_LABELS = {
+    "source_check": "Source Check",
+    "report_check": "Report Check",
+    "greeks_check": "Greeks Check",
+}
+
+
 CHECK_DEFINITIONS = {
     "total_vs_legs": "总单日盈亏 = 期权单日盈亏 + ETF单日盈亏",
     "net_after_fee": "净单日盈亏 = 总单日盈亏 - 当日手续费",
@@ -33,8 +40,13 @@ CHECK_DEFINITIONS = {
     "trade_fee_sum": "当日手续费 = 交易记录手续费合计",
     "account_position_snapshot": "账户当前持仓 = 最新持仓记录",
     "greeks_explainability": "总单日盈亏 = 单日GreeksPnL",
-    "option_greeks_explainability": "期权单日盈亏 = 期权单日GreeksPnL",
-    "hedge_greeks_explainability": "ETF单日盈亏 = ETF单日GreeksPnL",
+}
+
+
+CHECK_GROUPS = {
+    "trade_fee_sum": "source_check",
+    "account_position_snapshot": "source_check",
+    "greeks_explainability": "greeks_check",
 }
 
 
@@ -69,6 +81,11 @@ def reconcile(
         raise ValueError(f"No summary history for account_id={account_id}")
 
     summary_frame = _merge_latest_report_summary(product, account_history)
+    if start_date is None and end_date is None:
+        latest_date = _latest_summary_date(summary_frame)
+        if latest_date is not None:
+            start_date = latest_date
+            end_date = latest_date
     position_frame = _load_position_report_frame(product, account_id)
     trade_frame = _load_trade_report_frame(product, account_id)
 
@@ -89,7 +106,7 @@ def reconcile(
         "product": product,
         "account_id": account_id,
         "ok": bool(rows) and all(check["ok"] for check in checks if not check["skipped"]),
-        "mode": "account_reconciliation",
+        "mode": "account_reconciliation_by_layer",
         "start_date": start_date,
         "end_date": end_date,
         "abs_tolerance": abs_tolerance,
@@ -118,36 +135,50 @@ def write_reconcile_report(product, payload):
         f"- rows: {metrics.get('row_count', 0)}",
         "",
         "## Check Summary",
-        "",
-        "| check | residual | ratio | rows | skipped | ok |",
-        "|---|---:|---:|---:|---:|:---:|",
     ]
-    for check in payload.get("checks", []):
-        lines.append(
-            "| {label} | {residual} | {ratio} | {rows} | {skipped} | {ok} |".format(
-                label=check.get("label", check.get("name")),
-                residual=_fmt(check.get("residual")),
-                ratio=_fmt(check.get("ratio")),
-                rows=check.get("row_count", 0),
-                skipped=check.get("skipped_count", 0),
-                ok="Y" if check.get("ok") else "N",
-            )
+    for group, group_label in CHECK_GROUP_LABELS.items():
+        group_checks = [
+            check for check in payload.get("checks", [])
+            if check.get("group") == group
+        ]
+        if not group_checks:
+            continue
+        lines.extend(
+            [
+                "",
+                f"### {group_label}",
+                "",
+                "| check | residual | ratio | rows | skipped | ok |",
+                "|---|---:|---:|---:|---:|:---:|",
+            ]
         )
+        for check in group_checks:
+            lines.append(
+                "| {label} | {residual} | {ratio} | {rows} | {skipped} | {ok} |".format(
+                    label=check.get("label", check.get("name")),
+                    residual=_fmt(check.get("residual")),
+                    ratio=_fmt(check.get("ratio")),
+                    rows=check.get("row_count", 0),
+                    skipped=check.get("skipped_count", 0),
+                    ok="Y" if check.get("ok") else "N",
+                )
+            )
 
     lines.extend(
         [
             "",
             "## Daily Checks",
             "",
-            "| date | check | actual | expected | residual | ratio | ok | note |",
-            "|---|---|---:|---:|---:|---:|:---:|---|",
+            "| date | layer | check | actual | expected | residual | ratio | ok | note |",
+            "|---|---|---|---:|---:|---:|---:|:---:|---|",
         ]
     )
     for row in payload.get("rows", []):
         for check in row.get("checks", []):
             lines.append(
-                "| {date} | {label} | {actual} | {expected} | {residual} | {ratio} | {ok} | {note} |".format(
+                "| {date} | {layer} | {label} | {actual} | {expected} | {residual} | {ratio} | {ok} | {note} |".format(
                     date=row["date"],
+                    layer=check.get("group_label", check.get("group")),
                     label=check.get("label", check.get("name")),
                     actual=_fmt(check.get("actual")),
                     expected=_fmt(check.get("expected")),
@@ -173,16 +204,42 @@ def format_terminal_summary(payload):
     if not checks:
         lines.append("(none)")
         return lines
-    for check in checks:
-        status = "OK" if check.get("ok") else "FAIL"
-        if check.get("skipped"):
-            status = "SKIP"
-        lines.append(
-            f"{status} {check.get('label', check.get('name'))}: "
-            f"残差={_fmt(check.get('residual'))} "
-            f"比例={_fmt(check.get('ratio'))}"
-        )
+    for group, group_label in CHECK_GROUP_LABELS.items():
+        group_checks = [check for check in checks if check.get("group") == group]
+        if not group_checks:
+            continue
+        lines.append(f"[{group_label}]")
+        display_checks = _terminal_group_checks(group, group_checks)
+        for check in display_checks:
+            status = "OK" if check.get("ok") else "FAIL"
+            if check.get("skipped"):
+                status = "SKIP"
+            lines.append(
+                f"{status} {check.get('label', check.get('name'))}: "
+                f"残差={_fmt(check.get('residual'))} "
+                f"比例={_fmt(check.get('ratio'))}"
+            )
     return lines
+
+
+def _terminal_group_checks(group, checks):
+    if group == "greeks_check":
+        return checks
+    active = [check for check in checks if not check.get("skipped")]
+    failed = [check for check in active if not check.get("ok")]
+    if failed:
+        return checks
+    if not active:
+        return checks[:1]
+    return [
+        max(
+            active,
+            key=lambda check: (
+                _zero_if_none(check.get("abs_residual")),
+                _zero_if_none(check.get("ratio")),
+            ),
+        )
+    ]
 
 
 def _build_daily_rows(
@@ -226,6 +283,7 @@ def _build_daily_rows(
         daily_fee = _number(current.get("当日手续费")) or 0.0
         net_daily_pnl = _summary_net_daily_pnl(current)
         nav_change = _value_change(prev, current, "估算权益")
+        date_positions = _rows_for_date(position_frame, current_date)
 
         checks.append(
             _check_value(
@@ -291,28 +349,43 @@ def _build_daily_rows(
         decomposition = _number(current.get("当日盈亏分解合计"))
         holding_pnl = _number(current.get("持仓盈亏"))
         mark_trade_pnl = _number(current.get("当日盯市交易盈亏"))
-        checks.append(
-            _check_value(
-                "summary_decomposition",
-                current_date,
-                total_daily_pnl,
-                _sum_optional(holding_pnl, mark_trade_pnl, fallback=decomposition),
-                abs_tolerance,
-                rel_tolerance,
+        if _skip_new_position_pnl_decomposition(date_positions):
+            checks.append(
+                _skipped_check(
+                    "summary_decomposition",
+                    current_date,
+                    "new_position_pnl_not_reconciled",
+                )
             )
-        )
-        checks.append(
-            _check_value(
-                "summary_decomposition_residual",
-                current_date,
-                _number(current.get("当日盈亏对账差额")),
-                _difference(total_daily_pnl, decomposition),
-                abs_tolerance,
-                rel_tolerance,
+            checks.append(
+                _skipped_check(
+                    "summary_decomposition_residual",
+                    current_date,
+                    "new_position_pnl_not_reconciled",
+                )
             )
-        )
+        else:
+            checks.append(
+                _check_value(
+                    "summary_decomposition",
+                    current_date,
+                    total_daily_pnl,
+                    _sum_optional(holding_pnl, mark_trade_pnl, fallback=decomposition),
+                    abs_tolerance,
+                    rel_tolerance,
+                )
+            )
+            checks.append(
+                _check_value(
+                    "summary_decomposition_residual",
+                    current_date,
+                    _number(current.get("当日盈亏对账差额")),
+                    _difference(total_daily_pnl, decomposition),
+                    abs_tolerance,
+                    rel_tolerance,
+                )
+            )
 
-        date_positions = _rows_for_date(position_frame, current_date)
         checks.extend(
             _position_checks(
                 current_date,
@@ -343,26 +416,6 @@ def _build_daily_rows(
                 current_date,
                 total_daily_pnl,
                 greeks_pnl,
-                abs_tolerance,
-                rel_tolerance,
-            )
-        )
-        checks.append(
-            _check_value(
-                "option_greeks_explainability",
-                current_date,
-                option_daily_pnl,
-                _option_greeks_pnl(prev, current),
-                abs_tolerance,
-                rel_tolerance,
-            )
-        )
-        checks.append(
-            _check_value(
-                "hedge_greeks_explainability",
-                current_date,
-                hedge_daily_pnl,
-                _hedge_greeks_pnl(product, prev, current),
                 abs_tolerance,
                 rel_tolerance,
             )
@@ -408,6 +461,15 @@ def _build_daily_rows(
                 }
             )
     return rows
+
+
+def _latest_summary_date(history):
+    if history.empty or "日期" not in history.columns:
+        return None
+    dates = pd.to_datetime(history["日期"], errors="coerce").dropna()
+    if dates.empty:
+        return None
+    return str(dates.max().date())
 
 
 def _position_checks(date, summary_row, position_frame, abs_tolerance, rel_tolerance):
@@ -535,6 +597,8 @@ def _aggregate_checks(rows):
                 {
                     "name": name,
                     "label": CHECK_DEFINITIONS.get(name, name),
+                    "group": _check_group(name),
+                    "group_label": _check_group_label(name),
                     "residual": None,
                     "abs_residual": None,
                     "ratio": None,
@@ -552,6 +616,8 @@ def _aggregate_checks(rows):
             {
                 "name": name,
                 "label": CHECK_DEFINITIONS.get(name, name),
+                "group": _check_group(name),
+                "group_label": _check_group_label(name),
                 "residual": abs_residual,
                 "signed_residual": residual,
                 "abs_residual": abs_residual,
@@ -586,6 +652,7 @@ def _aggregate_metrics(rows, checks):
         "failed_check_count": sum(
             1 for check in checks if not check["skipped"] and not check["ok"]
         ),
+        "groups": _aggregate_group_metrics(checks),
         "total_daily_pnl": total_daily_pnl,
         "total_greeks_pnl": total_greeks_pnl,
         "total_residual": None if greeks_check is None else greeks_check.get("residual"),
@@ -629,6 +696,8 @@ def _check_value(
     return {
         "name": name,
         "label": label,
+        "group": _check_group(name),
+        "group_label": _check_group_label(name),
         "date": str(date),
         "actual": float(actual),
         "expected": float(expected),
@@ -647,6 +716,8 @@ def _skipped_check(name, date, note):
     return {
         "name": name,
         "label": CHECK_DEFINITIONS.get(name, name),
+        "group": _check_group(name),
+        "group_label": _check_group_label(name),
         "date": str(date),
         "actual": None,
         "expected": None,
@@ -659,6 +730,33 @@ def _skipped_check(name, date, note):
         "ok": True,
         "note": note,
     }
+
+
+def _check_group(name):
+    return CHECK_GROUPS.get(name, "report_check")
+
+
+def _check_group_label(name):
+    return CHECK_GROUP_LABELS[_check_group(name)]
+
+
+def _aggregate_group_metrics(checks):
+    metrics = {}
+    for group, label in CHECK_GROUP_LABELS.items():
+        group_checks = [check for check in checks if check.get("group") == group]
+        active = [check for check in group_checks if not check.get("skipped")]
+        metrics[group] = {
+            "label": label,
+            "check_count": sum(check.get("row_count", 0) for check in group_checks),
+            "failed_check_count": sum(
+                1 for check in active if not check.get("ok")
+            ),
+            "skipped_check_count": sum(
+                check.get("skipped_count", 0) for check in group_checks
+            ),
+            "ok": all(check.get("ok") for check in active),
+        }
+    return metrics
 
 
 def _merge_latest_report_summary(product, history):
@@ -819,6 +917,10 @@ def _position_decomposition_series(frame):
             return values.fillna(0.0)
     if "持仓盈亏" not in frame.columns:
         return None
+    if "当日盯市交易盈亏" not in frame.columns and "今日变化" in frame.columns:
+        changes = pd.to_numeric(frame["今日变化"], errors="coerce").fillna(0.0)
+        if changes.abs().gt(1e-9).any():
+            return None
     holding = pd.to_numeric(frame["持仓盈亏"], errors="coerce")
     if not holding.notna().any():
         return None
@@ -828,6 +930,18 @@ def _position_decomposition_series(frame):
         else pd.Series(0.0, index=frame.index)
     )
     return holding.fillna(0.0) + mark_trade
+
+
+def _skip_new_position_pnl_decomposition(frame):
+    if frame is None or frame.empty or "今日变化" not in frame.columns:
+        return False
+    changes = pd.to_numeric(frame["今日变化"], errors="coerce").fillna(0.0)
+    if not changes.abs().gt(1e-9).any():
+        return False
+    if "当日盯市交易盈亏" not in frame.columns:
+        return True
+    values = pd.to_numeric(frame["当日盯市交易盈亏"], errors="coerce")
+    return not values.notna().any()
 
 
 def _position_option_mask(frame):

@@ -19,6 +19,7 @@ TEMPLATE_REPORT_PATH = (
 SUMMARY_TEMPLATE_SHEET = "账户总体情况"
 STRATEGY_NAME_COLUMN = "策略名称"
 SUMMARY_CONTRACT_CODE_COLUMN = "合约代码"
+SUMMARY_AUM_COLUMN = "AUM"
 STRATEGY_DISPLAY_NAMES = {
     "kc50etf": "科创50ETF华夏",
     "300etf": "沪深300ETF华泰柏瑞",
@@ -44,7 +45,7 @@ def _report_sheet_order(products):
 def build_portfolio_report(
     account_id="default",
     products=None,
-    source="akshare",
+    source="snapshot",
     date=None,
     persist_history=True,
 ):
@@ -53,13 +54,15 @@ def build_portfolio_report(
     errors = {}
     for product in products:
         try:
-            payloads[product] = account_report.build_live_account_report(
+            payload = account_report.build_live_account_report(
                 product,
                 account_id=account_id,
                 source=source,
                 date=date,
                 persist_history=persist_history,
             )
+            payload["_portfolio_reset_date"] = _account_reset_date(product, account_id)
+            payloads[product] = payload
         except Exception as exc:
             errors[product] = str(exc)
     if not payloads:
@@ -115,8 +118,8 @@ def write_portfolio_report(payload):
     with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
         for sheet_name in _report_sheet_order(payload["products"]):
             combined[sheet_name].to_excel(writer, sheet_name=sheet_name, index=False)
-        account_report._format_account_report_workbook(writer.book)
         _apply_template_layout(writer.book)
+        account_report._format_account_report_workbook(writer.book)
     temp_path.replace(path)
 
     json_path = out_dir / f"{stamp}_account_daily.json"
@@ -139,6 +142,7 @@ def write_portfolio_report(payload):
 
 def format_terminal_summary(payload):
     lines = [
+        _portfolio_snapshot_time_line(payload),
         (
             f"统一账户总表 日期={payload['date']} "
             f"标的={len(payload['subaccounts'])}/{len(payload['products'])}"
@@ -161,7 +165,7 @@ def format_terminal_summary(payload):
             continue
         row = product_rows.iloc[-1]
         lines.append(
-            f"{product}: 估算权益={_fmt(row.get('估算权益'))} "
+            f"{product}: AUM={_fmt(row.get(SUMMARY_AUM_COLUMN))} "
             f"期权单日盈亏={_fmt(row.get('期权单日盈亏'))} "
             f"ETF单日盈亏={_fmt(row.get('ETF单日盈亏'))} "
             f"净单日盈亏={_fmt(row.get('净单日盈亏'))} "
@@ -172,15 +176,38 @@ def format_terminal_summary(payload):
     return lines
 
 
+def _portfolio_snapshot_time_line(payload):
+    snapshots = payload.get("subaccounts") or {}
+    times = " ".join(
+        (
+            f"{product}="
+            f"{account_report._snapshot_time_text((snapshots.get(product) or {}).get('quote_snapshot'))}"
+        )
+        for product in payload.get("products", [])
+    )
+    return f"报告快照时间: {times}" if times else "报告快照时间: 不可用"
+
+
 def _combined_daily_frames(payloads, errors):
     frames_by_sheet = {}
     summary_frames = []
     position_frames = []
     trade_frames = []
     for product, payload in payloads.items():
+        reset_date = _payload_reset_date(payload)
         frames = account_report._report_frames(payload)
-        summary_frames.append(_product_summary_frame(product, frames))
+        summary_frames.append(
+            _filter_single_product_reset_rows(
+                _product_summary_frame(product, payload, frames),
+                reset_date,
+            )
+        )
         daily_frames = account_report._daily_report_frames(payload)
+        for sheet_name in DETAIL_SHEETS:
+            daily_frames[sheet_name] = _filter_single_product_reset_rows(
+                daily_frames[sheet_name],
+                reset_date,
+            )
         position_frames.append(_product_position_frame(product, daily_frames["持仓记录"]))
         trade_frames.append(daily_frames["交易记录"])
 
@@ -196,16 +223,24 @@ def _combined_daily_frames(payloads, errors):
         trade_frames,
         account_report.TRADE_COLUMNS,
     )
+    frames_by_sheet[SUMMARY_TEMPLATE_SHEET] = _backfill_summary_aum_from_positions(
+        frames_by_sheet[SUMMARY_TEMPLATE_SHEET],
+        frames_by_sheet["持仓记录"],
+    )
     return frames_by_sheet
 
 
-def _product_summary_frame(product, frames):
+def _product_summary_frame(product, payload, frames):
     frame = frames[SUMMARY_TEMPLATE_SHEET].copy()
     frame[STRATEGY_NAME_COLUMN] = _strategy_display_name(product)
     frame[SUMMARY_CONTRACT_CODE_COLUMN] = _strategy_contract_code(product)
+    frame[SUMMARY_AUM_COLUMN] = _summary_aum_series(
+        frame,
+        payload,
+        position_report=frames.get("持仓记录"),
+    )
     if "备注" not in frame.columns:
         frame["备注"] = None
-    frame["备注"] = frame["备注"].fillna(f"{product} 标的汇总")
     return frame.reindex(columns=_summary_report_columns())
 
 
@@ -220,9 +255,29 @@ def _summary_report_columns():
         account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
         STRATEGY_NAME_COLUMN,
         SUMMARY_CONTRACT_CODE_COLUMN,
-        *account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[1:],
+        *_portfolio_summary_value_columns()[1:],
         "备注",
     ]
+
+
+def _portfolio_summary_value_columns():
+    columns = list(account_report.DEFAULT_SUMMARY_REPORT_COLUMNS)
+    try:
+        columns[columns.index("估算权益")] = SUMMARY_AUM_COLUMN
+    except ValueError:
+        pass
+    return columns
+
+
+def _summary_aum_series(frame, payload, position_report=None):
+    if frame.empty or "日期" not in frame.columns:
+        return pd.Series(index=frame.index, dtype="float64")
+    aum_by_date = {}
+    aum_by_date.update(account_report._summary_aum_by_date(payload))
+    if isinstance(position_report, pd.DataFrame) and not position_report.empty:
+        aum_by_date.update(account_report._position_report_aum_by_date(position_report))
+    dates = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime("%Y-%m-%d")
+    return pd.to_numeric(dates.map(aum_by_date), errors="coerce")
 
 
 def _strategy_display_name(product):
@@ -259,6 +314,44 @@ def _strategy_name_matches(value, product):
     return _canonical_strategy_name(value) == _strategy_display_name(product)
 
 
+def _account_reset_date(product, account_id):
+    try:
+        reset_at = account_report.account_store.load_account(
+            product,
+            account_id=account_id,
+        ).reset_at
+    except Exception:
+        return None
+    return _normalize_reset_date(reset_at)
+
+
+def _payload_reset_date(payload):
+    return _normalize_reset_date(payload.get("_portfolio_reset_date"))
+
+
+def _normalize_reset_date(value):
+    if value is None or value == "":
+        return None
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(timestamp):
+        return None
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("Asia/Hong_Kong").tz_localize(None)
+    return timestamp.normalize()
+
+
+def _filter_single_product_reset_rows(frame, reset_date):
+    if reset_date is None or frame.empty or "日期" not in frame.columns:
+        return frame
+    result = frame.copy()
+    dates = pd.to_datetime(result["日期"], errors="coerce").dt.normalize()
+    keep = dates.isna() | dates.ge(reset_date)
+    return result.loc[keep].reset_index(drop=True)
+
+
 def _number(value):
     try:
         return float(value)
@@ -275,6 +368,61 @@ def _concat_exact(frames, columns):
     if not rows:
         return pd.DataFrame(columns=columns)
     return pd.DataFrame.from_records(rows, columns=columns)
+
+
+def _filter_reset_history_rows(sheet_name, frame, payloads=None):
+    if frame.empty or payloads is None or "日期" not in frame.columns:
+        return frame
+    reset_dates = {
+        product: reset_date
+        for product, payload in payloads.items()
+        for reset_date in [_payload_reset_date(payload)]
+        if reset_date is not None
+    }
+    if not reset_dates:
+        return frame
+
+    result = frame.copy()
+    products = _reset_filter_products(sheet_name, result, payloads)
+    dates = pd.to_datetime(result["日期"], errors="coerce").dt.normalize()
+    keep = pd.Series(True, index=result.index)
+    for product, reset_date in reset_dates.items():
+        remove = products.eq(product) & dates.notna() & dates.lt(reset_date)
+        keep &= ~remove
+    return result.loc[keep].reset_index(drop=True)
+
+
+def _reset_filter_products(sheet_name, frame, payloads):
+    products = pd.Series([None] * len(frame), index=frame.index, dtype=object)
+    if STRATEGY_NAME_COLUMN in frame.columns:
+        by_strategy = frame[STRATEGY_NAME_COLUMN].map(_product_from_strategy_name)
+        products.loc[by_strategy.notna()] = by_strategy.loc[by_strategy.notna()]
+
+    missing = products.isna()
+    if not missing.any():
+        return products
+
+    markers = _position_product_markers(payloads)
+    if sheet_name == SUMMARY_TEMPLATE_SHEET:
+        inferred = frame.loc[missing].apply(
+            lambda row: _product_from_summary_row(row, payloads),
+            axis=1,
+        )
+    elif sheet_name == "持仓记录":
+        inferred = frame.loc[missing].apply(
+            lambda row: _product_from_position_row(row, markers),
+            axis=1,
+        )
+    elif sheet_name == "交易记录":
+        inferred = frame.loc[missing].apply(
+            lambda row: _product_from_trade_row(row, markers),
+            axis=1,
+        )
+    else:
+        return products
+
+    products.loc[inferred.index] = inferred
+    return products
 
 
 def _merge_with_existing(current, existing_path, payloads=None, products=None):
@@ -307,6 +455,8 @@ def _merge_with_existing(current, existing_path, payloads=None, products=None):
         old = old.reindex(columns=columns)
         if sheet_name in DETAIL_SHEETS:
             old = _restore_template_history(old, sheet_name, columns)
+        old = _filter_reset_history_rows(sheet_name, old, payloads)
+        daily = _filter_reset_history_rows(sheet_name, daily, payloads)
         if not daily.empty and "日期" in daily.columns:
             old = _drop_replaced_history_rows(sheet_name, old, daily)
         if old.empty:
@@ -324,6 +474,10 @@ def _merge_with_existing(current, existing_path, payloads=None, products=None):
             frame = _backfill_position_aum(frame, payloads)
             frame = _backfill_position_holding_pnl(frame, payloads)
         combined[sheet_name] = _sort_portfolio_report_frame(sheet_name, frame)
+    combined[SUMMARY_TEMPLATE_SHEET] = _backfill_summary_aum_from_positions(
+        combined.get(SUMMARY_TEMPLATE_SHEET),
+        combined.get("持仓记录"),
+    )
     return combined
 
 
@@ -386,6 +540,92 @@ def _backfill_position_strategy_name(frame, payloads=None):
     )
     for index, product in inferred.dropna().items():
         result.at[index, STRATEGY_NAME_COLUMN] = _strategy_display_name(product)
+    return result
+
+
+def _backfill_summary_aum_from_positions(summary_frame, position_frame):
+    if (
+        not isinstance(summary_frame, pd.DataFrame)
+        or summary_frame.empty
+        or not isinstance(position_frame, pd.DataFrame)
+        or position_frame.empty
+    ):
+        return summary_frame
+    summary_required = {"日期", STRATEGY_NAME_COLUMN, SUMMARY_AUM_COLUMN}
+    position_required = {
+        "日期",
+        STRATEGY_NAME_COLUMN,
+        "总持仓张数",
+        "AUM",
+        "到期日",
+    }
+    if not summary_required.issubset(summary_frame.columns) or not position_required.issubset(
+        position_frame.columns
+    ):
+        return summary_frame
+
+    option_rows = position_frame.loc[position_frame["到期日"].notna()].copy()
+    if option_rows.empty:
+        return summary_frame
+    option_rows["_summary_aum_qty"] = pd.to_numeric(
+        option_rows["总持仓张数"],
+        errors="coerce",
+    ).fillna(0.0).abs()
+    option_rows = option_rows.loc[option_rows["_summary_aum_qty"].gt(0)].copy()
+    if option_rows.empty:
+        return summary_frame
+    option_rows["_summary_aum_date"] = pd.to_datetime(
+        option_rows["日期"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    option_rows["_summary_aum_strategy"] = option_rows[STRATEGY_NAME_COLUMN].map(
+        _canonical_strategy_name
+    )
+    option_rows["_summary_aum_value"] = pd.to_numeric(
+        option_rows["AUM"],
+        errors="coerce",
+    )
+    option_rows = option_rows.dropna(
+        subset=[
+            "_summary_aum_date",
+            "_summary_aum_strategy",
+            "_summary_aum_value",
+        ]
+    )
+    if option_rows.empty:
+        return summary_frame
+
+    group_columns = [
+        "_summary_aum_date",
+        "_summary_aum_strategy",
+        *[
+            column
+            for column in ("交易方向", "到期日")
+            if column in option_rows.columns
+        ],
+    ]
+    aum_lookup = (
+        option_rows.groupby(group_columns, dropna=False)["_summary_aum_value"]
+        .max()
+        .groupby(level=[0, 1])
+        .sum()
+        .to_dict()
+    )
+    if not aum_lookup:
+        return summary_frame
+
+    result = summary_frame.copy()
+    summary_dates = pd.to_datetime(result["日期"], errors="coerce").dt.strftime(
+        "%Y-%m-%d"
+    )
+    summary_strategies = result[STRATEGY_NAME_COLUMN].map(_canonical_strategy_name)
+    values = [
+        aum_lookup.get((date, strategy))
+        for date, strategy in zip(summary_dates, summary_strategies)
+    ]
+    filled = pd.to_numeric(pd.Series(values, index=result.index), errors="coerce")
+    mask = filled.notna()
+    result.loc[mask, SUMMARY_AUM_COLUMN] = filled.loc[mask]
     return result
 
 
@@ -478,14 +718,29 @@ def _backfill_position_holding_pnl(frame, payloads=None):
             )
             if qty is not None:
                 result.at[index, "今日变化"] = qty - (previous_qty or 0.0)
-            if latest is not None and previous_latest is not None and previous_qty:
-                multiplier = _position_row_multiplier(row, product_markers)
-                direction = _position_direction_sign(previous_direction)
-                result.at[index, "持仓盈亏"] = (
-                    direction * (latest - previous_latest) * abs(previous_qty) * multiplier
-                )
-            else:
-                result.at[index, "持仓盈亏"] = 0.0
+            product = row.get("_position_product")
+            trade_rows = _position_trade_rows(
+                payloads.get(product, {}),
+                row.get("日期"),
+                row.get("合约代码"),
+            )
+            multiplier = _position_row_multiplier(row, product_markers)
+            pnl = account_report._daily_position_pnl_breakdown(
+                current_qty=qty,
+                current_side=_account_position_side(row.get("交易方向")),
+                current_price=latest,
+                previous_qty=previous_qty,
+                previous_side=_account_position_side(previous_direction),
+                previous_price=previous_latest,
+                previous_cost=(
+                    _number(previous_row.get("持仓均价"))
+                    if previous_row is not None
+                    else None
+                ),
+                trade_rows=trade_rows,
+                multiplier=multiplier,
+            )
+            result.at[index, "持仓盈亏"] = pnl["holding_pnl"]
             previous_row = row
 
     return result.drop(
@@ -496,6 +751,21 @@ def _backfill_position_holding_pnl(frame, payloads=None):
             "_original_order",
         ]
     )
+
+
+def _position_trade_rows(payload, date, code):
+    date_text = str(pd.Timestamp(date).date()) if not pd.isna(date) else ""
+    code_key = _position_code_key(code)
+    return [
+        trade
+        for trade in payload.get("trade_rows", [])
+        if str(trade.get("日期")) == date_text
+        and _position_code_key(trade.get("合约代码")) == code_key
+    ]
+
+
+def _account_position_side(value):
+    return "short" if _position_direction_sign(value) < 0 else "long"
 
 
 def _position_code_key(value):
@@ -603,17 +873,37 @@ def _product_from_contract_name(name, markers):
     return None
 
 
+def _product_from_summary_row(row, payloads):
+    return _product_from_security_code(
+        row.get(SUMMARY_CONTRACT_CODE_COLUMN),
+        payloads.keys(),
+    )
+
+
 def _product_from_position_row(row, markers):
     product = _product_from_contract_name(row.get("合约名称"), markers)
     if product is not None:
         return product
-    code = _position_code_key(row.get("合约代码"))
-    for product in markers:
+    return _product_from_security_code(row.get("合约代码"), markers.keys())
+
+
+def _product_from_trade_row(row, markers):
+    product = _product_from_contract_name(row.get("合约名称"), markers)
+    if product is not None:
+        return product
+    return _product_from_security_code(row.get("合约代码"), markers.keys())
+
+
+def _product_from_security_code(value, products):
+    code = _position_code_key(value).lower()
+    if code.startswith(("sh", "sz")):
+        code = code[2:]
+    for product in products:
         try:
             spec = market_data.SSE_ETF_OPTION_SPECS[product]
         except KeyError:
             continue
-        if code == _position_code_key(spec.etf_symbol):
+        if code == _position_code_key(spec.etf_symbol).lower():
             return product
     return None
 

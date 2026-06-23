@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 
 import _bootstrap  # noqa: F401
 import core
@@ -20,6 +21,13 @@ from core.live import (
 from core.live.runtime import load_product_config
 
 
+MARK_UPDATE_ACTIONS = {
+    "option_mark_update",
+    "option_hedge_mark_update",
+    "hedge_mark_update",
+}
+
+
 def main():
     session = {
         "products": tuple(core.config.available_live_products()),
@@ -29,20 +37,21 @@ def main():
         _print_header(session)
         action = _menu_choice(
             [
-                ("1", "初始化/重置账户"),
-                ("2", "拉取行情并生成/预览策略信号"),
+                ("1", "拉取并保存 AKShare 最新快照"),
+                ("2", "使用本地最新快照生成/预览策略信号"),
                 ("3", "导入期权/ETF 持仓成交并自动确认"),
                 ("4", "生成账户报告"),
                 ("5", "查看当前持仓"),
                 ("6", "查看成交记录"),
                 ("7", "重建账户状态"),
                 ("8", "账户对账"),
+                ("9", "初始化/重置账户"),
                 ("0", "退出"),
             ]
         )
         try:
             if action == "1":
-                _action_init_account(session)
+                _action_fetch_akshare_snapshots(session)
             elif action == "2":
                 _action_quote_signal(session)
             elif action == "3":
@@ -57,6 +66,8 @@ def main():
                 _action_rebuild_account(session)
             elif action == "8":
                 _action_reconcile(session)
+            elif action == "9":
+                _action_init_account(session)
             elif action == "0":
                 print("已退出。")
                 return
@@ -83,21 +94,33 @@ def _action_init_account(session):
 
 
 def _action_quote_signal(session):
-    source = _prompt_choice("行情源", ["akshare", "local", "none"], "akshare")
-    date = (
-        _prompt_optional("日期，留空则使用已有数据最新日期")
-        if source == "none"
-        else _prompt("行情日期", "latest")
+    source = "snapshot"
+    date = _prompt("本地快照日期", "latest")
+    snapshots = {}
+    snapshot_errors = {}
+    for product in session["products"]:
+        try:
+            snapshots[product] = market_data.fetch_quote_snapshot(
+                product,
+                source,
+                date,
+            )
+        except Exception as exc:
+            snapshot_errors[product] = exc
+
+    snapshot_times = " ".join(
+        f"{product}={_snapshot_time_text(snapshots.get(product))}"
+        for product in session["products"]
     )
+    print(f"\n快照时间: {snapshot_times}")
     for product in session["products"]:
         print(f"\n== {product} ==")
+        if product in snapshot_errors:
+            print(f"FAILED {snapshot_errors[product]}")
+            continue
         try:
-            snapshot = (
-                None
-                if source == "none"
-                else market_data.fetch_quote_snapshot(product, source, date)
-            )
-            signal_date = (date or None) if snapshot is None else snapshot["quote_date"]
+            snapshot = snapshots[product]
+            signal_date = snapshot["quote_date"]
             payload = signal_engine.generate_signal(
                 product,
                 session["account_id"],
@@ -109,12 +132,38 @@ def _action_quote_signal(session):
             report_path = report.write_signal_report(product, payload)
             json_path = report_path.with_suffix(".json")
             storage.write_json(json_path, payload)
-            print(f"quote_date={payload['date']}")
-            print(f"signal_report={report_path}")
-            print(f"signal_json={json_path}")
-            print("read_only=True")
             for line in report.format_signal_summary(payload):
                 print(line)
+        except Exception as exc:
+            print(f"FAILED {exc}")
+
+
+def _snapshot_time_text(snapshot):
+    if not snapshot:
+        return "不可用"
+    stamp = str(snapshot.get("snapshot_stamp") or "")
+    try:
+        return datetime.strptime(stamp, "%Y%m%d_%H%M%S").strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+    except (TypeError, ValueError):
+        return stamp or "未知"
+
+
+def _action_fetch_akshare_snapshots(session):
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            snapshot = market_data.fetch_quote_snapshot(
+                product,
+                source="akshare",
+                date="latest",
+            )
+            print(
+                f"saved={snapshot['snapshot_stamp']} "
+                f"quote_date={snapshot['quote_date']} "
+                f"option_rows={snapshot.get('option_rows', 0)}"
+            )
         except Exception as exc:
             print(f"FAILED {exc}")
 
@@ -207,14 +256,36 @@ def _try_auto_import(kind, factory):
 
 
 def _print_auto_import_results(results):
-    for item in results:
-        print("")
-        print(f"== {item['kind']} import ==")
-        if item.get("result") is not None:
-            _print_import_result(item["result"])
+    by_kind = {item["kind"]: item for item in results}
+    for kind, label in [("options", "Option"), ("etf", "ETF")]:
+        item = by_kind.get(kind)
+        if item is None:
             continue
-        label = "SKIPPED" if item.get("skipped") else "FAILED"
-        print(f"{label} reason={item.get('error')}")
+        result = item.get("result")
+        if result is None:
+            status = "跳过" if item.get("skipped") else "失败"
+            print(f"{label}: {status} - {item.get('error')}")
+            continue
+
+        applied = result.get("applied") or []
+        position_changes = [
+            change
+            for change in applied
+            if str((change.get("fill") or {}).get("action"))
+            not in MARK_UPDATE_ACTIONS
+        ]
+        if not position_changes:
+            print(f"{label}: 无变化")
+            continue
+
+        mode = (
+            "预览"
+            if any(change.get("dry_run") for change in position_changes)
+            else "已写入"
+        )
+        print(f"{label}: 有变化 ({mode})")
+        for change in position_changes:
+            print(f"  - {_format_auto_import_change(kind, change)}")
 
 
 def _auto_import_has_writes(results):
@@ -232,8 +303,134 @@ def _auto_import_writable_kinds(results):
     ]
 
 
+def _format_auto_import_change(kind, change):
+    fill = change["fill"]
+    prefix = "DRY_RUN" if change.get("dry_run") else "CONFIRMED"
+    if kind == "etf" or _is_hedge_fill(fill):
+        return _format_auto_import_etf_change(prefix, fill)
+    return _format_auto_import_option_change(prefix, fill)
+
+
+def _format_auto_import_etf_change(prefix, fill):
+    action = fill.get("action")
+    new_qty = _number_or_none(
+        fill.get("target_hedge_qty", fill.get("new_etf_qty", fill.get("qty")))
+    )
+    trade_qty = _number_or_none(fill.get("trade_etf_qty"))
+    old_qty = (
+        new_qty - trade_qty
+        if new_qty is not None and trade_qty is not None
+        else None
+    )
+    qty_text = (
+        f"qty={_fmt_qty(old_qty)}->{_fmt_qty(new_qty)}"
+        if old_qty is not None
+        else f"qty={_fmt_qty(new_qty)}"
+    )
+    parts = [
+        prefix,
+        str(action),
+        qty_text,
+        f"trade={_fmt_qty(trade_qty)}",
+        f"entry={_fmt_optional(fill.get('entry_price'))}",
+        f"latest={_fmt_optional(fill.get('latest_price'))}",
+    ]
+    if fill.get("cash_delta") is not None:
+        parts.append(f"cash_delta={float(fill['cash_delta']):.2f}")
+    if fill.get("unrealized_pnl") is not None:
+        parts.append(f"unrealized={float(fill['unrealized_pnl']):.2f}")
+    return " ".join(parts)
+
+
+def _format_auto_import_option_change(prefix, fill):
+    action = str(fill.get("action"))
+    parts = [
+        prefix,
+        action,
+        f"side={fill.get('side')}",
+    ]
+    code_text = _format_option_fill_codes(fill)
+    if code_text:
+        parts.append(code_text)
+    qty_text = _format_option_fill_qty(fill)
+    if qty_text:
+        parts.append(qty_text)
+    if fill.get("strike") is not None:
+        parts.append(f"strike={fill.get('strike')}")
+    if fill.get("expiry") is not None:
+        parts.append(f"expiry={fill.get('expiry')}")
+    price_text = _format_option_fill_prices(fill)
+    if price_text:
+        parts.append(price_text)
+    if fill.get("last_option_value") is not None:
+        parts.append(f"value={_fmt_optional(fill.get('last_option_value'))}")
+    if fill.get("option_margin") is not None:
+        parts.append(f"margin={_fmt_optional(fill.get('option_margin'))}")
+    if fill.get("option_margin_release") is not None:
+        parts.append(
+            f"margin_release={_fmt_optional(fill.get('option_margin_release'))}"
+        )
+    if fill.get("cash_delta") is not None:
+        parts.append(f"cash_delta={float(fill['cash_delta']):.2f}")
+    return " ".join(parts)
+
+
+def _format_option_fill_codes(fill):
+    if fill.get("order_book_id") is not None:
+        return f"code={fill.get('order_book_id')}"
+    call = fill.get("call_code")
+    put = fill.get("put_code")
+    if call is None and put is None:
+        return None
+    return f"call={call} put={put}"
+
+
+def _format_option_fill_qty(fill):
+    if fill.get("qty") is not None:
+        return f"qty={_fmt_qty(fill.get('qty'))}"
+    call_qty = fill.get("call_qty")
+    put_qty = fill.get("put_qty")
+    if call_qty is None and put_qty is None:
+        return None
+    return f"qty={_fmt_qty(call_qty)}/{_fmt_qty(put_qty)}"
+
+
+def _format_option_fill_prices(fill):
+    if fill.get("price") is not None or fill.get("close_price") is not None:
+        return f"price={_fmt_optional(fill.get('price', fill.get('close_price')))}"
+    call_price = fill.get(
+        "entry_call_price",
+        fill.get("call_price", fill.get("last_call_price")),
+    )
+    put_price = fill.get(
+        "entry_put_price",
+        fill.get("put_price", fill.get("last_put_price")),
+    )
+    if call_price is None and put_price is None:
+        return None
+    return f"call_px={_fmt_optional(call_price)} put_px={_fmt_optional(put_price)}"
+
+
+def _number_or_none(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_qty(value):
+    number = _number_or_none(value)
+    if number is None:
+        return "nan"
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return f"{number:.6f}".rstrip("0").rstrip(".")
+
+
 def _action_account_report(session):
-    source = _prompt_choice("行情源", ["akshare", "local", "none"], "akshare")
+    source = "snapshot"
     date = _prompt_optional("日期，留空则最新")
     persist_history = _confirm("更新累计账户/持仓历史", True)
     write_files = _confirm("写出组合报告文件", True)
@@ -311,8 +508,8 @@ def _action_rebuild_account(session):
 
 
 def _action_reconcile(session):
-    start_date = _prompt_optional("开始日期，留空则从第二条历史开始")
-    end_date = _prompt_optional("结束日期，留空则到最新历史")
+    start_date = _prompt_optional("开始日期，留空则只对最新日期")
+    end_date = _prompt_optional("结束日期，留空则只对最新日期")
     abs_tolerance = _prompt_float(
         "绝对残差容忍度",
         reconciler.DEFAULT_ABS_TOLERANCE,

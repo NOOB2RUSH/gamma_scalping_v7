@@ -344,18 +344,13 @@ def get_short_close_reason(feature_row, position_dte, position=None):
     return None
 
 
-def is_short_stop_loss(position, current_market_value):
-    """卖方跨式亏损超过初始合约价值一定比例时止损。"""
+def is_short_daily_loss_aum_stop(daily_pnl, aum):
+    """Return whether today's short-option holding loss breached its AUM limit."""
     if not CONFIG.strategy.short_stop_loss_enabled:
         return False
-
-    if position.get("side") != "short":
+    if aum is None or aum <= 0 or daily_pnl is None:
         return False
-    entry_value = position.get("entry_option_value", 0.0)
-    if entry_value <= 0:
-        return False
-    loss = current_market_value - entry_value
-    return loss > entry_value * CONFIG.strategy.short_stop_loss_rate
+    return daily_pnl / aum < CONFIG.strategy.short_daily_loss_aum_threshold
 
 
 def calc_position_greeks(call_row, put_row, call_qty=1, put_qty=1, side="long"):
