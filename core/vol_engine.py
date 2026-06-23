@@ -9,6 +9,59 @@ _VOLLIB_FUNCS = None
 IV_OBSERVATION_MODES = {"legacy", "simple_atm_absolute", "surface_percentile"}
 
 
+def strike_step_from_chain(chain_df, reference_strike):
+    if chain_df is None or chain_df.empty or "strike_price" not in chain_df.columns:
+        return None
+    chain_df = filter_standard_option_contracts(chain_df)
+    try:
+        reference = float(reference_strike)
+    except (TypeError, ValueError):
+        return None
+    strikes = (
+        pd.to_numeric(chain_df["strike_price"], errors="coerce")
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .to_numpy(dtype=float)
+    )
+    if len(strikes) < 2:
+        return None
+
+    nearest_idx = int(np.argmin(np.abs(strikes - reference)))
+    candidates = []
+    if nearest_idx > 0:
+        candidates.append(strikes[nearest_idx] - strikes[nearest_idx - 1])
+    if nearest_idx < len(strikes) - 1:
+        candidates.append(strikes[nearest_idx + 1] - strikes[nearest_idx])
+    candidates = [float(step) for step in candidates if step > 0]
+    return min(candidates) if candidates else None
+
+
+def spot_exceeds_one_strike_step(
+    position_strike,
+    spot,
+    chain_df,
+    fallback_atm_strike=None,
+):
+    try:
+        position_strike = float(position_strike)
+        spot = float(spot)
+    except (TypeError, ValueError):
+        return False
+
+    step = strike_step_from_chain(chain_df, position_strike)
+    if step is not None and step > 0:
+        deviation = abs(spot - position_strike)
+        return deviation > step and not np.isclose(deviation, step)
+
+    if fallback_atm_strike is None or pd.isna(fallback_atm_strike):
+        return False
+    try:
+        return not np.isclose(position_strike, float(fallback_atm_strike))
+    except (TypeError, ValueError):
+        return False
+
+
 def _iv_observation_mode():
     mode = getattr(CONFIG.vol, "iv_observation_mode", "legacy")
     if mode not in IV_OBSERVATION_MODES:
@@ -196,6 +249,7 @@ def add_iv_for_day(
     )
     # vectorized_* 返回的 Series 索引从 0 开始；写回原 DataFrame 时必须按位置赋值。
     chain_df.loc[valid, "iv"] = iv_values.to_numpy()
+    chain_df.loc[valid, "iv"] = chain_df.loc[valid, "iv"].fillna(0.0)
 
     return chain_df
 

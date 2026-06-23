@@ -111,70 +111,6 @@ def import_holding_file(
         warnings,
         config,
     )
-
-    for candidate in candidates:
-        if candidate.get("kind") == "option_hedge":
-            fill = candidate["fill"]
-            existing = _matching_option_hedge(local, fill)
-            if existing is not None:
-                skipped.append(
-                    {
-                        "side": fill.get("side"),
-                        "reason": "local_option_hedge_already_matches_snapshot",
-                        "fill": fill,
-                    }
-                )
-                if _is_newer_mark(fill, existing):
-                    mark_fill = _option_hedge_mark_update_fill(fill, source_timestamp)
-                    if dry_run:
-                        applied.append({"dry_run": True, "fill": mark_fill})
-                    else:
-                        local = account_store.record_fill(product, mark_fill, account_id=account_id)
-                        applied.append({"dry_run": False, "fill": mark_fill})
-            elif dry_run:
-                applied.append({"dry_run": True, "fill": fill})
-            else:
-                local = account_store.record_fill(product, fill, account_id=account_id)
-                applied.append({"dry_run": False, "fill": fill})
-            continue
-
-        side = candidate["side"]
-        fill = candidate["fill"]
-        existing = local.positions.get(side)
-        if existing is not None:
-            if _same_position(existing, fill):
-                skipped.append(
-                    {
-                        "side": side,
-                        "reason": "local_position_already_matches_snapshot",
-                        "fill": fill,
-                    }
-                )
-                if _is_newer_mark(fill, existing):
-                    mark_fill = _mark_update_fill(fill, source_timestamp)
-                    if dry_run:
-                        applied.append({"dry_run": True, "fill": mark_fill})
-                    else:
-                        local = account_store.record_fill(product, mark_fill, account_id=account_id)
-                        applied.append({"dry_run": False, "fill": mark_fill})
-                continue
-            warnings.append(
-                {
-                    "side": side,
-                    "reason": "local_position_differs_from_snapshot; manual amend/roll/close is required",
-                    "local_position": existing,
-                    "snapshot_fill": fill,
-                }
-            )
-            continue
-
-        if dry_run:
-            applied.append({"dry_run": True, "fill": fill})
-            continue
-
-        local = account_store.record_fill(product, fill, account_id=account_id)
-        applied.append({"dry_run": False, "fill": fill})
-
     local = _apply_missing_option_hedge_closes(
         product,
         account_id,
@@ -201,6 +137,90 @@ def import_holding_file(
         applied,
         warnings,
     )
+
+    for candidate in candidates:
+        if candidate.get("kind") == "option_hedge":
+            fill = candidate["fill"]
+            existing = _matching_option_hedge(local, fill)
+            if existing is not None:
+                skipped.append(
+                    {
+                        "side": fill.get("side"),
+                        "reason": "local_option_hedge_already_matches_snapshot",
+                        "fill": fill,
+                    }
+                )
+                if _is_newer_mark(fill, existing):
+                    mark_fill = _option_hedge_mark_update_fill(fill, source_timestamp)
+                    local = _record_or_preview_fill(
+                        product,
+                        account_id,
+                        local,
+                        mark_fill,
+                        dry_run,
+                        applied,
+                    )
+            elif dry_run:
+                local = _record_or_preview_fill(
+                    product,
+                    account_id,
+                    local,
+                    fill,
+                    dry_run,
+                    applied,
+                )
+            else:
+                local = _record_or_preview_fill(
+                    product,
+                    account_id,
+                    local,
+                    fill,
+                    dry_run,
+                    applied,
+                )
+            continue
+
+        side = candidate["side"]
+        fill = candidate["fill"]
+        existing = local.positions.get(side)
+        if existing is not None:
+            if _same_position(existing, fill):
+                skipped.append(
+                    {
+                        "side": side,
+                        "reason": "local_position_already_matches_snapshot",
+                        "fill": fill,
+                    }
+                )
+                if _is_newer_mark(fill, existing):
+                    mark_fill = _mark_update_fill(fill, source_timestamp)
+                    local = _record_or_preview_fill(
+                        product,
+                        account_id,
+                        local,
+                        mark_fill,
+                        dry_run,
+                        applied,
+                    )
+                continue
+            warnings.append(
+                {
+                    "side": side,
+                    "reason": "local_position_differs_from_snapshot; manual amend/roll/close is required",
+                    "local_position": existing,
+                    "snapshot_fill": fill,
+                }
+            )
+            continue
+
+        local = _record_or_preview_fill(
+            product,
+            account_id,
+            local,
+            fill,
+            dry_run,
+            applied,
+        )
     _warn_missing_local_positions(local, snapshot_rows, warnings, applied)
     return {
         "product": product,
@@ -216,6 +236,17 @@ def import_holding_file(
         "skipped": skipped,
         "warnings": warnings,
     }
+
+
+def _record_or_preview_fill(product, account_id, local, fill, dry_run, applied):
+    if dry_run:
+        account_store._apply_fill(local, product, fill)
+        applied.append({"dry_run": True, "fill": account_store.normalize_fill(fill)})
+        return local
+
+    local = account_store.record_fill(product, fill, account_id=account_id)
+    applied.append({"dry_run": False, "fill": fill})
+    return local
 
 
 def _apply_existing_position_rebalances(
@@ -266,11 +297,7 @@ def _apply_existing_position_rebalances(
                 }
             )
             continue
-        if dry_run:
-            applied.append({"dry_run": True, "fill": fill})
-        else:
-            local = account_store.record_fill(product, fill, account_id=account_id)
-            applied.append({"dry_run": False, "fill": fill})
+        local = _record_or_preview_fill(product, account_id, local, fill, dry_run, applied)
     return local
 
 
@@ -408,11 +435,7 @@ def _apply_missing_option_hedge_closes(
                 }
             )
             continue
-        if dry_run:
-            applied.append({"dry_run": True, "fill": fill})
-        else:
-            local = account_store.record_fill(product, fill, account_id=account_id)
-            applied.append({"dry_run": False, "fill": fill})
+        local = _record_or_preview_fill(product, account_id, local, fill, dry_run, applied)
     return local
 
 
@@ -519,11 +542,7 @@ def _apply_missing_straddle_closes(
                 }
             )
             continue
-        if dry_run:
-            applied.append({"dry_run": True, "fill": fill})
-        else:
-            local = account_store.record_fill(product, fill, account_id=account_id)
-            applied.append({"dry_run": False, "fill": fill})
+        local = _record_or_preview_fill(product, account_id, local, fill, dry_run, applied)
     return local
 
 

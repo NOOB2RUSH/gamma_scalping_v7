@@ -54,6 +54,12 @@ def historical_option_metadata_cache_path(product):
     return path / "historical_option_metadata.csv"
 
 
+def live_trading_calendar_path():
+    path = PROJECT_ROOT / "state" / "live"
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "trading_calendar.csv"
+
+
 def account_report_summary_history_path(product, account_id="default"):
     path = PROJECT_ROOT / "state" / "live" / product
     path.mkdir(parents=True, exist_ok=True)

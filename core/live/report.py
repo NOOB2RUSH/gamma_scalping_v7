@@ -7,14 +7,22 @@ def write_signal_report(product, signal_payload):
     stamp = storage.local_now_stamp()
     path = storage.output_dir(product) / f"{stamp}_signal.md"
     rows, notices = _execution_rows(signal_payload)
+    reasons = _advice_reason_lines(signal_payload)
     lines = [
         f"# Live Signal: {product}",
-        "",
-        "## Execution Plan",
-        "",
-        "| 执行顺序 | 合约代码 | 方向 | 数量 | 执行价格 |",
-        "| ---: | --- | --- | ---: | ---: |",
     ]
+    if reasons:
+        lines.extend(["", "## Reasons", ""])
+        lines.extend(f"- {reason}" for reason in reasons)
+    lines.extend(
+        [
+            "",
+            "## Execution Plan",
+            "",
+            "| 执行顺序 | 合约代码 | 方向 | 数量 | 执行价格 |",
+            "| ---: | --- | --- | ---: | ---: |",
+        ]
+    )
     if rows:
         for row in rows:
             lines.append(
@@ -34,9 +42,8 @@ def write_signal_report(product, signal_payload):
 def format_signal_summary(signal_payload):
     """Return terminal-friendly live advice lines for manual execution."""
     rows, notices = _execution_rows(signal_payload)
-    lines = [
-        "执行顺序 | 合约代码 | 方向 | 数量 | 执行价格",
-    ]
+    lines = _advice_reason_lines(signal_payload)
+    lines.append("执行顺序 | 合约代码 | 方向 | 数量 | 执行价格")
     if not rows:
         lines.append("- | - | 无操作 | 0 | -")
     for row in rows:
@@ -46,6 +53,14 @@ def format_signal_summary(signal_payload):
         )
     lines.extend(f"提示: {notice}" for notice in notices)
     return lines
+
+
+def _advice_reason_lines(signal_payload):
+    return [
+        f"reason: {item.get('action')}={item.get('reason')}"
+        for item in signal_payload.get("advice", [])
+        if item.get("reason")
+    ]
 
 
 def _execution_rows(signal_payload):

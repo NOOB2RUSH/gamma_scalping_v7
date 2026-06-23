@@ -10,7 +10,9 @@ from core.live import market_data
 def parse_args():
     parser = argparse.ArgumentParser(description="Fetch/save one live quote snapshot.")
     parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
-    parser.add_argument("--source", default="local", choices=["local", "akshare"])
+    parser.add_argument(
+        "--source", default="akshare", choices=["akshare", "snapshot", "local"]
+    )
     parser.add_argument("--date", default="latest")
     return parser.parse_args()
 

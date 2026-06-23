@@ -10,7 +10,11 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Build one combined report from all live product subaccounts."
     )
-    parser.add_argument("--source", choices=["akshare", "local", "none"], default="akshare")
+    parser.add_argument(
+        "--source",
+        choices=["snapshot", "akshare", "local", "none"],
+        default="snapshot",
+    )
     parser.add_argument("--date", default=None)
     parser.add_argument("--no-write", action="store_true")
     parser.add_argument("--no-history", action="store_true")

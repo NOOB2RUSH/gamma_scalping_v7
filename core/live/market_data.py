@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import time
@@ -402,8 +403,10 @@ def fetch_quote_snapshot(product, source="local", date="latest"):
     require_live_product(product)
     if source == "akshare":
         return _fetch_akshare_sse_snapshot(product)
+    if source == "snapshot":
+        return load_latest_quote_snapshot(product, date=date)
     if source != "local":
-        raise ValueError("source must be 'local' or 'akshare'.")
+        raise ValueError("source must be 'local', 'snapshot', or 'akshare'.")
 
     config = load_product_config(product)
     etf_dir = project_path(config.data.etf_dir)
@@ -437,6 +440,76 @@ def fetch_quote_snapshot(product, source="local", date="latest"):
     return metadata
 
 
+def load_latest_quote_snapshot(product, date="latest"):
+    """Return the newest complete saved AKShare snapshot without network I/O."""
+    require_live_product(product)
+    quote_root = storage.PROJECT_ROOT / "data" / "live" / product / "quotes"
+    if date in {None, "", "latest"}:
+        day_dirs = sorted(
+            (path for path in quote_root.glob("20??????") if path.is_dir()),
+            reverse=True,
+        )
+        expected_date = None
+    else:
+        expected_date = pd.Timestamp(date).strftime("%Y-%m-%d")
+        day_dirs = [quote_root / pd.Timestamp(date).strftime("%Y%m%d")]
+
+    for day_dir in day_dirs:
+        for metadata_path in sorted(day_dir.glob("*_metadata.json"), reverse=True):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                continue
+            if metadata.get("source") != "akshare":
+                continue
+            quote_date = str(metadata.get("quote_date") or "")
+            if expected_date is not None and quote_date != expected_date:
+                continue
+            time_part = metadata_path.name.removesuffix("_metadata.json")
+            etf_path = day_dir / f"{time_part}_etf.parquet"
+            option_path = day_dir / f"{time_part}_option_chain.parquet"
+            if not etf_path.exists() or not option_path.exists():
+                continue
+            result = dict(metadata)
+            result["source"] = "snapshot"
+            result["snapshot_source"] = "akshare"
+            result["metadata_path"] = str(metadata_path)
+            result["etf_snapshot"] = str(etf_path)
+            result["option_snapshot"] = str(option_path)
+            return result
+
+    date_text = "latest" if expected_date is None else expected_date
+    raise FileNotFoundError(
+        f"No complete saved AKShare quote snapshot for {product} {date_text}. "
+        "Fetch and save an AKShare snapshot first."
+    )
+
+
+def load_previous_quote_snapshot(product, before_date):
+    """Return the newest complete AKShare snapshot before a valuation date."""
+    require_live_product(product)
+    cutoff = pd.Timestamp(before_date).normalize()
+    quote_root = storage.PROJECT_ROOT / "data" / "live" / product / "quotes"
+    day_dirs = sorted(
+        (
+            path
+            for path in quote_root.glob("20??????")
+            if path.is_dir()
+            and pd.Timestamp(path.name).normalize() < cutoff
+        ),
+        reverse=True,
+    )
+    for day_dir in day_dirs:
+        try:
+            return load_latest_quote_snapshot(product, date=day_dir.name)
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError(
+        f"No complete saved AKShare quote snapshot for {product} before "
+        f"{cutoff.date()}."
+    )
+
+
 def _fetch_akshare_sse_snapshot(product):
     require_live_product(product)
 
@@ -448,7 +521,7 @@ def _fetch_akshare_sse_snapshot(product):
     config = load_product_config(product)
     spec = SSE_ETF_OPTION_SPECS[product]
     etf_df, quote_date = _fetch_latest_etf_bar(ak, spec.etf_symbol)
-    trading_calendar = _load_local_trading_calendar()
+    trading_calendar = _refresh_akshare_trading_calendar(ak)
     chain_df = _fetch_sse_option_chain(ak, spec, trading_calendar, quote_date)
     chain_df = attach_live_underlying_id(product, chain_df)
     chain_df = chain_df.sort_values(
@@ -736,6 +809,36 @@ def _load_local_trading_calendar():
         return core.data_loader.load_etf_trading_calendar()
     except Exception:
         return pd.DatetimeIndex([])
+
+
+def load_live_trading_calendar():
+    """Load canonical and cached AKShare trading dates without network I/O."""
+    local = _load_local_trading_calendar()
+    path = storage.live_trading_calendar_path()
+    if not path.exists():
+        return local
+    try:
+        cached = pd.read_csv(path, encoding="utf-8-sig")
+        dates = pd.to_datetime(cached["trade_date"], errors="coerce").dropna()
+    except (OSError, KeyError, ValueError):
+        return local
+    return pd.DatetimeIndex(sorted(set(local) | set(dates))).normalize()
+
+
+def _refresh_akshare_trading_calendar(ak):
+    try:
+        frame = _ak_call(ak.tool_trade_date_hist_sina)
+        date_column = "trade_date" if "trade_date" in frame.columns else frame.columns[0]
+        dates = pd.to_datetime(frame[date_column], errors="coerce").dropna()
+        calendar = pd.DatetimeIndex(dates).normalize().drop_duplicates().sort_values()
+        pd.DataFrame({"trade_date": calendar}).to_csv(
+            storage.live_trading_calendar_path(),
+            index=False,
+            encoding="utf-8-sig",
+        )
+        return calendar
+    except Exception:
+        return load_live_trading_calendar()
 
 
 def _fourth_wednesday(year, month):

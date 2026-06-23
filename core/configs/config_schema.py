@@ -55,7 +55,7 @@ class StrategyConfig:
     short_low_iv_hv_col: str = "yz_hv60"
     short_low_iv_overlay_enabled: bool = False
     short_stop_loss_enabled: bool = False
-    short_stop_loss_rate: float = 0.2
+    short_daily_loss_aum_threshold: float = -0.015
     enable_delta_hedge: bool = False
     delta_hedge_tolerance_ratio: float = 0.05
     allow_etf_short_hedge: bool = True
