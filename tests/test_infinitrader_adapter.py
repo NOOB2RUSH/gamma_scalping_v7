@@ -48,11 +48,10 @@ def test_compile_combination_option_hedge_signal_orders():
         )
         for order in orders
     ] == [
-        ("510300", "sell", None, 21800),
         ("10011704", "buy", "1", 4),
         ("10011699", "sell", "0", 3),
         ("10011700", "sell", "0", 1),
-        ("510300", "buy", None, 5400),
+        ("510300", "sell", None, 16400),
     ]
     assert all(order["exchange"] == "SSE" for order in orders)
 
@@ -132,16 +131,15 @@ def test_build_fills_from_combination_command():
     fills = infinitrader.build_fills_from_command(command)
 
     assert [fill["action"] for fill in fills] == [
-        "delta_hedge",
         "rebalance_straddle_legs",
         "open_option_hedge",
         "open_option_hedge",
         "delta_hedge",
     ]
-    assert fills[1]["call_qty"] == 6
-    assert fills[2]["order_book_id"] == "10011699"
-    assert fills[4]["trade_etf_qty"] == 5400
-    assert fills[4]["target_hedge_qty"] == 5400
+    assert fills[0]["call_qty"] == 6
+    assert fills[1]["order_book_id"] == "10011699"
+    assert fills[3]["trade_etf_qty"] == -16400
+    assert fills[3]["target_hedge_qty"] == 5400
 
 
 def test_compile_roll_short_straddle_orders_close_then_open():

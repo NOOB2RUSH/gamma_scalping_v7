@@ -2890,11 +2890,15 @@ def _override_greeks_pnl_with_segmented_intraday(summary_history, position_histo
                 parts["option_greeks_pnl"] + hedge_greeks
             )
             result.at[current_index, "GreeksPnL口径"] = "intraday_segmented"
-            result.at[current_index, "GreeksPnL说明"] = (
+            note = (
                 "option_greeks_integrated_by_trade_nodes;"
                 f"nodes={parts['nodes']};trades={parts['trade_count']};"
                 f"codes={parts['code_count']}"
             )
+            excluded_new_trades = int(parts.get("excluded_new_trade_count", 0) or 0)
+            if excluded_new_trades > 0:
+                note += f";same_day_new_position_trades_excluded={excluded_new_trades}"
+            result.at[current_index, "GreeksPnL说明"] = note
             result.at[current_index, "GreeksPnL路径节点数"] = parts["nodes"]
 
     return result
@@ -2958,6 +2962,7 @@ def _segmented_intraday_option_greeks(
     node_states = []
     node_index = 0
     node_count_hint = len(timestamps) + len(events_by_ts)
+    excluded_new_trade_count = 0
     for raw_index, timestamp in enumerate(timestamps):
         if node_index == 0:
             spot = float(start_spot)
@@ -3009,7 +3014,15 @@ def _segmented_intraday_option_greeks(
             code = _security_code(trade.get("合约代码"))
             if code is None:
                 continue
-            qty_by_code[code] = qty_by_code.get(code, 0.0) + _signed_trade_quantity(trade)
+            signed_trade_qty = _signed_trade_quantity(trade)
+            applied_qty = _previous_position_trade_quantity(
+                qty_by_code.get(code, 0.0),
+                signed_trade_qty,
+            )
+            if abs(applied_qty) > 1e-9:
+                qty_by_code[code] = qty_by_code.get(code, 0.0) + applied_qty
+            if abs(applied_qty - signed_trade_qty) > 1e-9:
+                excluded_new_trade_count += 1
         if events:
             post_state = _segmented_node_greeks(
                 product,
@@ -3026,7 +3039,14 @@ def _segmented_intraday_option_greeks(
             node_states.append(post_state)
             node_index += 1
 
-    return _integrate_segmented_node_greeks(node_states, len(option_trades), len(codes))
+    parts = _integrate_segmented_node_greeks(
+        node_states,
+        len(option_trades),
+        len([qty for qty in start_qty.values() if abs(qty) > 1e-9]),
+    )
+    if parts is not None:
+        parts["excluded_new_trade_count"] = excluded_new_trade_count
+    return parts
 
 
 def _option_position_rows_by_code(previous_positions, current_positions):
@@ -3062,6 +3082,17 @@ def _signed_trade_quantity(trade):
         return 0.0
     direction = str(trade.get("买卖") or "")
     return -qty if "卖" in direction else qty
+
+
+def _previous_position_trade_quantity(current_qty, signed_trade_qty):
+    current_qty = float(current_qty or 0.0)
+    signed_trade_qty = float(signed_trade_qty or 0.0)
+    if abs(current_qty) <= 1e-9 or abs(signed_trade_qty) <= 1e-9:
+        return 0.0
+    if current_qty * signed_trade_qty >= 0:
+        return 0.0
+    magnitude = min(abs(current_qty), abs(signed_trade_qty))
+    return math.copysign(magnitude, signed_trade_qty)
 
 
 def _option_price_at_node(product, report_date, code, timestamp, events):
@@ -3623,17 +3654,23 @@ def _add_summary_greeks_pnl_for_account(group, product=None, position_history=No
     option_actual_pnl = option_actual_pnl.combine_first(
         _legacy_total_daily_pnl_series(group, "期权总盈亏", "期权浮盈亏")
     )
-    etf_actual_pnl = _actual_daily_pnl_series_from_positions(
+    raw_etf_actual_pnl = _actual_daily_pnl_series_from_positions(
         group,
         position_history,
         product,
         side="hedge",
     )
-    etf_actual_pnl = etf_actual_pnl.combine_first(
+    raw_etf_actual_pnl = raw_etf_actual_pnl.combine_first(
         _legacy_total_daily_pnl_series(group, "对冲总盈亏", "对冲浮盈亏")
     )
     hedge_mark = _numeric_series(group, "对冲最新价")
     hedge_qty = _numeric_series(group, "对冲持仓").fillna(0.0)
+    etf_actual_pnl = _previous_close_hedge_pnl_series(
+        raw_etf_actual_pnl,
+        spot,
+        hedge_mark,
+        hedge_qty,
+    )
     call_iv = _numeric_series(group, "Call IV")
     put_iv = _numeric_series(group, "Put IV")
     call_delta = _numeric_series(group, "Call Delta")
@@ -3658,9 +3695,8 @@ def _add_summary_greeks_pnl_for_account(group, product=None, position_history=No
         call_delta.shift(1)
         + put_delta.shift(1)
     ) * spot_chg
-    hedge_delta_pnl = _segmented_hedge_delta_pnl_series(
-        product,
-        group,
+    hedge_delta_pnl = _previous_close_hedge_pnl_series(
+        raw_etf_actual_pnl,
         spot,
         hedge_mark,
         hedge_qty,
@@ -3791,6 +3827,17 @@ def _integrate_intraday_option_greeks(path):
 def _segmented_hedge_delta_pnl_series(product, group, spot, hedge_mark, hedge_qty):
     price = hedge_mark.where(hedge_mark.notna(), spot)
     return (hedge_qty.shift(1).fillna(0.0) * price.diff()).fillna(0.0)
+
+
+def _previous_close_hedge_pnl_series(raw_daily_pnl, spot, hedge_mark, hedge_qty):
+    price = hedge_mark.where(hedge_mark.notna(), spot)
+    result = (hedge_qty.shift(1).fillna(0.0) * price.diff()).fillna(0.0)
+    if result.empty:
+        return result
+    first_raw = raw_daily_pnl.iloc[0] if len(raw_daily_pnl) else np.nan
+    if pd.notna(first_raw):
+        result.iloc[0] = first_raw
+    return result
 
 
 def _segmented_hedge_delta_pnl(previous_qty, start_price, end_price, trade_rows):

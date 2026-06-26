@@ -9,6 +9,7 @@ import pandas as pd
 
 from .. import strategy as core_strategy
 from . import account as account_store
+from . import etf_netting
 from . import storage
 from .runtime import load_product_config
 
@@ -47,10 +48,13 @@ class InfiniOrder:
 
 def compile_signal_orders(signal_payload: dict[str, Any]) -> list[dict[str, Any]]:
     orders: list[InfiniOrder] = []
-    for item in signal_payload.get("advice", []) or []:
+    advice = signal_payload.get("advice", []) or []
+    for item in advice:
         if item.get("priority") != "action":
             continue
-        orders.extend(_compile_advice_item(item, len(orders) + 1))
+        orders.extend(_compile_advice_item(item, len(orders) + 1, include_etf=False))
+    for item in etf_netting.netted_etf_advice_items(advice):
+        orders.extend(_compile_advice_item(item, len(orders) + 1, include_etf=True))
     return [order.to_dict() for order in orders if order.volume > 0]
 
 
@@ -129,7 +133,8 @@ def build_fills_from_command(command: dict[str, Any]) -> list[dict[str, Any]]:
     date = command.get("date") or signal.get("date")
     source_file = command.get("command_path")
     fills: list[dict[str, Any]] = []
-    for item in signal.get("advice", []) or []:
+    advice = signal.get("advice", []) or []
+    for item in advice:
         if item.get("priority") != "action":
             continue
         fills.extend(
@@ -140,12 +145,29 @@ def build_fills_from_command(command: dict[str, Any]) -> list[dict[str, Any]]:
                 source_file,
                 float(config.vol.contract_multiplier),
                 float(config.backtest.option_fee_per_contract),
+                include_etf=False,
+            )
+        )
+    for item in etf_netting.netted_etf_advice_items(advice):
+        fills.extend(
+            _fills_from_advice(
+                item,
+                signal,
+                date,
+                source_file,
+                float(config.vol.contract_multiplier),
+                float(config.backtest.option_fee_per_contract),
+                include_etf=True,
             )
         )
     return fills
 
 
-def _compile_advice_item(item: dict[str, Any], start_sequence: int) -> list[InfiniOrder]:
+def _compile_advice_item(
+    item: dict[str, Any],
+    start_sequence: int,
+    include_etf: bool = True,
+) -> list[InfiniOrder]:
     action = str(item.get("action") or "")
     side = str(item.get("side") or "").lower()
 
@@ -247,7 +269,13 @@ def _compile_advice_item(item: dict[str, Any], start_sequence: int) -> list[Infi
         )
         return close_orders + open_orders
 
-    if action in {"DELTA_HEDGE", "FINAL_DELTA_HEDGE"}:
+    if action in {
+        "DELTA_HEDGE",
+        "FINAL_DELTA_HEDGE",
+        etf_netting.NETTED_ETF_HEDGE_ACTION,
+    }:
+        if not include_etf:
+            return []
         return [_etf_order(start_sequence, action, item)]
 
     if action in {"OPTION_DELTA_HEDGE_SHORT_CALL", "FINAL_OPTION_DELTA_HEDGE_SHORT_CALL"}:
@@ -270,7 +298,12 @@ def _compile_advice_item(item: dict[str, Any], start_sequence: int) -> list[Infi
         "GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
         "FINAL_GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
     }:
-        return _combination_option_hedge_orders(item, start_sequence, action)
+        return _combination_option_hedge_orders(
+            item,
+            start_sequence,
+            action,
+            include_etf=include_etf,
+        )
 
     return []
 
@@ -282,10 +315,17 @@ def _fills_from_advice(
     source_file,
     multiplier: float,
     option_fee_per_contract: float,
+    include_etf: bool = True,
 ) -> list[dict[str, Any]]:
     action = str(item.get("action") or "")
     side = str(item.get("side") or "").lower()
-    if action in {"DELTA_HEDGE", "FINAL_DELTA_HEDGE"}:
+    if action in {
+        "DELTA_HEDGE",
+        "FINAL_DELTA_HEDGE",
+        etf_netting.NETTED_ETF_HEDGE_ACTION,
+    }:
+        if not include_etf:
+            return []
         return [_delta_hedge_fill(item, date, source_file)]
 
     if action in {"OPTION_DELTA_HEDGE_SHORT_CALL", "FINAL_OPTION_DELTA_HEDGE_SHORT_CALL"}:
@@ -376,7 +416,7 @@ def _fills_from_advice(
                 option_fee_per_contract,
             )
         )
-        if abs(float(item.get("trade_etf_qty", 0.0) or 0.0)) > 0:
+        if include_etf and abs(float(item.get("trade_etf_qty", 0.0) or 0.0)) > 0:
             fills.append(_delta_hedge_fill(item, date, source_file))
         return fills
 
@@ -558,6 +598,7 @@ def _combination_option_hedge_orders(
     item: dict[str, Any],
     start_sequence: int,
     action: str,
+    include_etf: bool = True,
 ) -> list[InfiniOrder]:
     orders: list[InfiniOrder] = []
     close_qty = _int_qty(item.get("close_call_qty"))
@@ -596,7 +637,7 @@ def _combination_option_hedge_orders(
         )
 
     trade_etf_qty = _etf_board_lot_qty(item.get("trade_etf_qty", 0.0))
-    if abs(trade_etf_qty) > 0:
+    if include_etf and abs(trade_etf_qty) > 0:
         orders.append(_etf_order(start_sequence + len(orders), action, item))
     return orders
 

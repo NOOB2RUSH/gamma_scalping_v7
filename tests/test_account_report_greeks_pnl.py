@@ -358,6 +358,121 @@ class AccountReportGreeksPnlTest(unittest.TestCase):
         self.assertEqual(row["单日ThetaPnL"], 4.0)
         self.assertEqual(row["单日GreeksPnL"], 144.0)
 
+    def test_previous_position_trade_quantity_excludes_same_day_open(self):
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(0.0, -6.0),
+            0.0,
+        )
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(-5.0, -2.0),
+            0.0,
+        )
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(-5.0, 3.0),
+            3.0,
+        )
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(-5.0, 8.0),
+            5.0,
+        )
+
+    def test_segmented_intraday_greeks_excludes_same_day_open_position(self):
+        date = "日期"
+        account = "账户ID"
+        code = "合约代码"
+        name = "合约名称"
+        direction = "方向"
+        qty = "总持仓"
+        latest_price = "最新价"
+        strike = "行权价"
+        expiry = "到期日"
+        dte = "剩余天数"
+        spot = "标的价格"
+        open_close = "开平"
+        buy_sell = "买卖"
+        trade_price = "成交价格"
+        trade_qty = "成交数量"
+        trade_time = "成交时间"
+        trade_type = "类型"
+
+        previous_positions = pd.DataFrame()
+        current_positions = pd.DataFrame(
+            [
+                {
+                    date: "2026-06-26",
+                    account: "default",
+                    direction: "short",
+                    code: "10000001",
+                    name: "test call",
+                    qty: 6,
+                    latest_price: 0.9,
+                    strike: 100.0,
+                    expiry: "2026-07-22",
+                    dte: 18,
+                    "IV": 0.20,
+                }
+            ]
+        )
+        trade_rows = [
+            {
+                code: "10000001",
+                open_close: "开仓",
+                buy_sell: "卖",
+                trade_price: 1.0,
+                trade_qty: 6,
+                trade_time: "14:50:00",
+                trade_type: "期权",
+            }
+        ]
+
+        with mock.patch.object(
+            account_report,
+            "_spot_from_intraday_minute",
+            return_value=101.0,
+        ):
+            parts = account_report._segmented_intraday_option_greeks(
+                "300etf",
+                "2026-06-25",
+                "2026-06-26",
+                pd.Series({spot: 100.0}),
+                pd.Series({spot: 102.0}),
+                previous_positions,
+                current_positions,
+                trade_rows,
+            )
+
+        self.assertEqual(parts["option_greeks_pnl"], 0.0)
+        self.assertEqual(parts["excluded_new_trade_count"], 1)
+
+    def test_hedge_daily_pnl_excludes_same_day_open_quantity(self):
+        history = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-25",
+                    "账户ID": "default",
+                    "标的价格": 10.0,
+                    "对冲持仓": 100.0,
+                    "对冲最新价": 10.0,
+                    "ETF单日盈亏": 50.0,
+                },
+                {
+                    "日期": "2026-06-26",
+                    "账户ID": "default",
+                    "标的价格": 11.0,
+                    "对冲持仓": 180.0,
+                    "对冲最新价": 11.0,
+                    "ETF单日盈亏": 900.0,
+                },
+            ]
+        )
+
+        result = account_report._add_summary_greeks_pnl_for_account(history)
+        row = result.iloc[-1]
+
+        self.assertEqual(row["ETF单日盈亏"], 100.0)
+        self.assertEqual(row["对冲单日GreeksPnL"], 100.0)
+        self.assertEqual(row["总单日盈亏"], 100.0)
+
 
 if __name__ == "__main__":
     unittest.main()
