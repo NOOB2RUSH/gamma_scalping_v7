@@ -2160,7 +2160,10 @@ def _option_delta_hedge_combination_item(
         close_price,
         float(source["row"].get("contract_multiplier", config.vol.contract_multiplier)),
     ) * int(close_qty)
-    etf_correction_cost = float(best["etf_buy_qty"]) * float(spot) * (
+    etf_buy_qty = core.strategy.round_etf_hedge_target(best["etf_buy_qty"])
+    combined_delta = float(best["projected_delta"]) + float(etf_buy_qty)
+    executable_delta_tolerance = core.strategy.ETF_HEDGE_LOT_SIZE / 2.0
+    etf_correction_cost = float(etf_buy_qty) * float(spot) * (
         1.0 + float(config.backtest.etf_fee_rate)
     )
     estimated_cash_effect = (
@@ -2240,12 +2243,12 @@ def _option_delta_hedge_combination_item(
         "estimated_gamma_effect": best["gamma_effect"],
         "residual_delta_before_option_hedge": residual_delta,
         "projected_account_delta_after_option_hedge": best["projected_delta"],
-        "etf_delta_correction": best["etf_buy_qty"],
-        "projected_account_delta_after_combined_hedge": best["combined_delta"],
+        "etf_delta_correction": etf_buy_qty,
+        "projected_account_delta_after_combined_hedge": combined_delta,
         "option_delta": option_delta,
         "current_hedge_qty": current_hedge_qty,
-        "target_hedge_qty": current_hedge_qty + best["etf_buy_qty"],
-        "trade_etf_qty": best["etf_buy_qty"],
+        "target_hedge_qty": current_hedge_qty + etf_buy_qty,
+        "trade_etf_qty": etf_buy_qty,
         "estimated_price": float(spot),
         "estimated_fee": fee,
         "estimated_option_margin": margin,
@@ -2260,7 +2263,8 @@ def _option_delta_hedge_combination_item(
         ),
         "close_liquidity_capacity": best["close_liquidity_capacity"],
         "solver_priority": "liquidity_then_delta_then_gamma",
-        "delta_neutral_achieved": best["delta_neutral_achieved"],
+        "delta_neutral_achieved": abs(combined_delta) <= executable_delta_tolerance,
+        "executable_delta_tolerance": executable_delta_tolerance,
         "liquidity_capacity_exhausted": best["liquidity_capacity_exhausted"],
         "underlying_order_book_id": underlying_order_book_id,
     }

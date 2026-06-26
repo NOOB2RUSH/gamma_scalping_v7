@@ -55,7 +55,6 @@ CONFIG = AppConfig(
         short_volume_spike_multiplier=1.5,
         short_cooldown_after_long_iv_high_exit_days=3,
         roll_dte_threshold=7,
-        roll_strike_mismatch_days=2,
         roll_cooldown_days=4,
     ),
     vol=VolConfig(

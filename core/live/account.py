@@ -514,7 +514,12 @@ def _apply_fill(account, product, fill):
     elif action in {"roll_straddle", "roll_short_straddle", "roll_long_straddle"}:
         side = side or ("short" if "short" in action else "long")
         account.positions[side] = _position_from_fill(fill, side)
-        _reset_strategy_side(account.strategy_state, side)
+        _start_strategy_cooldown(
+            account.strategy_state,
+            side,
+            _roll_cooldown_days(product),
+            fill.get("date"),
+        )
         account.cash += cash_delta
     elif action in {"close_straddle", "close_short_straddle", "close_long_straddle"}:
         side = side or ("short" if "short" in action else "long")
@@ -1085,14 +1090,6 @@ def _default_initial_cash(product):
     import core
 
     return core.config.load_config(product).backtest.initial_cash
-
-
-def _insert_fill(product, fill, db_path=None, account_id="default"):
-    db_path = db_path or storage.account_db_path(product)
-    fill = normalize_fill(fill)
-    with connect(db_path) as conn:
-        _insert_fill_to_conn(conn, fill, account_id, storage.utc_now_text())
-        conn.commit()
 
 
 def _insert_fill_to_conn(conn, fill, account_id, now):

@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import pandas as pd
+
 from core import strategy
 from core.live import account, signal_engine
 
@@ -115,6 +117,91 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
 
         self.assertEqual(plan[0]["target_hedge_qty"], 259300)
         self.assertEqual(plan[0]["trade_etf_qty"], 206200)
+
+    def test_option_combination_etf_correction_uses_board_lot(self):
+        config = _config()
+        live_account = account.AccountState(
+            product="300etf",
+            cash=10_000_000,
+            positions={
+                "long": None,
+                "short": {
+                    **_short_straddle(qty=10),
+                    "call_code": "SOURCE",
+                },
+            },
+            hedge=account.HedgeState(qty=0),
+        )
+        expiry = pd.Timestamp("2026-07-22")
+        chain = pd.DataFrame(
+            [
+                {
+                    "order_book_id": "SOURCE",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 4.9,
+                    "mid": 0.10,
+                    "delta": 0.60,
+                    "gamma": 0.08,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "OPEN",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 4.8,
+                    "mid": 0.12,
+                    "delta": 0.70,
+                    "gamma": 0.06,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+            ]
+        )
+        solution = {
+            "open_legs": [
+                {
+                    "row": chain.iloc[1],
+                    "qty": 1,
+                    "liquidity_capacity": 100,
+                }
+            ],
+            "open_qty": 1,
+            "close_qty": 1,
+            "delta_effect": -10000.0,
+            "gamma_effect": -100.0,
+            "projected_delta": -730.9459505262275,
+            "etf_buy_qty": 731.0,
+            "combined_delta": 0.05404947377251071,
+            "delta_neutral_achieved": True,
+            "liquidity_capacity_exhausted": False,
+            "close_liquidity_capacity": 9,
+            "score": (0.05404947377251071, 100.0, 2),
+        }
+
+        with mock.patch.object(
+            signal_engine.core.position,
+            "solve_liquid_call_delta_hedge",
+            return_value=solution,
+        ):
+            item = signal_engine._option_delta_hedge_combination_item(
+                config,
+                live_account,
+                chain,
+                residual_delta=9272.685032822234,
+                spot=5.0,
+                underlying_order_book_id="510300.XSHG",
+            )
+
+        self.assertEqual(item["trade_etf_qty"], 700.0)
+        self.assertEqual(item["etf_delta_correction"], 700.0)
+        self.assertEqual(item["target_hedge_qty"], 700.0)
+        self.assertEqual(item["trade_etf_qty"] % strategy.ETF_HEDGE_LOT_SIZE, 0.0)
+        self.assertAlmostEqual(
+            item["projected_account_delta_after_combined_hedge"],
+            -30.94595052622749,
+        )
 
     def test_live_plan_reduces_short_before_neutral_hedge_breaches_occupation_limit(self):
         config = _config()

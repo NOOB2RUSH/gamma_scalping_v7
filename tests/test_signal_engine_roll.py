@@ -62,7 +62,6 @@ class SignalEngineRollTest(unittest.TestCase):
         config = SimpleNamespace(
             strategy=SimpleNamespace(
                 roll_dte_threshold=7,
-                roll_strike_mismatch_days=2,
             ),
             backtest=SimpleNamespace(short_qty=80, long_qty=10),
         )

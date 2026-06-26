@@ -41,6 +41,21 @@ def _short_position(qty=80):
     }
 
 
+def _long_position(qty=10):
+    return {
+        "side": "long",
+        "call_code": "CALL",
+        "put_code": "PUT",
+        "strike": 2.45,
+        "expiry": pd.Timestamp("2024-04-24"),
+        "call_qty": qty,
+        "put_qty": qty,
+        "contract_multiplier": 10000,
+        "option_margin": 0.0,
+        "last_option_value": 7200.0,
+    }
+
+
 class BacktesterLiveParityTest(unittest.TestCase):
     def test_day_aggregates_clear_stale_eod_marks_after_position_close(self):
         engine = _engine()
@@ -227,6 +242,33 @@ class BacktesterLiveParityTest(unittest.TestCase):
         self.assertEqual(
             captured["day"]["data_warnings"][0]["reason"],
             "missing_option_chain",
+        )
+
+    def test_expired_missing_position_contracts_settle_at_intrinsic_value(self):
+        engine = _engine()
+        state = backtester.BacktestState(
+            cash=1_000_000.0,
+            positions={"long": _long_position(), "short": None},
+        )
+        day = engine._new_day(
+            pd.Timestamp("2024-04-24"),
+            2.46,
+            {},
+            pd.DataFrame({"order_book_id": ["OTHER"]}),
+        )
+
+        engine._mark_current_positions_for_capacity(day, state)
+
+        self.assertIsNone(state.positions["long"])
+        self.assertFalse(day["defer_delta_hedge"])
+        close_trade = next(
+            trade for trade in state.trades if trade.get("type") == "close_straddle"
+        )
+        self.assertEqual(close_trade["exit_reason"], "expired_missing_option_data_intrinsic")
+        self.assertAlmostEqual(state.cash, 1_000_960.0)
+        self.assertEqual(
+            day["data_warnings"][-1]["reason"],
+            "expired_missing_position_contracts_settled_intrinsic",
         )
 
     def test_capacity_reduction_only_reduces_short_once(self):

@@ -125,7 +125,7 @@ Then run smoke tests against the live scripts:
 
 ```bash
 python scripts/live/fetch_quotes.py --product <product> --source akshare
-python scripts/live/generate_signal.py --product <product> --source akshare
+python scripts/live/generate_signal.py --product <product>
 python scripts/live/import_holdings.py --product <product> --include-existing --dry-run
 python scripts/live/import_etf.py --product <product> --dry-run
 python scripts/live/live_account_report.py --product <product> --source akshare --no-write --no-history
@@ -171,4 +171,3 @@ Before enabling a new live product for real operation, save sample broker export
 | ETF import matching | `core/live/etf_importer.py` | uses `SSE_ETF_OPTION_SPECS` |
 | Console product universe | `scripts/live/live_console.py` | uses `core.config.available_live_products()` |
 | Portfolio product universe | `core/live/portfolio_report.py` | uses `core.config.available_live_products()` |
-

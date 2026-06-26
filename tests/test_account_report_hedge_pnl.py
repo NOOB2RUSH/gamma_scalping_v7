@@ -4,6 +4,7 @@ from unittest import mock
 
 import pandas as pd
 
+import core.hedge
 from core.live import account_report
 
 
@@ -91,12 +92,10 @@ class AccountReportHedgePnlTest(unittest.TestCase):
         self.assertAlmostEqual(pnl, -300.0)
 
     def test_hedge_unrealized_pnl_uses_system_cost_not_broker_export(self):
-        pnl = account_report._hedge_unrealized_pnl_for_report(
-            "kc50etf",
-            qty=160_000,
-            entry_price=1.8205,
-            spot=1.823,
-            report_date="2026-06-03",
+        pnl = core.hedge.calc_unrealized_pnl(
+            160_000,
+            1.8205,
+            1.823,
         )
 
         self.assertAlmostEqual(pnl, 400.0)

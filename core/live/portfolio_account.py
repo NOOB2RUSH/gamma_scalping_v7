@@ -22,19 +22,7 @@ def product_initial_cash(product):
 
 
 def shared_nav_from_subaccounts(payloads):
-    nav = PORTFOLIO_INITIAL_CASH
-    for product, payload in payloads.items():
-        summary = payload.get("summary") or {}
-        subaccount_nav = _number(summary.get("估算权益"))
-        initial_cash = _number(summary.get("初始资金"))
-        if subaccount_nav is None:
-            continue
-        nav += subaccount_nav - (
-            initial_cash
-            if initial_cash is not None
-            else product_initial_cash(product)
-        )
-    return nav
+    return None
 
 
 def _number(value):

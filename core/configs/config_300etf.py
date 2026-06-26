@@ -46,6 +46,7 @@ CONFIG = AppConfig(
         short_stop_loss_enabled=True,
         short_daily_loss_aum_threshold=-0.015,
         enable_delta_hedge=True,
+        delta_hedge_tolerance_ratio=0.0,
         allow_etf_short_hedge=False,
         enable_option_delta_hedge=True,
         option_delta_hedge_combination_enabled=True,
@@ -55,7 +56,6 @@ CONFIG = AppConfig(
         short_volume_spike_multiplier=1.5,
         short_cooldown_after_long_iv_high_exit_days=6,
         roll_dte_threshold=7,
-        roll_strike_mismatch_days=2,
         roll_cooldown_days=3,
     ),
     vol=VolConfig(

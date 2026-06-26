@@ -91,6 +91,82 @@ class AccountReportPnlClassificationTest(unittest.TestCase):
         self.assertEqual(result["mark_to_market_trade_pnl"], 0.0)
         self.assertAlmostEqual(result["daily_pnl_decomposition"], expected)
 
+    def test_close_snapshot_option_daily_pnl_uses_closes_and_carry_positions(self):
+        code_col = "\u5408\u7ea6\u4ee3\u7801"
+        qty_col = "\u603b\u6301\u4ed3"
+        side_col = "\u65b9\u5411"
+        last_col = "\u6700\u65b0\u4ef7"
+        name_col = "\u5408\u7ea6\u540d\u79f0"
+        previous = pd.DataFrame(
+            [
+                {
+                    code_col: "100001",
+                    name_col: "50ETF\u8d2d7\u67082800",
+                    side_col: "short",
+                    qty_col: 4,
+                    last_col: 0.22925,
+                },
+                {
+                    code_col: "100002",
+                    name_col: "50ETF\u6cbd7\u67083100",
+                    side_col: "short",
+                    qty_col: 10,
+                    last_col: 0.11295,
+                },
+            ]
+        )
+        current = pd.DataFrame(
+            [
+                {
+                    code_col: "100001",
+                    name_col: "50ETF\u8d2d7\u67082800",
+                    side_col: "short",
+                    qty_col: 2,
+                    last_col: 0.25875,
+                },
+                {
+                    code_col: "100002",
+                    name_col: "50ETF\u6cbd7\u67083100",
+                    side_col: "short",
+                    qty_col: 10,
+                    last_col: 0.09030,
+                },
+            ]
+        )
+        trades = [
+            {
+                code_col: "100001",
+                "\u4e70\u5356": "\u4e70",
+                "\u5f00\u5e73": "\u5e73\u4ed3",
+                "\u6210\u4ea4\u4ef7\u683c": 0.25990,
+                "\u6210\u4ea4\u6570\u91cf": 4,
+                "\u5e73\u4ed3\u76c8\u4e8f": -1180.0,
+                "\u6210\u4ea4\u65f6\u95f4": "14:51:55",
+                "\u7c7b\u578b": "\u671f\u6743",
+            },
+            {
+                code_col: "100001",
+                "\u4e70\u5356": "\u5356",
+                "\u5f00\u5e73": "\u5f00\u4ed3",
+                "\u6210\u4ea4\u4ef7\u683c": 0.25680,
+                "\u6210\u4ea4\u6570\u91cf": 2,
+                "\u6210\u4ea4\u65f6\u95f4": "14:52:28",
+                "\u7c7b\u578b": "\u671f\u6743",
+            },
+        ]
+
+        result = account_report._close_snapshot_option_daily_pnl(
+            "50etf",
+            "2026-06-25",
+            previous,
+            current,
+            trades,
+        )
+
+        expected = -1180.0
+        expected += -10 * (0.09030 - 0.11295) * 10000
+        self.assertAlmostEqual(result, expected)
+
     def test_first_history_day_uses_cumulative_pnl_since_reset(self):
         history = pd.DataFrame(
             [
@@ -163,6 +239,61 @@ class AccountReportPnlClassificationTest(unittest.TestCase):
                 )
 
         self.assertAlmostEqual(realized, -53120.0)
+
+    def test_option_realized_pnl_is_replayed_for_rebalance_leg_close(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            db_path = Path(temp_dir) / "account.sqlite"
+            with mock.patch.object(account.storage, "account_db_path", return_value=db_path):
+                account.record_fill(
+                    "300etf",
+                    {
+                        "action": "open_short_straddle",
+                        "side": "short",
+                        "date": "2026-06-22",
+                        "call_code": "10011704",
+                        "put_code": "10011713",
+                        "strike": 5.0,
+                        "expiry": "2026-07-22",
+                        "call_qty": 10,
+                        "put_qty": 10,
+                        "entry_call_price": 0.1625,
+                        "entry_put_price": 0.0839,
+                        "contract_multiplier": 10000,
+                    },
+                )
+                account.record_fill(
+                    "300etf",
+                    {
+                        "action": "rebalance_straddle_legs",
+                        "side": "short",
+                        "date": "2026-06-23",
+                        "call_code": "10011704",
+                        "put_code": "10011713",
+                        "strike": 5.0,
+                        "expiry": "2026-07-22",
+                        "call_qty": 6,
+                        "put_qty": 10,
+                        "entry_call_price": 0.1622,
+                        "entry_put_price": 0.0836,
+                        "contract_multiplier": 10000,
+                        "leg_adjustments": [
+                            {
+                                "leg": "call",
+                                "qty_change": -4,
+                                "price": 0.0843,
+                                "qty": 4,
+                            }
+                        ],
+                    },
+                )
+
+                realized = account_report._cumulative_option_realized_pnl_for_report(
+                    "300etf",
+                    "default",
+                    "2026-06-23",
+                )
+
+        self.assertAlmostEqual(realized, 3128.0)
 
 
 if __name__ == "__main__":

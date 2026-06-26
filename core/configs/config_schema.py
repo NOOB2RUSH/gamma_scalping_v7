@@ -70,7 +70,6 @@ class StrategyConfig:
 
     # 展期信号：按到期日和 ATM 档位偏离触发。
     roll_dte_threshold: int = 7
-    roll_strike_mismatch_days: int = 2
     roll_cooldown_days: int = 1
 
 

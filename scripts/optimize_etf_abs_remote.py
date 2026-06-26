@@ -30,7 +30,11 @@ PARAM_NAMES = [
     "backtest.long_qty",
     "backtest.short_qty",
     "strategy.short_stop_loss_enabled",
-    "strategy.short_stop_loss_rate",
+    "strategy.short_daily_loss_aum_threshold",
+    "strategy.delta_hedge_tolerance_ratio",
+    "strategy.option_delta_hedge_max_itm_ratio",
+    "strategy.short_volume_spike_multiplier",
+    "strategy.roll_dte_threshold",
     "strategy.short_cooldown_after_long_iv_high_exit_days",
     "strategy.roll_cooldown_days",
 ]
@@ -52,7 +56,11 @@ COARSE_SPACE = {
     "backtest.long_qty": (5, 80, 5),
     "backtest.short_qty": (5, 80, 5),
     "strategy.short_stop_loss_enabled": [False, True],
-    "strategy.short_stop_loss_rate": (0.10, 0.60, 0.025),
+    "strategy.short_daily_loss_aum_threshold": (-0.030, -0.005, 0.001),
+    "strategy.delta_hedge_tolerance_ratio": (0.050, 0.200, 0.010),
+    "strategy.option_delta_hedge_max_itm_ratio": (0.050, 0.200, 0.010),
+    "strategy.short_volume_spike_multiplier": (1.200, 2.500, 0.100),
+    "strategy.roll_dte_threshold": (3, 12, 1),
     "strategy.short_cooldown_after_long_iv_high_exit_days": (0, 12, 1),
     "strategy.roll_cooldown_days": (0, 12, 1),
 }
@@ -66,7 +74,11 @@ FINE_RADII = [
         "strategy.short_open_pullback_iv_threshold": 0.080,
         "backtest.long_qty": 15,
         "backtest.short_qty": 15,
-        "strategy.short_stop_loss_rate": 0.150,
+        "strategy.short_daily_loss_aum_threshold": 0.006,
+        "strategy.delta_hedge_tolerance_ratio": 0.030,
+        "strategy.option_delta_hedge_max_itm_ratio": 0.030,
+        "strategy.short_volume_spike_multiplier": 0.300,
+        "strategy.roll_dte_threshold": 3,
         "strategy.short_cooldown_after_long_iv_high_exit_days": 4,
         "strategy.roll_cooldown_days": 4,
     },
@@ -78,7 +90,11 @@ FINE_RADII = [
         "strategy.short_open_pullback_iv_threshold": 0.040,
         "backtest.long_qty": 10,
         "backtest.short_qty": 10,
-        "strategy.short_stop_loss_rate": 0.075,
+        "strategy.short_daily_loss_aum_threshold": 0.003,
+        "strategy.delta_hedge_tolerance_ratio": 0.020,
+        "strategy.option_delta_hedge_max_itm_ratio": 0.020,
+        "strategy.short_volume_spike_multiplier": 0.200,
+        "strategy.roll_dte_threshold": 2,
         "strategy.short_cooldown_after_long_iv_high_exit_days": 2,
         "strategy.roll_cooldown_days": 2,
     },
@@ -90,7 +106,11 @@ FINE_RADII = [
         "strategy.short_open_pullback_iv_threshold": 0.020,
         "backtest.long_qty": 5,
         "backtest.short_qty": 5,
-        "strategy.short_stop_loss_rate": 0.050,
+        "strategy.short_daily_loss_aum_threshold": 0.001,
+        "strategy.delta_hedge_tolerance_ratio": 0.010,
+        "strategy.option_delta_hedge_max_itm_ratio": 0.010,
+        "strategy.short_volume_spike_multiplier": 0.100,
+        "strategy.roll_dte_threshold": 1,
         "strategy.short_cooldown_after_long_iv_high_exit_days": 1,
         "strategy.roll_cooldown_days": 1,
     },
@@ -136,6 +156,11 @@ def parse_args():
     parser.add_argument("--start", default=None)
     parser.add_argument("--end", default=None)
     parser.add_argument("--coarse-result", default=None)
+    parser.add_argument(
+        "--param-table",
+        default=None,
+        help="CSV containing exact PARAM_NAMES columns to use for the coarse scan.",
+    )
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-warm-cache", action="store_true")
@@ -202,7 +227,7 @@ def is_valid_param_set(param_set):
         return False
     if not param_set["strategy.short_stop_loss_enabled"]:
         return True
-    return param_set["strategy.short_stop_loss_rate"] > 0
+    return param_set["strategy.short_daily_loss_aum_threshold"] < 0
 
 
 def param_identity(param_set):
@@ -247,6 +272,28 @@ def generate_unique(generator, count, seed, max_attempt_factor=80):
 
 def generate_coarse_param_sets(count, seed):
     return generate_unique(random_coarse_param_set, count, seed)
+
+
+def load_param_table(path):
+    frame = pd.read_csv(path)
+    missing = [key for key in PARAM_NAMES if key not in frame.columns]
+    if missing:
+        raise ValueError(f"Parameter table missing columns: {missing}")
+    param_sets = []
+    seen = set()
+    for _, row in frame.iterrows():
+        raw = {key: row[key] for key in PARAM_NAMES}
+        param_set = normalize_param_set(raw)
+        if not is_valid_param_set(param_set):
+            continue
+        identity = param_identity(param_set)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        param_sets.append(param_set)
+    if not param_sets:
+        raise ValueError(f"No valid parameter rows in table: {path}")
+    return param_sets
 
 
 def clamp(value, low, high):
@@ -461,7 +508,11 @@ def write_best_snippet(result_df, output_dir, stage_name, objective, product):
         f"short_close_iv_threshold={typed_best['strategy.short_close_iv_threshold']:.3f},",
         f"short_open_pullback_iv_threshold={typed_best['strategy.short_open_pullback_iv_threshold']:.3f},",
         f"short_stop_loss_enabled={typed_best['strategy.short_stop_loss_enabled']},",
-        f"short_stop_loss_rate={typed_best['strategy.short_stop_loss_rate']:.3f},",
+        f"short_daily_loss_aum_threshold={typed_best['strategy.short_daily_loss_aum_threshold']:.3f},",
+        f"delta_hedge_tolerance_ratio={typed_best['strategy.delta_hedge_tolerance_ratio']:.3f},",
+        f"option_delta_hedge_max_itm_ratio={typed_best['strategy.option_delta_hedge_max_itm_ratio']:.3f},",
+        f"short_volume_spike_multiplier={typed_best['strategy.short_volume_spike_multiplier']:.3f},",
+        f"roll_dte_threshold={typed_best['strategy.roll_dte_threshold']},",
         f"short_cooldown_after_long_iv_high_exit_days={typed_best['strategy.short_cooldown_after_long_iv_high_exit_days']},",
         f"roll_cooldown_days={typed_best['strategy.roll_cooldown_days']},",
         "",
@@ -617,7 +668,11 @@ def main():
 
     result_paths = []
     if args.stage in {"coarse", "all"}:
-        coarse_sets = generate_coarse_param_sets(args.coarse_samples, args.seed)
+        coarse_sets = (
+            load_param_table(args.param_table)
+            if args.param_table
+            else generate_coarse_param_sets(args.coarse_samples, args.seed)
+        )
         coarse_path = output_dir / "coarse.csv"
         result_paths.append(
             run_stage("coarse", coarse_sets, coarse_path, args, base_config, output_dir)

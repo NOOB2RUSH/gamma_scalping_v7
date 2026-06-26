@@ -20,6 +20,11 @@ SUMMARY_TEMPLATE_SHEET = "账户总体情况"
 STRATEGY_NAME_COLUMN = "策略名称"
 SUMMARY_CONTRACT_CODE_COLUMN = "合约代码"
 SUMMARY_AUM_COLUMN = "AUM"
+PORTFOLIO_SUMMARY_VALUE_COLUMNS = [
+    account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
+    SUMMARY_AUM_COLUMN,
+    *account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[1:],
+]
 STRATEGY_DISPLAY_NAMES = {
     "kc50etf": "科创50ETF华夏",
     "300etf": "沪深300ETF华泰柏瑞",
@@ -28,18 +33,18 @@ STRATEGY_DISPLAY_NAMES = {
 }
 DETAIL_SHEETS = ("持仓记录", "交易记录")
 REPORT_SHEETS = (SUMMARY_TEMPLATE_SHEET, *DETAIL_SHEETS)
-
-
-def _position_report_columns():
-    return [
-        account_report.DEFAULT_POSITION_REPORT_COLUMNS[0],
-        STRATEGY_NAME_COLUMN,
-        *account_report.DEFAULT_POSITION_REPORT_COLUMNS[1:],
-    ]
-
-
-def _report_sheet_order(products):
-    return REPORT_SHEETS
+POSITION_REPORT_COLUMNS = [
+    account_report.DEFAULT_POSITION_REPORT_COLUMNS[0],
+    STRATEGY_NAME_COLUMN,
+    *account_report.DEFAULT_POSITION_REPORT_COLUMNS[1:],
+]
+SUMMARY_REPORT_COLUMNS = [
+    account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
+    STRATEGY_NAME_COLUMN,
+    SUMMARY_CONTRACT_CODE_COLUMN,
+    *PORTFOLIO_SUMMARY_VALUE_COLUMNS[1:],
+    "备注",
+]
 
 
 def build_portfolio_report(
@@ -116,7 +121,7 @@ def write_portfolio_report(payload):
 
     temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
     with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-        for sheet_name in _report_sheet_order(payload["products"]):
+        for sheet_name in REPORT_SHEETS:
             combined[sheet_name].to_excel(writer, sheet_name=sheet_name, index=False)
         _apply_template_layout(writer.book)
         account_report._format_account_report_workbook(writer.book)
@@ -158,7 +163,8 @@ def format_terminal_summary(payload):
             continue
         product_rows = summary_frame[
             summary_frame[STRATEGY_NAME_COLUMN].map(
-                lambda value: _strategy_name_matches(value, product)
+                lambda value: _canonical_strategy_name(value)
+                == _strategy_display_name(product)
             )
         ]
         if product_rows.empty:
@@ -194,7 +200,7 @@ def _combined_daily_frames(payloads, errors):
     position_frames = []
     trade_frames = []
     for product, payload in payloads.items():
-        reset_date = _payload_reset_date(payload)
+        reset_date = _normalize_reset_date(payload.get("_portfolio_reset_date"))
         frames = account_report._report_frames(payload)
         summary_frames.append(
             _filter_single_product_reset_rows(
@@ -213,11 +219,11 @@ def _combined_daily_frames(payloads, errors):
 
     frames_by_sheet[SUMMARY_TEMPLATE_SHEET] = _concat_exact(
         summary_frames,
-        _summary_report_columns(),
+        SUMMARY_REPORT_COLUMNS,
     )
     frames_by_sheet["持仓记录"] = _concat_exact(
         position_frames,
-        _position_report_columns(),
+        POSITION_REPORT_COLUMNS,
     )
     frames_by_sheet["交易记录"] = _concat_exact(
         trade_frames,
@@ -241,32 +247,13 @@ def _product_summary_frame(product, payload, frames):
     )
     if "备注" not in frame.columns:
         frame["备注"] = None
-    return frame.reindex(columns=_summary_report_columns())
+    return frame.reindex(columns=SUMMARY_REPORT_COLUMNS)
 
 
 def _product_position_frame(product, frame):
     result = frame.copy()
     result[STRATEGY_NAME_COLUMN] = _strategy_display_name(product)
-    return result.reindex(columns=_position_report_columns())
-
-
-def _summary_report_columns():
-    return [
-        account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
-        STRATEGY_NAME_COLUMN,
-        SUMMARY_CONTRACT_CODE_COLUMN,
-        *_portfolio_summary_value_columns()[1:],
-        "备注",
-    ]
-
-
-def _portfolio_summary_value_columns():
-    columns = list(account_report.DEFAULT_SUMMARY_REPORT_COLUMNS)
-    try:
-        columns[columns.index("估算权益")] = SUMMARY_AUM_COLUMN
-    except ValueError:
-        pass
-    return columns
+    return result.reindex(columns=POSITION_REPORT_COLUMNS)
 
 
 def _summary_aum_series(frame, payload, position_report=None):
@@ -310,10 +297,6 @@ def _product_from_strategy_name(value):
     return None
 
 
-def _strategy_name_matches(value, product):
-    return _canonical_strategy_name(value) == _strategy_display_name(product)
-
-
 def _account_reset_date(product, account_id):
     try:
         reset_at = account_report.account_store.load_account(
@@ -323,10 +306,6 @@ def _account_reset_date(product, account_id):
     except Exception:
         return None
     return _normalize_reset_date(reset_at)
-
-
-def _payload_reset_date(payload):
-    return _normalize_reset_date(payload.get("_portfolio_reset_date"))
 
 
 def _normalize_reset_date(value):
@@ -376,7 +355,7 @@ def _filter_reset_history_rows(sheet_name, frame, payloads=None):
     reset_dates = {
         product: reset_date
         for product, payload in payloads.items()
-        for reset_date in [_payload_reset_date(payload)]
+        for reset_date in [_normalize_reset_date(payload.get("_portfolio_reset_date"))]
         if reset_date is not None
     }
     if not reset_dates:
@@ -404,9 +383,8 @@ def _reset_filter_products(sheet_name, frame, payloads):
 
     markers = _position_product_markers(payloads)
     if sheet_name == SUMMARY_TEMPLATE_SHEET:
-        inferred = frame.loc[missing].apply(
-            lambda row: _product_from_summary_row(row, payloads),
-            axis=1,
+        inferred = frame.loc[missing, SUMMARY_CONTRACT_CODE_COLUMN].map(
+            lambda value: _product_from_security_code(value, payloads.keys())
         )
     elif sheet_name == "持仓记录":
         inferred = frame.loc[missing].apply(
@@ -415,7 +393,7 @@ def _reset_filter_products(sheet_name, frame, payloads):
         )
     elif sheet_name == "交易记录":
         inferred = frame.loc[missing].apply(
-            lambda row: _product_from_trade_row(row, markers),
+            lambda row: _product_from_position_row(row, markers),
             axis=1,
         )
     else:
@@ -724,13 +702,23 @@ def _backfill_position_holding_pnl(frame, payloads=None):
                 row.get("日期"),
                 row.get("合约代码"),
             )
-            multiplier = _position_row_multiplier(row, product_markers)
+            multiplier = 1.0
+            if not pd.isna(row.get("到期日")):
+                multiplier = _contract_multiplier(
+                    _product_from_contract_name(row.get("合约名称"), product_markers)
+                )
             pnl = account_report._daily_position_pnl_breakdown(
                 current_qty=qty,
-                current_side=_account_position_side(row.get("交易方向")),
+                current_side=(
+                    "short"
+                    if _position_direction_sign(row.get("交易方向")) < 0
+                    else "long"
+                ),
                 current_price=latest,
                 previous_qty=previous_qty,
-                previous_side=_account_position_side(previous_direction),
+                previous_side=(
+                    "short" if _position_direction_sign(previous_direction) < 0 else "long"
+                ),
                 previous_price=previous_latest,
                 previous_cost=(
                     _number(previous_row.get("持仓均价"))
@@ -764,10 +752,6 @@ def _position_trade_rows(payload, date, code):
     ]
 
 
-def _account_position_side(value):
-    return "short" if _position_direction_sign(value) < 0 else "long"
-
-
 def _position_code_key(value):
     if value is None or pd.isna(value):
         return ""
@@ -783,13 +767,6 @@ def _position_code_key(value):
 
 def _position_direction_sign(direction):
     return -1.0 if str(direction or "") == "空" else 1.0
-
-
-def _position_row_multiplier(row, product_markers):
-    if pd.isna(row.get("到期日")):
-        return 1.0
-    product = _product_from_contract_name(row.get("合约名称"), product_markers)
-    return _contract_multiplier(product)
 
 
 def _backfill_position_aum(frame, payloads=None):
@@ -873,21 +850,7 @@ def _product_from_contract_name(name, markers):
     return None
 
 
-def _product_from_summary_row(row, payloads):
-    return _product_from_security_code(
-        row.get(SUMMARY_CONTRACT_CODE_COLUMN),
-        payloads.keys(),
-    )
-
-
 def _product_from_position_row(row, markers):
-    product = _product_from_contract_name(row.get("合约名称"), markers)
-    if product is not None:
-        return product
-    return _product_from_security_code(row.get("合约代码"), markers.keys())
-
-
-def _product_from_trade_row(row, markers):
     product = _product_from_contract_name(row.get("合约名称"), markers)
     if product is not None:
         return product

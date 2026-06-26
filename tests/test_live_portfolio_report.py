@@ -65,7 +65,7 @@ def _portfolio_frames(payload):
     summary["合约代码"] = portfolio_report._strategy_contract_code(payload["product"])
     summary["AUM"] = None
     summary["备注"] = "new"
-    summary = summary.reindex(columns=portfolio_report._summary_report_columns())
+    summary = summary.reindex(columns=portfolio_report.SUMMARY_REPORT_COLUMNS)
     frames["持仓记录"] = portfolio_report._product_position_frame(
         payload["product"],
         frames["持仓记录"],
@@ -157,7 +157,7 @@ class LivePortfolioReportTest(unittest.TestCase):
                 account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
                 "策略名称",
                 "合约代码",
-                *portfolio_report._portfolio_summary_value_columns()[1:],
+                *portfolio_report.PORTFOLIO_SUMMARY_VALUE_COLUMNS[1:],
                 "备注",
             ],
         )
@@ -375,7 +375,7 @@ class LivePortfolioReportTest(unittest.TestCase):
         summary_cols = account_report.SUMMARY_COLUMNS
         summary = {column: 0.0 for column in summary_cols}
         summary[summary_cols[0]] = "2026-06-15"
-        summary[summary_cols[3]] = 8.544
+        summary["标的价格"] = 8.544
         payloads = {
             "500etf": {
                 "date": "2026-06-15",
@@ -648,7 +648,7 @@ class LivePortfolioReportTest(unittest.TestCase):
             account_report.DEFAULT_SUMMARY_REPORT_COLUMNS[0],
             "策略名称",
             "合约代码",
-            *portfolio_report._portfolio_summary_value_columns()[1:],
+            *portfolio_report.PORTFOLIO_SUMMARY_VALUE_COLUMNS[1:],
             "备注",
         ]
         current = pd.DataFrame(
@@ -687,7 +687,7 @@ class LivePortfolioReportTest(unittest.TestCase):
                 {
                     "账户总体情况": current,
                     "持仓记录": pd.DataFrame(
-                        columns=portfolio_report._position_report_columns()
+                        columns=portfolio_report.POSITION_REPORT_COLUMNS
                     ),
                     "交易记录": pd.DataFrame(columns=account_report.TRADE_COLUMNS),
                 },
@@ -728,7 +728,7 @@ class LivePortfolioReportTest(unittest.TestCase):
                     "合约名称": "510300.XSHG",
                 }
             ],
-            columns=portfolio_report._position_report_columns(),
+            columns=portfolio_report.POSITION_REPORT_COLUMNS,
         )
         old_trade = pd.DataFrame(
             [
