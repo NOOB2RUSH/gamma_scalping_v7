@@ -353,6 +353,45 @@ def _option_hedge_id(payload, index=0):
     return f"{side}:{code}"
 
 
+def _position_leg_codes(positions):
+    codes = set()
+    for position in (positions or {}).values():
+        if not position:
+            continue
+        for key in ("call_code", "put_code"):
+            code = position.get(key)
+            if code is not None:
+                codes.add(str(code).split(".", 1)[0])
+                codes.add(str(code))
+    return codes
+
+
+def _option_hedge_code(payload):
+    code = payload.get("order_book_id") or payload.get("call_code") or payload.get("put_code")
+    if code is None:
+        return None
+    return str(code).split(".", 1)[0]
+
+
+def _dedupe_option_hedges_against_positions(option_hedges, positions):
+    position_codes = _position_leg_codes(positions)
+    if not position_codes:
+        return list(option_hedges or [])
+    return [
+        hedge
+        for hedge in option_hedges or []
+        if _option_hedge_code(hedge) not in position_codes
+    ]
+
+
+def _normalize_account_option_hedges(account):
+    account.option_hedges = _dedupe_option_hedges_against_positions(
+        account.option_hedges,
+        account.positions,
+    )
+    return account
+
+
 def _load_account_from_conn(conn, product, account_id):
     state_row = conn.execute(
         "select * from account_state where account_id = ?",
@@ -374,6 +413,7 @@ def _load_account_from_conn(conn, product, account_id):
         (account_id,),
     ):
         option_hedges.append(json.loads(row["payload"]))
+    option_hedges = _dedupe_option_hedges_against_positions(option_hedges, positions)
 
     hedge_row = conn.execute(
         "select payload from hedge_position where account_id = ?",
@@ -411,6 +451,7 @@ def _load_account_from_conn(conn, product, account_id):
 
 
 def _save_account_to_conn(conn, account, now):
+    _normalize_account_option_hedges(account)
     conn.execute(
         """
         insert into account_state(account_id, product, cash, reset_at, updated_at)
@@ -937,6 +978,8 @@ def _option_hedge_from_fill(fill):
 
 def _upsert_option_hedge(account, fill):
     hedge = _option_hedge_from_fill(fill)
+    if _option_hedge_code(hedge) in _position_leg_codes(account.positions):
+        return
     hedge_id = _option_hedge_id(hedge)
     for index, existing in enumerate(account.option_hedges or []):
         if _option_hedge_id(existing, index) == hedge_id:

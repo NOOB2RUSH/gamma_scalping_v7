@@ -583,6 +583,161 @@ class LiveMultiProductSupportTest(unittest.TestCase):
         self.assertEqual(local.positions["short"]["call_qty"], 10)
         self.assertEqual(local.positions["short"]["put_qty"], 10)
 
+    def test_holding_import_uses_trade_execution_time_not_export_time_for_snapshot_filter(self):
+        with TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "account.sqlite"
+            holding_path = root / "实时持仓(信息导出)_2026_06_29-15_07_20.csv"
+            detail_path = root / "成交明细(信息导出)_2026_06_29-15_07_28.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "合约代码": "10011721",
+                        "合约名称": "500ETF购7月8500",
+                        "买卖": "卖",
+                        "持仓类型": "义务仓",
+                        "总持仓": 5,
+                        "今开仓": 5,
+                        "开仓均价": 0.4551,
+                        "最新价": 0.4630,
+                        "占用保证金": 73471.0,
+                    },
+                    {
+                        "合约代码": "10011723",
+                        "合约名称": "500ETF购7月9000",
+                        "买卖": "卖",
+                        "持仓类型": "义务仓",
+                        "总持仓": 1,
+                        "今开仓": 0,
+                        "开仓均价": 0.2499,
+                        "最新价": 0.1724,
+                        "占用保证金": 10692.2,
+                    },
+                    {
+                        "合约代码": "10011732",
+                        "合约名称": "500ETF沽7月9000",
+                        "买卖": "卖",
+                        "持仓类型": "义务仓",
+                        "总持仓": 10,
+                        "今开仓": 0,
+                        "开仓均价": 0.2488,
+                        "最新价": 0.3020,
+                        "占用保证金": 143542.0,
+                    },
+                ]
+            ).to_csv(holding_path, index=False, encoding="utf-8-sig")
+            pd.DataFrame(
+                [
+                    {
+                        "合约代码": "10011721",
+                        "开平": "平仓",
+                        "买卖": "买",
+                        "成交数量": 5,
+                        "成交价格": 0.4554,
+                        "日期": "20260629",
+                        "成交时间": "14:47:41",
+                        "成交时间(日)": "20260629 14:47:41",
+                    },
+                    {
+                        "合约代码": "10011723",
+                        "开平": "平仓",
+                        "买卖": "买",
+                        "成交数量": 3,
+                        "成交价格": 0.1660,
+                        "日期": "20260629",
+                        "成交时间": "14:47:56",
+                        "成交时间(日)": "20260629 14:47:56",
+                    },
+                    {
+                        "合约代码": "10011721",
+                        "开平": "开仓",
+                        "买卖": "卖",
+                        "成交数量": 5,
+                        "成交价格": 0.4551,
+                        "日期": "20260629",
+                        "成交时间": "14:48:15",
+                        "成交时间(日)": "20260629 14:48:15",
+                    },
+                ]
+            ).to_csv(detail_path, index=False, encoding="utf-8-sig")
+            old_straddle = {
+                "action": "open_short_straddle",
+                "side": "short",
+                "date": "2026-06-25",
+                "call_code": "10011723",
+                "put_code": "10011732",
+                "strike": 9.0,
+                "expiry": "2026-07-22",
+                "call_qty": 4,
+                "put_qty": 10,
+                "entry_call_price": 0.2499,
+                "entry_put_price": 0.2488,
+                "contract_multiplier": 10000,
+                "option_margin": 184884.0,
+                "cash_delta": 0.0,
+            }
+            old_hedge = {
+                "action": "open_option_hedge",
+                "side": "short",
+                "option_type": "c",
+                "date": "2026-06-26",
+                "order_book_id": "10011721",
+                "call_code": "10011721",
+                "qty": 5,
+                "strike": 8.5,
+                "expiry": "2026-07-22",
+                "entry_price": 0.4179,
+                "contract_multiplier": 10000,
+                "option_margin": 83950.0,
+                "cash_delta": 0.0,
+            }
+            metadata = {
+                "10011721": {
+                    "strike": 8.5,
+                    "expiry": "2026-07-22",
+                    "option_type": "C",
+                    "contract_multiplier": 10000,
+                    "contract_symbol": "500ETF购7月8500",
+                },
+                "10011723": {
+                    "strike": 9.0,
+                    "expiry": "2026-07-22",
+                    "option_type": "C",
+                    "contract_multiplier": 10000,
+                    "contract_symbol": "500ETF购7月9000",
+                },
+                "10011732": {
+                    "strike": 9.0,
+                    "expiry": "2026-07-22",
+                    "option_type": "P",
+                    "contract_multiplier": 10000,
+                    "contract_symbol": "500ETF沽7月9000",
+                },
+            }
+
+            with (
+                mock.patch.object(account.storage, "account_db_path", return_value=db_path),
+                mock.patch.object(holding_importer, "_resolve_trade_detail_file", return_value=detail_path),
+                mock.patch.object(holding_importer, "_load_contract_metadata", return_value=metadata),
+            ):
+                account.record_fill("500etf", old_straddle)
+                account.record_fill("500etf", old_hedge)
+                result = holding_importer.import_holding_file(
+                    "500etf",
+                    file_path=holding_path,
+                    date="2026-06-29",
+                )
+                local = account.load_account("500etf")
+
+        self.assertEqual(
+            [item["fill"]["action"] for item in result["applied"]],
+            ["rebalance_straddle_legs", "option_hedge_mark_update"],
+        )
+        self.assertEqual(local.positions["short"]["call_qty"], 1)
+        self.assertEqual(local.positions["short"]["put_qty"], 10)
+        self.assertEqual(local.option_hedges[0]["order_book_id"], "10011721")
+        self.assertEqual(local.option_hedges[0]["qty"], 5)
+
     def test_roll_fill_starts_live_roll_cooldown_like_backtest(self):
         fill = {
             "action": "roll_short_straddle",

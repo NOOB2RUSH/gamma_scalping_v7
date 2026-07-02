@@ -15,6 +15,12 @@ import core  # noqa: E402
 
 
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "research"
+PRODUCT_LABELS = {
+    "50etf": "50ETF",
+    "300etf": "300ETF",
+    "500etf": "500ETF",
+    "kc50etf": "KC50ETF",
+}
 DEFAULT_PAIRS = (
     ("300etf", "50etf"),
     ("500etf", "50etf"),
@@ -123,8 +129,10 @@ def build_ratio_frame(numerator, denominator, features_by_product, rolling_windo
     denominator_iv = pd.to_numeric(joined[f"atm_iv_{denominator}"], errors="coerce")
     numerator_iv = pd.to_numeric(joined[f"atm_iv_{numerator}"], errors="coerce")
     ratio_col = f"iv_ratio_{numerator}_over_{denominator}"
+    diff_col = f"iv_diff_{numerator}_minus_{denominator}"
     joined[ratio_col] = numerator_iv / denominator_iv
     joined.loc[~denominator_iv.gt(0), ratio_col] = pd.NA
+    joined[diff_col] = numerator_iv - denominator_iv
     joined[f"{ratio_col}_ma"] = joined[ratio_col].rolling(
         rolling_window,
         min_periods=max(2, rolling_window // 4),
@@ -166,6 +174,94 @@ def write_ratio_outputs(frame, numerator, denominator, output_dir, rolling_windo
     fig.savefig(png_path, dpi=160)
     plt.close(fig)
     return csv_path, png_path
+
+
+def write_pair_iv_curve_output(frame, numerator, denominator, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{numerator}_vs_{denominator}_atm_iv_curves"
+    png_path = output_dir / f"{stem}.png"
+
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    numerator_label = PRODUCT_LABELS.get(numerator, numerator.upper())
+    denominator_label = PRODUCT_LABELS.get(denominator, denominator.upper())
+    dates = pd.to_datetime(frame["date"])
+    numerator_iv = pd.to_numeric(frame[f"atm_iv_{numerator}"], errors="coerce")
+    denominator_iv = pd.to_numeric(frame[f"atm_iv_{denominator}"], errors="coerce")
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(dates, numerator_iv, label=f"{numerator_label} ATM IV", linewidth=1.3)
+    ax.plot(dates, denominator_iv, label=f"{denominator_label} ATM IV", linewidth=1.3)
+    ax.set_title(f"{numerator_label} vs {denominator_label} ATM IV")
+    ax.set_ylabel("ATM IV")
+    ax.set_xlabel("Date")
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=160)
+    plt.close(fig)
+    return png_path
+
+
+def write_pair_iv_diff_overlay_output(frame, numerator, denominator, output_dir):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{numerator}_vs_{denominator}_atm_iv_diff_overlay"
+    png_path = output_dir / f"{stem}.png"
+
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+
+    numerator_label = PRODUCT_LABELS.get(numerator, numerator.upper())
+    denominator_label = PRODUCT_LABELS.get(denominator, denominator.upper())
+    dates = pd.to_datetime(frame["date"])
+    numerator_iv = pd.to_numeric(frame[f"atm_iv_{numerator}"], errors="coerce")
+    denominator_iv = pd.to_numeric(frame[f"atm_iv_{denominator}"], errors="coerce")
+    diff_col = f"iv_diff_{numerator}_minus_{denominator}"
+    iv_diff = pd.to_numeric(frame[diff_col], errors="coerce")
+
+    fig, ax_iv = plt.subplots(figsize=(12, 5))
+    numerator_line = ax_iv.plot(
+        dates,
+        numerator_iv,
+        label=f"{numerator_label} ATM IV",
+        linewidth=1.3,
+    )[0]
+    denominator_line = ax_iv.plot(
+        dates,
+        denominator_iv,
+        label=f"{denominator_label} ATM IV",
+        linewidth=1.3,
+    )[0]
+    ax_iv.set_title(
+        f"{numerator_label} vs {denominator_label} ATM IV and Difference"
+    )
+    ax_iv.set_ylabel("ATM IV")
+    ax_iv.set_xlabel("Date")
+    ax_iv.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+    ax_iv.grid(True, alpha=0.25)
+
+    ax_diff = ax_iv.twinx()
+    diff_line = ax_diff.plot(
+        dates,
+        iv_diff,
+        label=f"{numerator_label} - {denominator_label}",
+        color="tab:red",
+        linewidth=1.2,
+        linestyle="--",
+        alpha=0.85,
+    )[0]
+    ax_diff.axhline(0.0, color="tab:red", linewidth=0.8, alpha=0.35)
+    ax_diff.set_ylabel("ATM IV difference")
+    ax_diff.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
+
+    lines = [numerator_line, denominator_line, diff_line]
+    ax_iv.legend(lines, [line.get_label() for line in lines], loc="best")
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=160)
+    plt.close(fig)
+    return png_path
 
 
 def _pair_summary(frame, numerator, denominator):
@@ -212,15 +308,32 @@ def main():
             args.output_dir,
             args.rolling_window,
         )
+        iv_curve_path = write_pair_iv_curve_output(
+            frame,
+            numerator,
+            denominator,
+            args.output_dir,
+        )
+        iv_diff_overlay_path = write_pair_iv_diff_overlay_output(
+            frame,
+            numerator,
+            denominator,
+            args.output_dir,
+        )
         summary = _pair_summary(frame, numerator, denominator)
         summary["csv"] = str(csv_path)
         summary["chart"] = str(png_path)
+        summary["ratio_chart"] = str(png_path)
+        summary["iv_curve_chart"] = str(iv_curve_path)
+        summary["iv_diff_overlay_chart"] = str(iv_diff_overlay_path)
         summaries.append(summary)
         print(
             f"{summary['pair']}: rows={summary.get('rows')} valid={summary.get('valid')} "
             f"first_valid={summary.get('first_valid')} last_valid={summary.get('last_valid')} "
             f"mean={summary.get('mean', float('nan')):.4f} "
-            f"latest={summary.get('latest', float('nan')):.4f}"
+            f"latest={summary.get('latest', float('nan')):.4f} "
+            f"iv_curve={iv_curve_path} "
+            f"iv_diff_overlay={iv_diff_overlay_path}"
         )
 
     summary_frame = pd.DataFrame(summaries)

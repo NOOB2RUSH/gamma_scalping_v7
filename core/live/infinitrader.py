@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,7 @@ def compile_signal_orders(signal_payload: dict[str, Any]) -> list[dict[str, Any]
         orders.extend(_compile_advice_item(item, len(orders) + 1, include_etf=False))
     for item in etf_netting.netted_etf_advice_items(advice):
         orders.extend(_compile_advice_item(item, len(orders) + 1, include_etf=True))
+    orders = _renumber_orders(_net_exact_option_hedge_orders(orders))
     return [order.to_dict() for order in orders if order.volume > 0]
 
 
@@ -160,7 +161,7 @@ def build_fills_from_command(command: dict[str, Any]) -> list[dict[str, Any]]:
                 include_etf=True,
             )
         )
-    return fills
+    return _net_exact_option_hedge_fills(fills)
 
 
 def _compile_advice_item(
@@ -278,31 +279,14 @@ def _compile_advice_item(
             return []
         return [_etf_order(start_sequence, action, item)]
 
-    if action in {"OPTION_DELTA_HEDGE_SHORT_CALL", "FINAL_OPTION_DELTA_HEDGE_SHORT_CALL"}:
-        return [
-            _option_order(
-                start_sequence,
-                action,
-                "short_call_hedge_open",
-                item.get("call_code"),
-                SELL,
-                OFFSET_OPEN,
-                item.get("call_qty"),
-                item.get("estimated_call_price"),
-            )
-        ]
-
     if action in {
-        "OPTION_DELTA_HEDGE_COMBINATION",
-        "FINAL_OPTION_DELTA_HEDGE_COMBINATION",
-        "GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
-        "FINAL_GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
+        "ATM_STRADDLE_DELTA_REBALANCE",
+        "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
     }:
-        return _combination_option_hedge_orders(
+        return _atm_straddle_delta_rebalance_orders(
             item,
             start_sequence,
             action,
-            include_etf=include_etf,
         )
 
     return []
@@ -327,30 +311,6 @@ def _fills_from_advice(
         if not include_etf:
             return []
         return [_delta_hedge_fill(item, date, source_file)]
-
-    if action in {"OPTION_DELTA_HEDGE_SHORT_CALL", "FINAL_OPTION_DELTA_HEDGE_SHORT_CALL"}:
-        qty = _int_qty(item.get("call_qty"))
-        price = float(item.get("estimated_call_price", 0.0) or 0.0)
-        return [
-            {
-                "action": "open_option_hedge",
-                "date": date,
-                "side": "short",
-                "option_type": "c",
-                "order_book_id": item.get("call_code"),
-                "call_code": item.get("call_code"),
-                "qty": qty,
-                "strike": item.get("strike"),
-                "expiry": item.get("expiry"),
-                "entry_price": price,
-                "contract_multiplier": multiplier,
-                "underlying_order_book_id": item.get("underlying_order_book_id"),
-                "option_margin": item.get("estimated_option_margin", 0.0),
-                "cash_delta": qty * price * multiplier - qty * option_fee_per_contract,
-                "source_file": source_file,
-                "import_source": "infinitrader_command",
-            }
-        ]
 
     if action == "CLOSE_OPTION_HEDGE":
         qty = _int_qty(item.get("qty"))
@@ -391,13 +351,10 @@ def _fills_from_advice(
         return [fill] if fill is not None else []
 
     if action in {
-        "OPTION_DELTA_HEDGE_COMBINATION",
-        "FINAL_OPTION_DELTA_HEDGE_COMBINATION",
-        "GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
-        "FINAL_GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
+        "ATM_STRADDLE_DELTA_REBALANCE",
+        "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
     }:
-        fills = []
-        rebalance = _rebalance_short_core_call_fill(
+        fill = _atm_straddle_delta_rebalance_fill(
             item,
             signal,
             date,
@@ -405,22 +362,132 @@ def _fills_from_advice(
             multiplier,
             option_fee_per_contract,
         )
-        if rebalance is not None:
-            fills.append(rebalance)
-        fills.extend(
-            _open_option_hedge_fills(
-                item,
-                date,
-                source_file,
-                multiplier,
-                option_fee_per_contract,
-            )
-        )
-        if include_etf and abs(float(item.get("trade_etf_qty", 0.0) or 0.0)) > 0:
-            fills.append(_delta_hedge_fill(item, date, source_file))
-        return fills
+        return [fill] if fill is not None else []
 
     return []
+
+
+def _net_exact_option_hedge_orders(orders: list[InfiniOrder]) -> list[InfiniOrder]:
+    result: list[InfiniOrder] = []
+    for order in orders:
+        if not (_is_option_hedge_close_order(order) or _is_option_hedge_open_order(order)):
+            result.append(order)
+            continue
+
+        residual = order
+        residual_volume = int(order.volume or 0)
+        index = 0
+        while index < len(result) and residual_volume > 0:
+            other = result[index]
+            if not _opposite_option_hedge_orders(other, residual):
+                index += 1
+                continue
+            matched_volume = min(int(other.volume or 0), residual_volume)
+            other_volume = int(other.volume or 0) - matched_volume
+            residual_volume -= matched_volume
+            if other_volume <= 0:
+                result.pop(index)
+            else:
+                result[index] = replace(other, volume=other_volume)
+                index += 1
+        if residual_volume > 0:
+            result.append(replace(residual, volume=residual_volume))
+    return result
+
+
+def _is_option_hedge_close_order(order: InfiniOrder) -> bool:
+    return order.leg == "option_hedge_close"
+
+
+def _opposite_option_hedge_orders(left: InfiniOrder, right: InfiniOrder) -> bool:
+    if left.exchange != right.exchange or left.instrument_id != right.instrument_id:
+        return False
+    if _is_option_hedge_close_order(left) and _is_option_hedge_open_order(right):
+        close_order, open_order = left, right
+    elif _is_option_hedge_close_order(right) and _is_option_hedge_open_order(left):
+        close_order, open_order = right, left
+    else:
+        return False
+    return _opposite_close_open(close_order, open_order)
+
+
+def _is_option_hedge_open_order(order: InfiniOrder) -> bool:
+    return False
+
+
+def _opposite_close_open(close_order: InfiniOrder, open_order: InfiniOrder) -> bool:
+    return (
+        close_order.offset == OFFSET_CLOSE
+        and open_order.offset == OFFSET_OPEN
+        and (
+            (close_order.order_direction == BUY and open_order.order_direction == SELL)
+            or (close_order.order_direction == SELL and open_order.order_direction == BUY)
+        )
+    )
+
+
+def _renumber_orders(orders: list[InfiniOrder]) -> list[InfiniOrder]:
+    return [
+        replace(order, sequence=index, memo=f"{order.action}:{order.leg}:{index}")
+        for index, order in enumerate(orders, start=1)
+    ]
+
+
+def _net_exact_option_hedge_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for fill in fills:
+        if fill.get("action") not in {"close_option_hedge", "open_option_hedge"}:
+            result.append(fill)
+            continue
+
+        residual = dict(fill)
+        residual_qty = _int_qty(residual.get("qty"))
+        index = 0
+        while index < len(result) and residual_qty > 0:
+            other = result[index]
+            if not _opposite_option_hedge_fills(other, residual):
+                index += 1
+                continue
+            other_qty = _int_qty(other.get("qty"))
+            matched_qty = min(other_qty, residual_qty)
+            other_qty -= matched_qty
+            residual_qty -= matched_qty
+            if other_qty <= 0:
+                result.pop(index)
+            else:
+                result[index] = _scale_option_hedge_fill(other, other_qty)
+                index += 1
+        if residual_qty > 0:
+            result.append(_scale_option_hedge_fill(residual, residual_qty))
+    return result
+
+
+def _opposite_option_hedge_fills(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    actions = {left.get("action"), right.get("action")}
+    if actions != {"close_option_hedge", "open_option_hedge"}:
+        return False
+    return (
+        _same_code(left.get("order_book_id"), right.get("order_book_id"))
+        and str(left.get("side", "short")).lower()
+        == str(right.get("side", "short")).lower()
+    )
+
+
+def _scale_option_hedge_fill(fill: dict[str, Any], qty: int) -> dict[str, Any]:
+    original_qty = max(_int_qty(fill.get("qty")), 1)
+    if qty == original_qty:
+        return dict(fill)
+    scale = qty / original_qty
+    result = dict(fill)
+    result["qty"] = qty
+    for key in ("option_margin", "cash_delta"):
+        if key in result:
+            result[key] = float(result.get(key, 0.0) or 0.0) * scale
+    return result
+
+
+def _same_code(left, right) -> bool:
+    return str(left or "").split(".", 1)[0] == str(right or "").split(".", 1)[0]
 
 
 def _delta_hedge_fill(item, date, source_file):
@@ -548,42 +615,79 @@ def _rebalance_short_core_call_fill(
     }
 
 
-def _open_option_hedge_fills(
+def _atm_straddle_delta_rebalance_fill(
     item,
+    signal,
     date,
     source_file,
     multiplier,
     option_fee_per_contract,
 ):
-    result = []
-    for leg in item.get("open_legs") or []:
-        qty = _int_qty(leg.get("qty"))
-        price = float(leg.get("estimated_price", 0.0) or 0.0)
-        result.append(
-            {
-                "action": "open_option_hedge",
-                "date": date,
-                "side": "short",
-                "option_type": "c",
-                "order_book_id": leg.get("order_book_id"),
-                "call_code": leg.get("order_book_id"),
-                "qty": qty,
-                "strike": leg.get("strike"),
-                "expiry": item.get("open_expiry"),
-                "entry_price": price,
-                "contract_multiplier": multiplier,
-                "underlying_order_book_id": item.get("underlying_order_book_id"),
-                "option_margin": (
-                    float(item.get("estimated_option_margin", 0.0) or 0.0)
-                    * qty
-                    / max(float(item.get("open_call_qty", qty) or qty), 1.0)
-                ),
-                "cash_delta": qty * price * multiplier - qty * option_fee_per_contract,
-                "source_file": source_file,
-                "import_source": "infinitrader_command",
-            }
+    position = ((signal.get("account") or {}).get("positions") or {}).get("short")
+    if not position:
+        return None
+    close_put_qty = _int_qty(item.get("close_put_qty"))
+    open_call_qty = _int_qty(item.get("open_call_qty"))
+    if close_put_qty <= 0 and open_call_qty <= 0:
+        return None
+    close_put_price = float(item.get("estimated_close_put_price", 0.0) or 0.0)
+    open_call_price = float(item.get("estimated_open_call_price", 0.0) or 0.0)
+    target_call_qty = _int_qty(
+        item.get(
+            "target_call_qty",
+            int(position.get("call_qty", 0) or 0) + open_call_qty,
         )
-    return result
+    )
+    target_put_qty = _int_qty(
+        item.get(
+            "target_put_qty",
+            int(position.get("put_qty", 0) or 0) - close_put_qty,
+        )
+    )
+    fee = (close_put_qty + open_call_qty) * float(option_fee_per_contract)
+    cash_delta = (
+        open_call_qty * open_call_price * multiplier
+        - close_put_qty * close_put_price * multiplier
+        - fee
+    )
+    return {
+        "action": "rebalance_straddle_legs",
+        "date": date,
+        "side": "short",
+        "call_code": position.get("call_code"),
+        "put_code": position.get("put_code"),
+        "call_qty": target_call_qty,
+        "put_qty": max(0, target_put_qty),
+        "strike": position.get("strike"),
+        "expiry": position.get("expiry"),
+        "entry_call_price": position.get("entry_call_price"),
+        "entry_put_price": position.get("entry_put_price"),
+        "entry_option_value": position.get("entry_option_value", 0.0),
+        "option_margin": float(
+            item.get("estimated_option_margin", position.get("option_margin", 0.0))
+            or 0.0
+        ),
+        "contract_multiplier": position.get("contract_multiplier", multiplier),
+        "underlying_order_book_id": position.get("underlying_order_book_id")
+        or item.get("underlying_order_book_id"),
+        "cash_delta": cash_delta,
+        "leg_adjustments": [
+            {
+                "leg": "put",
+                "qty_change": -close_put_qty,
+                "price": close_put_price,
+                "order_book_id": position.get("put_code"),
+            },
+            {
+                "leg": "call",
+                "qty_change": open_call_qty,
+                "price": open_call_price,
+                "order_book_id": position.get("call_code"),
+            },
+        ],
+        "source_file": source_file,
+        "import_source": "infinitrader_command",
+    }
 
 
 def _write_json(path: Path, payload):
@@ -594,51 +698,40 @@ def _write_json(path: Path, payload):
     )
 
 
-def _combination_option_hedge_orders(
+def _atm_straddle_delta_rebalance_orders(
     item: dict[str, Any],
     start_sequence: int,
     action: str,
-    include_etf: bool = True,
 ) -> list[InfiniOrder]:
     orders: list[InfiniOrder] = []
-    close_qty = _int_qty(item.get("close_call_qty"))
-    if close_qty > 0:
+    close_put_qty = _int_qty(item.get("close_put_qty"))
+    if close_put_qty > 0:
         orders.append(
             _option_order(
                 start_sequence,
                 action,
-                "combo_close_call",
-                item.get("close_call_code"),
+                "atm_rebalance_close_put",
+                item.get("close_put_code"),
                 BUY,
                 OFFSET_CLOSE,
-                close_qty,
-                item.get("estimated_close_call_price"),
+                close_put_qty,
+                item.get("estimated_close_put_price"),
             )
         )
-
-    for leg in item.get("open_legs") or [
-        {
-            "order_book_id": item.get("open_call_code"),
-            "qty": item.get("open_call_qty"),
-            "estimated_price": item.get("estimated_open_call_price"),
-        }
-    ]:
+    open_call_qty = _int_qty(item.get("open_call_qty"))
+    if open_call_qty > 0:
         orders.append(
             _option_order(
                 start_sequence + len(orders),
                 action,
-                "combo_open_call",
-                leg.get("order_book_id"),
+                "atm_rebalance_open_call",
+                item.get("open_call_code"),
                 SELL,
                 OFFSET_OPEN,
-                leg.get("qty"),
-                leg.get("estimated_price"),
+                open_call_qty,
+                item.get("estimated_open_call_price"),
             )
         )
-
-    trade_etf_qty = _etf_board_lot_qty(item.get("trade_etf_qty", 0.0))
-    if include_etf and abs(trade_etf_qty) > 0:
-        orders.append(_etf_order(start_sequence + len(orders), action, item))
     return orders
 
 

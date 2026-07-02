@@ -18,7 +18,6 @@ def _engine():
         "delta_hedge_tolerance_ratio": 0.10,
         "allow_etf_short_hedge": False,
         "enable_option_delta_hedge": True,
-        "option_delta_hedge_combination_enabled": True,
         "dynamic_position_control_enabled": False,
         "proportional_position_sizing_enabled": False,
         "position_sizing_base_nav": 1_000_000.0,

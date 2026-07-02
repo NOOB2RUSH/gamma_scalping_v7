@@ -9,7 +9,7 @@ from core.live import account, account_report
 
 
 class AccountReportPnlClassificationTest(unittest.TestCase):
-    def test_new_intraday_position_pnl_is_left_unexplained(self):
+    def test_new_intraday_position_pnl_is_transaction_to_close(self):
         result = account_report._daily_position_pnl_breakdown(
             current_qty=80,
             current_side="short",
@@ -30,8 +30,9 @@ class AccountReportPnlClassificationTest(unittest.TestCase):
         )
 
         self.assertEqual(result["holding_pnl"], 0.0)
-        self.assertEqual(result["mark_to_market_trade_pnl"], 0.0)
-        self.assertEqual(result["daily_pnl_decomposition"], 0.0)
+        self.assertAlmostEqual(result["realized_cost_pnl"], -3120.0)
+        self.assertAlmostEqual(result["mark_to_market_trade_pnl"], -3120.0)
+        self.assertAlmostEqual(result["daily_pnl_decomposition"], -3120.0)
 
     def test_previous_close_position_pnl_remains_holding_pnl(self):
         result = account_report._daily_position_pnl_breakdown(
@@ -65,9 +66,9 @@ class AccountReportPnlClassificationTest(unittest.TestCase):
             multiplier=10000,
         )
 
-        self.assertAlmostEqual(result["holding_pnl"], -1790.0)
-        self.assertAlmostEqual(result["realized_cost_pnl"], -1600.0)
-        self.assertEqual(result["mark_to_market_trade_pnl"], 0.0)
+        self.assertAlmostEqual(result["holding_pnl"], -1840.0)
+        self.assertAlmostEqual(result["realized_cost_pnl"], 50.0)
+        self.assertAlmostEqual(result["mark_to_market_trade_pnl"], 50.0)
         self.assertAlmostEqual(result["daily_pnl_decomposition"], -1790.0)
 
     def test_partially_closed_previous_position_uses_fill_and_latest_price(self):
@@ -85,11 +86,10 @@ class AccountReportPnlClassificationTest(unittest.TestCase):
             multiplier=10000,
         )
 
-        expected = (0.1170 - 0.1250) * 4 * 10000
-        expected += (0.1170 - 0.1300) * 6 * 10000
-        self.assertAlmostEqual(result["holding_pnl"], expected)
-        self.assertEqual(result["mark_to_market_trade_pnl"], 0.0)
-        self.assertAlmostEqual(result["daily_pnl_decomposition"], expected)
+        self.assertAlmostEqual(result["holding_pnl"], -1300.0)
+        self.assertAlmostEqual(result["realized_cost_pnl"], 200.0)
+        self.assertAlmostEqual(result["mark_to_market_trade_pnl"], 200.0)
+        self.assertAlmostEqual(result["daily_pnl_decomposition"], -1100.0)
 
     def test_close_snapshot_option_daily_pnl_uses_closes_and_carry_positions(self):
         code_col = "\u5408\u7ea6\u4ee3\u7801"

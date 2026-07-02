@@ -37,16 +37,16 @@ class LivePortfolioAccountTest(unittest.TestCase):
 
     def test_shared_nav_counts_initial_cash_once(self):
         payloads = {
-            "300etf": {"summary": {"初始资金": 1_000_000.0, "估算权益": 999_000.0}},
-            "500etf": {"summary": {"初始资金": 1_000_000.0, "估算权益": 998_000.0}},
+            "300etf": {"summary": {"初始资金": 1_000_000.0}},
+            "500etf": {"summary": {"初始资金": 1_000_000.0}},
             "kc50etf": {
-                "summary": {"初始资金": 10_000_000.0, "估算权益": 10_011_915.34}
+                "summary": {"初始资金": 10_000_000.0}
             },
         }
 
         nav = portfolio_account.shared_nav_from_subaccounts(payloads)
 
-        self.assertAlmostEqual(nav, 10_008_915.34)
+        self.assertIsNone(nav)
 
 
 if __name__ == "__main__":

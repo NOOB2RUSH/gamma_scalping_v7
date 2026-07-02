@@ -10,9 +10,11 @@ from core.live import (
     account,
     etf_importer,
     holding_importer,
+    intraday_pnl,
     market_data,
     portfolio_account,
     portfolio_report,
+    position_checker,
     reconciler,
     report,
     signal_engine,
@@ -46,6 +48,8 @@ def main():
                 ("7", "重建账户状态"),
                 ("8", "账户对账"),
                 ("9", "初始化/重置账户"),
+                ("10", "盘中盈亏统计"),
+                ("11", "检查本地/券商持仓一致性"),
                 ("0", "退出"),
             ]
         )
@@ -68,6 +72,10 @@ def main():
                 _action_reconcile(session)
             elif action == "9":
                 _action_init_account(session)
+            elif action == "10":
+                _action_intraday_pnl(session)
+            elif action == "11":
+                _action_check_positions(session)
             elif action == "0":
                 print("已退出。")
                 return
@@ -448,6 +456,38 @@ def _action_account_report(session):
         print(line)
 
 
+def _action_intraday_pnl(session):
+    date = _prompt_optional("本地快照日期，留空则最新")
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            payload = intraday_pnl.calculate_intraday_pnl(
+                product,
+                account_id=session["account_id"],
+                date=date,
+            )
+            for line in intraday_pnl.format_intraday_pnl(payload):
+                print(line)
+        except Exception as exc:
+            print(f"FAILED {exc}")
+
+
+def _action_check_positions(session):
+    date = _prompt_optional("导出文件日期，留空则最新")
+    for product in session["products"]:
+        print(f"\n== {product} ==")
+        try:
+            payload = position_checker.check_account_positions(
+                product,
+                account_id=session["account_id"],
+                date=date or None,
+            )
+            for line in position_checker.format_position_check(payload):
+                print(line)
+        except Exception as exc:
+            print(f"FAILED {exc}")
+
+
 def _action_show_positions(session):
     print(
         f"\nshared_account={session['account_id']} "
@@ -518,6 +558,17 @@ def _action_reconcile(session):
         "相对残差容忍度",
         reconciler.DEFAULT_REL_TOLERANCE,
     )
+    try:
+        fund_rows = reconciler.fund_reconciliation_rows(
+            account_id=session["account_id"],
+            products=session["products"],
+            start_date=start_date,
+            end_date=end_date,
+        )
+        for line in reconciler.format_fund_reconciliation_terminal(fund_rows):
+            print(line)
+    except Exception as exc:
+        print(f"资金对账 FAILED {exc}")
     for product in session["products"]:
         print(f"\n== {product} ==")
         try:
@@ -532,7 +583,7 @@ def _action_reconcile(session):
             report_path = reconciler.write_reconcile_report(product, payload)
             storage.write_json(report_path.with_suffix(".json"), payload)
             print(f"reconcile_report={report_path}")
-            for line in reconciler.format_terminal_summary(payload):
+            for line in reconciler.format_terminal_summary(payload, include_fund=False):
                 print(line)
         except Exception as exc:
             print(f"FAILED {exc}")

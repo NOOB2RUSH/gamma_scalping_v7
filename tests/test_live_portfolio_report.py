@@ -511,7 +511,8 @@ class LivePortfolioReportTest(unittest.TestCase):
 
         result = portfolio_report._backfill_position_holding_pnl(frame, payloads)
 
-        self.assertAlmostEqual(result.iloc[1]["持仓盈亏"], -1790.0)
+        self.assertAlmostEqual(result.iloc[1]["持仓盈亏"], -1840.0)
+        self.assertAlmostEqual(result.iloc[1]["交易盈亏"], 50.0)
 
     def test_write_uses_template_then_appends_new_date(self):
         with TemporaryDirectory() as temp_dir:
@@ -768,6 +769,107 @@ class LivePortfolioReportTest(unittest.TestCase):
             set(combined["交易记录"]["合约代码"]),
             {"300etf-trade"},
         )
+
+    def test_merge_backfills_historical_etf_trade_pnl_from_merged_trades(self):
+        current = {
+            "账户总体情况": pd.DataFrame(columns=portfolio_report.SUMMARY_REPORT_COLUMNS),
+            "持仓记录": pd.DataFrame(columns=portfolio_report.POSITION_REPORT_COLUMNS),
+            "交易记录": pd.DataFrame(columns=account_report.TRADE_COLUMNS),
+        }
+        position_rows = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-26",
+                    "策略名称": "科创50ETF华夏",
+                    "合约代码": "588000",
+                    "合约名称": "588000.XSHG",
+                    "交易方向": "多",
+                    "总持仓张数": 5800,
+                    "今日变化": 5200,
+                    "最新价": 2.133,
+                    "持仓均价": 2.144258,
+                    "持仓盈亏": -27.0,
+                    "交易盈亏": 0.0,
+                },
+                {
+                    "日期": "2026-06-29",
+                    "策略名称": "科创50ETF华夏",
+                    "合约代码": "588000",
+                    "合约名称": "588000.XSHG",
+                    "交易方向": "多",
+                    "总持仓张数": 6900,
+                    "今日变化": 1100,
+                    "最新价": 2.248,
+                    "持仓均价": 2.157927,
+                    "持仓盈亏": 667.0,
+                    "交易盈亏": 0.0,
+                },
+            ],
+            columns=portfolio_report.POSITION_REPORT_COLUMNS,
+        )
+        trade_rows = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-29",
+                    "合约代码": "588000",
+                    "合约名称": "科创50ETF华夏",
+                    "买卖": "买",
+                    "成交价格": 2.23,
+                    "成交数量": 1100,
+                    "成交时间": "14:46:31",
+                    "类型": "ETF对冲",
+                }
+            ],
+            columns=account_report.TRADE_COLUMNS,
+        )
+        summary_rows = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-29",
+                    "策略名称": "科创50ETF华夏",
+                    "合约代码": "sh588000",
+                    "AUM": 1_000_000.0,
+                    "当日手续费": 0.2,
+                    "期权单日盈亏": 0.0,
+                    "ETF单日盈亏": 667.0,
+                    "总单日盈亏(手续费前)": 667.0,
+                    "净单日盈亏": 666.8,
+                    "单日盈亏/AUM": 0.000667,
+                }
+            ],
+            columns=portfolio_report.SUMMARY_REPORT_COLUMNS,
+        )
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "existing.xlsx"
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                summary_rows.to_excel(writer, sheet_name="账户总体情况", index=False)
+                position_rows.to_excel(writer, sheet_name="持仓记录", index=False)
+                trade_rows.to_excel(writer, sheet_name="交易记录", index=False)
+            with mock.patch.object(
+                portfolio_report,
+                "TEMPLATE_REPORT_PATH",
+                Path(temp_dir) / "missing-template.xlsx",
+            ):
+                combined = portfolio_report._merge_with_existing(
+                    current,
+                    path,
+                    payloads={"kc50etf": {"trade_rows": []}},
+                    products=["kc50etf"],
+                )
+
+        positions = combined["持仓记录"]
+        row = positions.loc[
+            positions["日期"].astype(str).eq("2026-06-29")
+            & positions["合约代码"].astype(str).eq("588000")
+        ].iloc[0]
+        self.assertAlmostEqual(row["持仓盈亏"], 667.0)
+        self.assertAlmostEqual(row["交易盈亏"], 19.8)
+        summary = combined["账户总体情况"].iloc[0]
+        self.assertAlmostEqual(summary["期权单日盈亏"], 0.0)
+        self.assertAlmostEqual(summary["ETF单日盈亏"], 686.8)
+        self.assertAlmostEqual(summary["总单日盈亏(手续费前)"], 686.8)
+        self.assertAlmostEqual(summary["净单日盈亏"], 686.6)
+        self.assertAlmostEqual(summary["单日盈亏/AUM"], 0.0006868)
 
 
 if __name__ == "__main__":

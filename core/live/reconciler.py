@@ -11,8 +11,31 @@ from . import account_report
 from . import storage
 
 
-DEFAULT_ABS_TOLERANCE = 100.0
-DEFAULT_REL_TOLERANCE = 0.25
+DEFAULT_ABS_TOLERANCE = 0.0
+DEFAULT_REL_TOLERANCE = 0.0
+STRICT_EQUAL_EPSILON = 1e-8
+FUND_RECONCILIATION_ABS_TOLERANCE = 1.0
+
+
+FUND_RECONCILIATION_COLUMNS = [
+    "日期",
+    "期权资金文件",
+    "证券资金文件",
+    "期权总资产",
+    "证券总资产",
+    "券商合并总资产",
+    "上一资金日期",
+    "上一日券商合并总资产",
+    "券商总资产变化",
+    "期权保证金",
+    "上一日期权保证金",
+    "期权保证金变化",
+    "剔除保证金后券商资产变化",
+    "本地净单日盈亏",
+    "资金对账差额",
+    "资金对账通过",
+    "资金对账说明",
+]
 
 
 CHECK_GROUP_LABELS = {
@@ -26,7 +49,7 @@ CHECK_GROUP_LABELS = {
 CHECK_DEFINITIONS = {
     "total_vs_legs": "总单日盈亏 = 期权单日盈亏 + ETF单日盈亏",
     "net_after_fee": "净单日盈亏 = 总单日盈亏 - 当日手续费",
-    "summary_decomposition": "总单日盈亏 = 持仓盈亏 + 当日盯市交易盈亏",
+    "summary_decomposition": "总单日盈亏 = 持仓盈亏 + 交易盈亏",
     "summary_decomposition_residual": "当日盈亏对账差额 = 总单日盈亏 - 分解合计",
     "position_holding_sum": "汇总持仓盈亏 = 持仓记录持仓盈亏合计",
     "position_trade_sum": "汇总交易盈亏 = 持仓记录交易盈亏合计",
@@ -35,17 +58,29 @@ CHECK_DEFINITIONS = {
     "position_option_split": "期权单日盈亏 = 期权持仓记录分解合计",
     "position_hedge_split": "ETF单日盈亏 = ETF持仓记录分解合计",
     "trade_fee_sum": "当日手续费 = 交易记录手续费合计",
+    "trade_pnl_sum": "持仓交易盈亏 = 交易记录按收盘价重算交易盈亏",
+    "position_market_value_identity": "持仓市值差 = 持仓盈亏 + 净交易收盘市值",
     "account_position_snapshot": "账户当前持仓 = 最新持仓记录",
-    "position_lifecycle_pnl": "持仓周期交易盈亏 = 周期盯市分解合计",
+    "position_lifecycle_pnl": "持仓周期交易盈亏 = 周期分解合计",
     "greeks_intraday_adjusted": "总单日盈亏 = 单日GreeksPnL",
+    "greeks_report_recalc": "单日GreeksPnL(不含Vega) = 报告昨收-今收Greeks重算",
+    "greeks_report_delta_recalc": "单日DeltaPnL = 报告昨收-今收Delta重算",
+    "greeks_report_gamma_recalc": "单日GammaPnL = 报告昨收-今收Gamma重算",
+    "greeks_report_theta_recalc": "单日ThetaPnL = 报告昨收-今收Theta重算",
 }
 
 
 CHECK_GROUPS = {
     "trade_fee_sum": "source_check",
+    "trade_pnl_sum": "source_check",
+    "position_market_value_identity": "source_check",
     "account_position_snapshot": "source_check",
     "position_lifecycle_pnl": "lifecycle_check",
     "greeks_intraday_adjusted": "greeks_check",
+    "greeks_report_recalc": "greeks_check",
+    "greeks_report_delta_recalc": "greeks_check",
+    "greeks_report_gamma_recalc": "greeks_check",
+    "greeks_report_theta_recalc": "greeks_check",
 }
 
 
@@ -109,16 +144,24 @@ def reconcile(
         rel_tolerance=rel_tolerance,
     )
     checks.append(_aggregate_lifecycle_check(lifecycle_rows))
+    fund_reconciliation = fund_reconciliation_rows(
+        account_id=account_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
     metrics = _aggregate_metrics(rows, checks)
+    account_ok = bool(rows) and all(check["ok"] for check in checks if not check["skipped"])
+    fund_ok = _fund_reconciliation_ok(fund_reconciliation)
     payload = {
         "product": product,
         "account_id": account_id,
-        "ok": bool(rows) and all(check["ok"] for check in checks if not check["skipped"]),
+        "ok": account_ok and fund_ok,
         "mode": "account_reconciliation_by_layer",
         "start_date": start_date,
         "end_date": end_date,
         "abs_tolerance": abs_tolerance,
         "rel_tolerance": rel_tolerance,
+        "fund_reconciliation": fund_reconciliation,
         "metrics": metrics,
         "checks": checks,
         "rows": rows,
@@ -139,12 +182,37 @@ def write_reconcile_report(product, payload):
         f"- account_id: {payload['account_id']}",
         f"- mode: {payload.get('mode')}",
         f"- ok: {payload['ok']}",
-        f"- tolerance: abs<={_fmt(payload.get('abs_tolerance'))}, "
-        f"rel<={_fmt(payload.get('rel_tolerance'))}",
+        "- tolerance: strict equality for non-Greeks; Greeks are informational",
         f"- rows: {metrics.get('row_count', 0)}",
         "",
-        "## Check Summary",
+        "## Fund Reconciliation",
+        "",
+        "| date | raw broker change | option margin change | adjusted broker change | local net pnl | residual | ok | note |",
+        "|---|---:|---:|---:|---:|---:|:---:|---|",
     ]
+    fund_rows = payload.get("fund_reconciliation") or []
+    if fund_rows:
+        for row in fund_rows:
+            lines.append(
+                "| {date} | {raw} | {margin} | {adjusted} | {local} | {residual} | {ok} | {note} |".format(
+                    date=row.get("日期"),
+                    raw=_fmt(row.get("券商总资产变化")),
+                    margin=_fmt(row.get("期权保证金变化")),
+                    adjusted=_fmt(row.get("剔除保证金后券商资产变化")),
+                    local=_fmt(row.get("本地净单日盈亏")),
+                    residual=_fmt(row.get("资金对账差额")),
+                    ok=_fund_reconciliation_status_text(row),
+                    note=str(row.get("资金对账说明") or ""),
+                )
+            )
+    else:
+        lines.append("|  |  |  |  |  |  | SKIP | no fund reconciliation rows |")
+    lines.extend(
+        [
+            "",
+            "## Check Summary",
+        ]
+    )
     for group, group_label in CHECK_GROUP_LABELS.items():
         group_checks = [
             check for check in payload.get("checks", [])
@@ -169,7 +237,7 @@ def write_reconcile_report(product, payload):
                     ratio=_fmt(check.get("ratio")),
                     rows=check.get("row_count", 0),
                     skipped=check.get("skipped_count", 0),
-                    ok="Y" if check.get("ok") else "N",
+                    ok=_check_status_text(check),
                 )
             )
 
@@ -193,7 +261,7 @@ def write_reconcile_report(product, payload):
                     expected=_fmt(check.get("expected")),
                     residual=_fmt(check.get("residual")),
                     ratio=_fmt(check.get("ratio")),
-                    ok="Y" if check.get("ok") else "N",
+                    ok=_check_status_text(check),
                     note=str(check.get("note") or ""),
                 )
             )
@@ -228,14 +296,17 @@ def write_reconcile_report(product, payload):
     return path
 
 
-def format_terminal_summary(payload):
+def format_terminal_summary(payload, include_fund=True):
     metrics = payload.get("metrics", {})
-    lines = [
-        (
-            f"账户对账 {payload['product']}/{payload['account_id']} "
-            f"ok={payload['ok']} rows={metrics.get('row_count', 0)}"
-        )
-    ]
+    lines = (
+        format_fund_reconciliation_terminal(payload.get("fund_reconciliation"))
+        if include_fund
+        else []
+    )
+    lines.append(
+        f"账户对账 {payload['product']}/{payload['account_id']} "
+        f"ok={payload['ok']} rows={metrics.get('row_count', 0)}"
+    )
     checks = payload.get("checks", [])
     if not checks:
         lines.append("(none)")
@@ -248,6 +319,8 @@ def format_terminal_summary(payload):
         display_checks = _terminal_group_checks(group, group_checks)
         for check in display_checks:
             status = "OK" if check.get("ok") else "FAIL"
+            if check.get("informational"):
+                status = "INFO"
             if check.get("skipped"):
                 status = "SKIP"
             lines.append(
@@ -261,21 +334,324 @@ def format_terminal_summary(payload):
 def _terminal_group_checks(group, checks):
     if group == "greeks_check":
         return checks
+    pinned_names = {"summary_decomposition", "position_market_value_identity"}
+    pinned = [
+        check
+        for check in checks
+        if check.get("name") in pinned_names and not check.get("skipped")
+    ]
     active = [check for check in checks if not check.get("skipped")]
     failed = [check for check in active if not check.get("ok")]
     if failed:
         return checks
     if not active:
         return checks[:1]
+    worst = max(
+        active,
+        key=lambda check: (
+            _zero_if_none(check.get("abs_residual")),
+            _zero_if_none(check.get("ratio")),
+        )
+    )
+    result = []
+    seen = set()
+    for check in [*pinned, worst]:
+        name = check.get("name")
+        if name in seen:
+            continue
+        result.append(check)
+        seen.add(name)
+    return result
+
+
+def fund_reconciliation_rows(
+    account_id="default",
+    products=None,
+    start_date=None,
+    end_date=None,
+    report_date=None,
+):
+    local_pnl_by_date = _portfolio_net_daily_pnl_by_date(account_id, products)
+    snapshots = _broker_fund_snapshots_by_date()
+    dates = _fund_reconciliation_dates(
+        snapshots,
+        local_pnl_by_date,
+        start_date=start_date,
+        end_date=end_date,
+        report_date=report_date,
+    )
     return [
-        max(
-            active,
-            key=lambda check: (
-                _zero_if_none(check.get("abs_residual")),
-                _zero_if_none(check.get("ratio")),
-            ),
+        _fund_reconciliation_row(date, snapshots, local_pnl_by_date)
+        for date in dates
+    ]
+
+
+def _fund_reconciliation_dates(
+    snapshots,
+    local_pnl_by_date,
+    start_date=None,
+    end_date=None,
+    report_date=None,
+):
+    if report_date is not None:
+        return [str(pd.Timestamp(report_date).date())]
+    dates = sorted(set(snapshots) | set(local_pnl_by_date))
+    start = _date_or_none(start_date)
+    end = _date_or_none(end_date)
+    if start is None and end is None:
+        return dates[-1:] if dates else []
+    result = []
+    for date in dates:
+        current = pd.Timestamp(date).date()
+        if start is not None and current < start:
+            continue
+        if end is not None and current > end:
+            continue
+        result.append(date)
+    return result
+
+
+def _broker_fund_snapshots_by_date():
+    snapshots = {}
+    for path in sorted(
+        account_report._live_hold_dir().glob("实时资金*.csv"),
+        key=lambda item: item.stat().st_mtime,
+    ):
+        date = account_report._filename_date(path)
+        if date is None:
+            continue
+        try:
+            frame = account_report._read_export_csv(path)
+        except Exception:
+            continue
+        if frame.empty:
+            continue
+        row = frame.iloc[0].to_dict()
+        kind = _broker_fund_account_kind(row, frame.columns)
+        total_asset = account_report._number(row.get("总资产"))
+        if kind is None or total_asset is None:
+            continue
+        snapshots.setdefault(str(date), {})[kind] = {
+            "file": path.name,
+            "total_asset": total_asset,
+            "margin": account_report._number(row.get("保证金")),
+            "account": row.get("投资者账号"),
+        }
+    return snapshots
+
+
+def _broker_fund_account_kind(row, columns):
+    account = str(row.get("投资者账号") or "").strip()
+    if account.startswith("期权"):
+        return "option"
+    if account.startswith("证券"):
+        return "security"
+    column_set = set(columns)
+    if {"期权市值", "保证金"}.intersection(column_set):
+        return "option"
+    if "证券市值" in column_set:
+        return "security"
+    return None
+
+
+def _portfolio_net_daily_pnl_by_date(account_id, products=None):
+    totals = {}
+    for product in products or _available_live_products():
+        path = storage.account_report_summary_history_path(product, account_id)
+        if not Path(path).exists():
+            continue
+        try:
+            history = pd.read_csv(path, encoding="utf-8-sig")
+        except Exception:
+            continue
+        if history.empty:
+            continue
+        if "账户ID" in history.columns:
+            history = history[history["账户ID"].astype(str).eq(str(account_id))].copy()
+        if history.empty:
+            continue
+        history = _merge_latest_report_summary(product, history)
+        by_date = _product_net_daily_pnl_by_date(history)
+        for date, value in by_date.items():
+            totals[date] = totals.get(date, 0.0) + value
+    return totals
+
+
+def _available_live_products():
+    try:
+        import core
+
+        return tuple(core.config.available_live_products())
+    except Exception:
+        root = storage.PROJECT_ROOT / "state" / "live"
+        if not root.exists():
+            return ()
+        return tuple(path.name for path in root.iterdir() if path.is_dir())
+
+
+def _product_net_daily_pnl_by_date(frame):
+    if frame is None or frame.empty or "日期" not in frame.columns or "净单日盈亏" not in frame.columns:
+        return {}
+    result = frame.copy()
+    result["_fund_date"] = pd.to_datetime(result["日期"], errors="coerce").dt.strftime(
+        "%Y-%m-%d"
+    )
+    result["_fund_net_pnl"] = pd.to_numeric(result["净单日盈亏"], errors="coerce")
+    result = result.dropna(subset=["_fund_date", "_fund_net_pnl"])
+    if result.empty:
+        return {}
+    result = result.drop_duplicates("_fund_date", keep="last")
+    return result.set_index("_fund_date")["_fund_net_pnl"].astype(float).to_dict()
+
+
+def _fund_reconciliation_row(date, snapshots, local_pnl_by_date):
+    current = snapshots.get(str(date), {})
+    previous_date, previous = _previous_complete_fund_snapshot(str(date), snapshots)
+    option = current.get("option")
+    security = current.get("security")
+    option_asset = _fund_total_asset(option)
+    security_asset = _fund_total_asset(security)
+    broker_total = _sum_required_optional(option_asset, security_asset)
+    previous_total = _combined_fund_total_asset(previous)
+    broker_change = _difference_optional(broker_total, previous_total)
+    option_margin = _fund_margin(option)
+    previous_option_margin = _fund_margin(None if previous is None else previous.get("option"))
+    option_margin_change = _difference_optional(option_margin, previous_option_margin)
+    adjusted_broker_change = _sum_required_optional(broker_change, option_margin_change)
+    local_pnl = local_pnl_by_date.get(str(date))
+    residual = _difference_optional(adjusted_broker_change, local_pnl)
+    ok = (
+        abs(residual) <= FUND_RECONCILIATION_ABS_TOLERANCE
+        if residual is not None
+        else None
+    )
+    return {
+        "日期": str(date),
+        "期权资金文件": None if option is None else option.get("file"),
+        "证券资金文件": None if security is None else security.get("file"),
+        "期权总资产": option_asset,
+        "证券总资产": security_asset,
+        "券商合并总资产": broker_total,
+        "上一资金日期": previous_date,
+        "上一日券商合并总资产": previous_total,
+        "券商总资产变化": broker_change,
+        "期权保证金": option_margin,
+        "上一日期权保证金": previous_option_margin,
+        "期权保证金变化": option_margin_change,
+        "剔除保证金后券商资产变化": adjusted_broker_change,
+        "本地净单日盈亏": local_pnl,
+        "资金对账差额": residual,
+        "资金对账通过": ok,
+        "资金对账说明": _fund_reconciliation_note(
+            current,
+            previous,
+            local_pnl,
+            option_margin_change,
+            ok,
+        ),
+    }
+
+
+def _previous_complete_fund_snapshot(date, snapshots):
+    previous_dates = sorted(
+        candidate
+        for candidate, snapshot in snapshots.items()
+        if candidate < date and _combined_fund_total_asset(snapshot) is not None
+    )
+    if not previous_dates:
+        return None, None
+    previous_date = previous_dates[-1]
+    return previous_date, snapshots[previous_date]
+
+
+def _fund_total_asset(snapshot):
+    if not snapshot:
+        return None
+    return snapshot.get("total_asset")
+
+
+def _fund_margin(snapshot):
+    if not snapshot:
+        return None
+    return snapshot.get("margin")
+
+
+def _combined_fund_total_asset(snapshot):
+    if not snapshot:
+        return None
+    return _sum_required_optional(
+        _fund_total_asset(snapshot.get("option")),
+        _fund_total_asset(snapshot.get("security")),
+    )
+
+
+def _sum_required_optional(*values):
+    if any(value is None for value in values):
+        return None
+    return sum(float(value) for value in values)
+
+
+def _difference_optional(left, right):
+    if left is None or right is None:
+        return None
+    return float(left) - float(right)
+
+
+def _fund_reconciliation_note(current, previous, local_pnl, option_margin_change, ok):
+    missing = []
+    if current.get("option") is None:
+        missing.append("缺少当日期权资金文件")
+    if current.get("security") is None:
+        missing.append("缺少当日证券资金文件")
+    if previous is None:
+        missing.append("缺少上一资金日完整资金文件")
+    if option_margin_change is None:
+        missing.append("缺少期权保证金变化")
+    if local_pnl is None:
+        missing.append("缺少本地净单日盈亏")
+    if missing:
+        return ";".join(missing)
+    return "通过" if ok else "不通过"
+
+
+def _fund_reconciliation_ok(rows):
+    active = [
+        row.get("资金对账通过")
+        for row in rows or []
+        if row.get("资金对账通过") is not None
+    ]
+    return all(bool(value) for value in active)
+
+
+def _fund_reconciliation_status_text(row):
+    ok = row.get("资金对账通过")
+    if ok is None:
+        return "SKIP"
+    return "Y" if ok else "N"
+
+
+def format_fund_reconciliation_terminal(rows):
+    rows = rows or []
+    if not rows:
+        return ["资金对账 SKIP 无资金对账记录"]
+    row = rows[-1]
+    status = "SKIP"
+    if row.get("资金对账通过") is not None:
+        status = "OK" if row.get("资金对账通过") else "FAIL"
+    return [
+        (
+            f"资金对账 {status} 日期={row.get('日期')} "
+            f"剔除保证金后券商变化={_fmt(row.get('剔除保证金后券商资产变化'))} "
+            f"本地净单日盈亏={_fmt(row.get('本地净单日盈亏'))} "
+            f"差额={_fmt(row.get('资金对账差额'))} "
+            f"保证金变化={_fmt(row.get('期权保证金变化'))} "
+            f"说明={row.get('资金对账说明')}"
         )
     ]
+
+
+def _format_fund_reconciliation_terminal(rows):
+    return format_fund_reconciliation_terminal(rows)
 
 
 def _build_daily_rows(
@@ -340,51 +716,56 @@ def _build_daily_rows(
                 rel_tolerance,
             )
         )
-        decomposition = _number(current.get("当日盈亏分解合计"))
-        holding_pnl = _number(current.get("持仓盈亏"))
-        mark_trade_pnl = _number(current.get("当日盯市交易盈亏"))
-        if _skip_new_position_pnl_decomposition(date_positions):
-            checks.append(
-                _skipped_check(
-                    "summary_decomposition",
-                    current_date,
-                    "new_position_pnl_not_reconciled",
-                )
+        position_decomposition = _position_decomposition_series(date_positions)
+        position_decomposition_total = (
+            float(position_decomposition.sum())
+            if position_decomposition is not None
+            else None
+        )
+        position_holding_pnl = (
+            None
+            if date_positions.empty
+            else _sum_numeric_column(date_positions, "持仓盈亏")
+        )
+        position_transaction_pnl = (
+            None
+            if date_positions.empty
+            else _sum_numeric_column(date_positions, "交易盈亏")
+        )
+        displayed_position_pnl = _sum_optional(
+            position_holding_pnl,
+            position_transaction_pnl,
+            fallback=position_decomposition_total,
+        )
+        checks.append(
+            _check_value(
+                "summary_decomposition",
+                current_date,
+                total_daily_pnl,
+                displayed_position_pnl,
+                abs_tolerance,
+                rel_tolerance,
             )
-            checks.append(
-                _skipped_check(
-                    "summary_decomposition_residual",
-                    current_date,
-                    "new_position_pnl_not_reconciled",
-                )
+        )
+        checks.append(
+            _check_value(
+                "summary_decomposition_residual",
+                current_date,
+                _difference(total_daily_pnl, displayed_position_pnl),
+                0.0,
+                abs_tolerance,
+                rel_tolerance,
             )
-        else:
-            checks.append(
-                _check_value(
-                    "summary_decomposition",
-                    current_date,
-                    total_daily_pnl,
-                    _sum_optional(holding_pnl, mark_trade_pnl, fallback=decomposition),
-                    abs_tolerance,
-                    rel_tolerance,
-                )
-            )
-            checks.append(
-                _check_value(
-                    "summary_decomposition_residual",
-                    current_date,
-                    _number(current.get("当日盈亏对账差额")),
-                    _difference(total_daily_pnl, decomposition),
-                    abs_tolerance,
-                    rel_tolerance,
-                )
-            )
+        )
 
         checks.extend(
             _position_checks(
                 current_date,
                 current,
                 date_positions,
+                total_daily_pnl,
+                option_daily_pnl,
+                hedge_daily_pnl,
                 abs_tolerance,
                 rel_tolerance,
             )
@@ -400,6 +781,26 @@ def _build_daily_rows(
                 abs_tolerance,
                 rel_tolerance,
                 note="no_trade_rows" if date_trades.empty else None,
+            )
+        )
+        checks.append(
+            _trade_pnl_sum_check(
+                product,
+                current_date,
+                date_positions,
+                date_trades,
+                abs_tolerance,
+                rel_tolerance,
+            )
+        )
+        checks.append(
+            _position_market_value_identity_check(
+                product,
+                current_date,
+                _rows_for_date(position_frame, prev["_date"].date()),
+                date_positions,
+                abs_tolerance,
+                rel_tolerance,
             )
         )
 
@@ -418,6 +819,42 @@ def _build_daily_rows(
                 ),
             )
         )
+        report_recalc = _report_close_to_close_greeks_pnl_without_vega(
+            product,
+            prev,
+            current,
+        )
+        greeks_pnl_without_vega = _difference(
+            greeks_pnl,
+            _number(current.get("单日VegaPnL")) or 0.0,
+        )
+        checks.append(
+            _check_value(
+                "greeks_report_recalc",
+                current_date,
+                greeks_pnl_without_vega,
+                None if report_recalc is None else report_recalc["total"],
+                1e-6,
+                1e-8,
+                note=None if report_recalc is None else report_recalc["note"],
+            )
+        )
+        for name, actual_column, expected_key in [
+            ("greeks_report_delta_recalc", "单日DeltaPnL", "delta"),
+            ("greeks_report_gamma_recalc", "单日GammaPnL", "gamma"),
+            ("greeks_report_theta_recalc", "单日ThetaPnL", "theta"),
+        ]:
+            checks.append(
+                _check_value(
+                    name,
+                    current_date,
+                    _number(current.get(actual_column)),
+                    None if report_recalc is None else report_recalc[expected_key],
+                    1e-6,
+                    1e-8,
+                    note=None if report_recalc is None else "source=summary_report_fields",
+                )
+            )
 
         rows.append(
             {
@@ -469,7 +906,16 @@ def _latest_summary_date(history):
     return str(dates.max().date())
 
 
-def _position_checks(date, summary_row, position_frame, abs_tolerance, rel_tolerance):
+def _position_checks(
+    date,
+    summary_row,
+    position_frame,
+    total_daily_pnl,
+    option_daily_pnl,
+    hedge_daily_pnl,
+    abs_tolerance,
+    rel_tolerance,
+):
     if position_frame is None or position_frame.empty:
         return [
             _skipped_check(name, date, "no_position_rows")
@@ -484,45 +930,55 @@ def _position_checks(date, summary_row, position_frame, abs_tolerance, rel_toler
         ]
 
     position_decomposition = _position_decomposition_series(position_frame)
+    holding_total = _sum_numeric_column(position_frame, "持仓盈亏")
+    transaction_total = _sum_numeric_column(position_frame, "交易盈亏")
+    mark_transaction_total = (
+        _sum_numeric_column(position_frame, "当日盯市交易盈亏")
+        if "当日盯市交易盈亏" in position_frame.columns
+        else None
+    )
+    decomposition_total = (
+        float(position_decomposition.sum()) if position_decomposition is not None else None
+    )
     option_mask = _position_option_mask(position_frame)
     hedge_mask = ~option_mask
     return [
         _check_value(
             "position_holding_sum",
             date,
-            _number(summary_row.get("持仓盈亏")),
-            _sum_numeric_column(position_frame, "持仓盈亏"),
+            _difference(total_daily_pnl, transaction_total),
+            holding_total,
             abs_tolerance,
             rel_tolerance,
         ),
         _check_value(
             "position_trade_sum",
             date,
-            _number(summary_row.get("交易盈亏")),
-            _sum_numeric_column(position_frame, "交易盈亏"),
+            _difference(total_daily_pnl, holding_total),
+            transaction_total,
             abs_tolerance,
             rel_tolerance,
         ),
         _check_value(
             "position_mark_trade_sum",
             date,
-            _number(summary_row.get("当日盯市交易盈亏")),
-            _sum_numeric_column(position_frame, "当日盯市交易盈亏"),
+            transaction_total,
+            mark_transaction_total,
             abs_tolerance,
             rel_tolerance,
         ),
         _check_value(
             "position_decomposition_sum",
             date,
-            _number(summary_row.get("当日盈亏分解合计")),
-            float(position_decomposition.sum()) if position_decomposition is not None else None,
+            total_daily_pnl,
+            decomposition_total,
             abs_tolerance,
             rel_tolerance,
         ),
         _check_value(
             "position_option_split",
             date,
-            _number(summary_row.get("期权单日盈亏")),
+            option_daily_pnl,
             (
                 float(position_decomposition.loc[option_mask].sum())
                 if position_decomposition is not None
@@ -534,7 +990,7 @@ def _position_checks(date, summary_row, position_frame, abs_tolerance, rel_toler
         _check_value(
             "position_hedge_split",
             date,
-            _summary_hedge_daily_pnl(summary_row),
+            hedge_daily_pnl,
             (
                 float(position_decomposition.loc[hedge_mask].sum())
                 if position_decomposition is not None
@@ -577,6 +1033,194 @@ def _account_position_snapshot_check(
         rel_tolerance,
         denominator=denominator,
     )
+
+
+def _trade_pnl_sum_check(
+    product,
+    date,
+    position_frame,
+    trade_frame,
+    abs_tolerance,
+    rel_tolerance,
+):
+    position_trade_pnl = (
+        None
+        if position_frame is None or position_frame.empty
+        else _sum_numeric_column(position_frame, "交易盈亏")
+    )
+    calculated = _trade_pnl_from_trade_rows(product, position_frame, trade_frame)
+    note = None
+    if trade_frame is None or trade_frame.empty:
+        note = "no_trade_rows"
+    return _check_value(
+        "trade_pnl_sum",
+        date,
+        position_trade_pnl,
+        calculated,
+        abs_tolerance,
+        rel_tolerance,
+        note=note,
+    )
+
+
+def _trade_pnl_from_trade_rows(product, position_frame, trade_frame):
+    if position_frame is None or position_frame.empty:
+        return None
+    if "交易盈亏" not in position_frame.columns:
+        return None
+    if trade_frame is None or trade_frame.empty:
+        return 0.0
+    required_trade = {"合约代码", "买卖", "成交数量", "成交价格"}
+    required_position = {"合约代码", "最新价", "到期日"}
+    if not required_trade.issubset(trade_frame.columns):
+        transaction_columns = {"合约代码", "成交数量", "成交价格"}
+        if transaction_columns.isdisjoint(trade_frame.columns):
+            return 0.0
+        return None
+    if not required_position.issubset(position_frame.columns):
+        return None
+
+    positions = position_frame.copy()
+    positions["_trade_pnl_code"] = positions["合约代码"].map(_position_code_key)
+    positions = positions.drop_duplicates("_trade_pnl_code", keep="last")
+    lookup = positions.set_index("_trade_pnl_code")
+    total = 0.0
+    has_trade = False
+    for _, trade in trade_frame.iterrows():
+        code = _position_code_key(trade.get("合约代码"))
+        trade_price = _number(trade.get("成交价格"))
+        qty = _number(trade.get("成交数量"))
+        if code == "" and trade_price is None and qty is None:
+            continue
+        if code == "" or code not in lookup.index:
+            return None
+        position = lookup.loc[code]
+        close_price = _number(position.get("最新价"))
+        if close_price is None or trade_price is None or qty is None:
+            return None
+        signed_qty = float(qty)
+        if "卖" in str(trade.get("买卖") or ""):
+            signed_qty = -signed_qty
+        multiplier = _contract_multiplier(product) if pd.notna(position.get("到期日")) else 1.0
+        total += signed_qty * (close_price - trade_price) * multiplier
+        has_trade = True
+    return float(total) if has_trade else 0.0
+
+
+def _position_market_value_identity_check(
+    product,
+    date,
+    previous_positions,
+    current_positions,
+    abs_tolerance,
+    rel_tolerance,
+):
+    values = _position_market_value_identity_values(
+        product,
+        previous_positions,
+        current_positions,
+    )
+    if values is None:
+        return _skipped_check("position_market_value_identity", date, "missing_value")
+    if values.get("missing_codes"):
+        return _skipped_check(
+            "position_market_value_identity",
+            date,
+            "missing_price_or_position:" + ",".join(values["missing_codes"]),
+        )
+    return _check_value(
+        "position_market_value_identity",
+        date,
+        values["market_value_diff"],
+        values["holding_pnl"] + values["trade_close_value"],
+        abs_tolerance,
+        rel_tolerance,
+    )
+
+
+def _position_market_value_identity_values(product, previous_positions, current_positions):
+    if (
+        previous_positions is None
+        or current_positions is None
+        or previous_positions.empty
+        or current_positions.empty
+    ):
+        return None
+    required = {"合约代码", "总持仓张数", "最新价", "持仓盈亏"}
+    if not required.issubset(current_positions.columns):
+        return None
+    if not {"合约代码", "总持仓张数", "最新价"}.issubset(previous_positions.columns):
+        return None
+
+    previous_lookup = _position_identity_lookup(previous_positions)
+    current_lookup = _position_identity_lookup(current_positions)
+    codes = sorted(set(previous_lookup) | set(current_lookup))
+    if not codes:
+        return None
+
+    market_value_diff = 0.0
+    holding_pnl = 0.0
+    trade_close_value = 0.0
+    missing_codes = []
+    for code in codes:
+        previous = previous_lookup.get(code)
+        current = current_lookup.get(code)
+        previous_qty = previous["qty"] if previous is not None else 0.0
+        current_qty = current["qty"] if current is not None else 0.0
+        previous_price = previous["price"] if previous is not None else None
+        current_price = current["price"] if current is not None else None
+        if previous_qty == 0.0 and current_qty == 0.0 and current is None:
+            continue
+        if current_price is None:
+            missing_codes.append(code)
+            continue
+        if previous_qty != 0.0 and previous_price is None:
+            missing_codes.append(code)
+            continue
+        multiplier = _contract_multiplier(product) if _identity_is_option(current, previous) else 1.0
+        previous_market_value = previous_qty * (previous_price or 0.0) * multiplier
+        current_market_value = current_qty * current_price * multiplier
+        market_value_diff += current_market_value - previous_market_value
+        holding_pnl += (current["holding_pnl"] if current is not None else 0.0)
+        trade_close_value += (current_qty - previous_qty) * current_price * multiplier
+
+    return {
+        "market_value_diff": float(market_value_diff),
+        "holding_pnl": float(holding_pnl),
+        "trade_close_value": float(trade_close_value),
+        "missing_codes": missing_codes,
+    }
+
+
+def _position_identity_lookup(frame):
+    lookup = {}
+    for _, row in frame.iterrows():
+        code = _position_code_key(row.get("合约代码"))
+        if not code:
+            continue
+        qty = _signed_report_position_qty(row)
+        price = _number(row.get("最新价"))
+        holding_pnl = _number(row.get("持仓盈亏")) or 0.0
+        lookup[code] = {
+            "qty": qty,
+            "price": price,
+            "holding_pnl": holding_pnl,
+            "is_option": pd.notna(row.get("到期日")) and str(row.get("到期日")).strip() != "",
+        }
+    return lookup
+
+
+def _signed_report_position_qty(row):
+    qty = float(_number(row.get("总持仓张数")) or 0.0)
+    direction = str(row.get("交易方向") or row.get("买卖") or "").strip()
+    if direction in {"空", "卖"} or "卖" in direction or direction.lower() == "short":
+        return -abs(qty)
+    return abs(qty)
+
+
+def _identity_is_option(current, previous):
+    row = current if current is not None else previous
+    return bool(row and row.get("is_option"))
 
 
 def _build_position_lifecycle_rows(
@@ -668,17 +1312,15 @@ def _position_lifecycle_row(
     holding_pnl = _sum_row_values(rows, "持仓盈亏")
     mark_trade_pnl = _sum_row_values(rows, "当日盯市交易盈亏")
     decomposition_pnl = _sum_lifecycle_decomposition(rows)
-    opening_mark_pnl = _opening_mark_pnl(product, first)
-    adjusted_decomposition = decomposition_pnl + opening_mark_pnl
+    opening_mark_pnl = 0.0
     trade_pnl = _sum_row_values(rows, "交易盈亏")
-    residual = trade_pnl - adjusted_decomposition if closed else None
-    denominator = abs(trade_pnl)
+    adjusted_decomposition = holding_pnl + trade_pnl
+    residual = decomposition_pnl - adjusted_decomposition if closed else None
+    if residual is not None and _strict_equal(residual, 0.0):
+        residual = 0.0
+    denominator = abs(decomposition_pnl)
     ratio = _safe_ratio(abs(residual), denominator) if residual is not None else None
-    tolerance = (
-        max(abs_tolerance, rel_tolerance * denominator)
-        if residual is not None
-        else None
-    )
+    tolerance = 0.0 if residual is not None else None
     return {
         "contract_code": _position_code_key(first.get("合约代码")),
         "contract_name": first.get("合约名称"),
@@ -692,7 +1334,7 @@ def _position_lifecycle_row(
         "decomposition_pnl": decomposition_pnl,
         "adjusted_decomposition_pnl": adjusted_decomposition,
         "trade_pnl": trade_pnl,
-        "actual": trade_pnl if closed else None,
+        "actual": decomposition_pnl if closed else None,
         "expected": adjusted_decomposition if closed else None,
         "residual": residual,
         "abs_residual": abs(residual) if residual is not None else None,
@@ -700,7 +1342,7 @@ def _position_lifecycle_row(
         "ratio": ratio,
         "tolerance": tolerance,
         "skipped": not closed,
-        "ok": True if not closed else abs(residual) <= tolerance,
+        "ok": True if not closed else _strict_equal(residual, 0.0),
         "note": None if closed else "open_lifecycle",
     }
 
@@ -713,7 +1355,7 @@ def _sum_lifecycle_decomposition(rows):
             total += explicit
         else:
             total += (_number(row.get("持仓盈亏")) or 0.0) + (
-                _number(row.get("当日盯市交易盈亏")) or 0.0
+                _number(row.get("交易盈亏")) or 0.0
             )
     return total
 
@@ -802,10 +1444,12 @@ def _aggregate_checks(rows):
                     "row_count": 0,
                     "skipped_count": skipped_count,
                     "skipped": True,
+                    "informational": _check_group(name) == "greeks_check",
                     "ok": True,
                 }
             )
             continue
+        informational = _check_group(name) == "greeks_check"
         residual = sum(check["residual"] for check in non_skipped)
         abs_residual = sum(abs(check["residual"]) for check in non_skipped)
         denominator = sum(abs(check.get("denominator") or 0.0) for check in non_skipped)
@@ -822,6 +1466,7 @@ def _aggregate_checks(rows):
                 "row_count": len(non_skipped),
                 "skipped_count": skipped_count,
                 "skipped": False,
+                "informational": informational,
                 "ok": all(check["ok"] for check in non_skipped),
             }
         )
@@ -881,7 +1526,7 @@ def _check_value(
     if actual is None or expected is None:
         return _skipped_check(name, date, "missing_value" if note is None else note)
     residual = float(actual) - float(expected)
-    if abs(residual) < 1e-8:
+    if _strict_equal(residual, 0.0):
         residual = 0.0
     denominator_value = (
         abs(float(denominator))
@@ -889,12 +1534,14 @@ def _check_value(
         else max(abs(float(actual)), abs(float(expected)))
     )
     ratio = _safe_ratio(abs(residual), denominator_value)
-    tolerance = max(abs_tolerance, denominator_value * rel_tolerance)
+    group = _check_group(name)
+    informational = group == "greeks_check"
+    tolerance = None if informational else 0.0
     return {
         "name": name,
         "label": label,
-        "group": _check_group(name),
-        "group_label": _check_group_label(name),
+        "group": group,
+        "group_label": CHECK_GROUP_LABELS[group],
         "date": str(date),
         "actual": float(actual),
         "expected": float(expected),
@@ -904,7 +1551,8 @@ def _check_value(
         "ratio": ratio,
         "tolerance": tolerance,
         "skipped": False,
-        "ok": abs(residual) <= tolerance,
+        "informational": informational,
+        "ok": True if informational else _strict_equal(residual, 0.0),
         "note": note,
     }
 
@@ -924,9 +1572,22 @@ def _skipped_check(name, date, note):
         "ratio": None,
         "tolerance": None,
         "skipped": True,
+        "informational": _check_group(name) == "greeks_check",
         "ok": True,
         "note": note,
     }
+
+
+def _strict_equal(left, right):
+    return abs(float(left) - float(right)) <= STRICT_EQUAL_EPSILON
+
+
+def _check_status_text(check):
+    if check.get("skipped"):
+        return "SKIP"
+    if check.get("informational"):
+        return "INFO"
+    return "Y" if check.get("ok") else "N"
 
 
 def _check_group(name):
@@ -1115,19 +1776,15 @@ def _position_decomposition_series(frame):
             return values.fillna(0.0)
     if "持仓盈亏" not in frame.columns:
         return None
-    if "当日盯市交易盈亏" not in frame.columns and "今日变化" in frame.columns:
-        changes = pd.to_numeric(frame["今日变化"], errors="coerce").fillna(0.0)
-        if changes.abs().gt(1e-9).any():
-            return None
     holding = pd.to_numeric(frame["持仓盈亏"], errors="coerce")
     if not holding.notna().any():
         return None
-    mark_trade = (
-        pd.to_numeric(frame["当日盯市交易盈亏"], errors="coerce").fillna(0.0)
-        if "当日盯市交易盈亏" in frame.columns
+    transaction = (
+        pd.to_numeric(frame["交易盈亏"], errors="coerce").fillna(0.0)
+        if "交易盈亏" in frame.columns
         else pd.Series(0.0, index=frame.index)
     )
-    return holding.fillna(0.0) + mark_trade
+    return holding.fillna(0.0) + transaction
 
 
 def _skip_new_position_pnl_decomposition(frame):
@@ -1199,6 +1856,74 @@ def _summary_net_daily_pnl(row):
 
 def _summary_hedge_daily_pnl(row):
     return _number(row.get("ETF单日盈亏"))
+
+
+def _report_close_to_close_greeks_pnl_without_vega(product, prev, current):
+    previous_spot = _number(prev.get("标的价格"))
+    current_spot = _number(current.get("标的价格"))
+    if previous_spot is None or current_spot is None:
+        return None
+    spot_change = current_spot - previous_spot
+
+    call_delta = _number(prev.get("Call Delta"))
+    put_delta = _number(prev.get("Put Delta"))
+    call_gamma = _number(prev.get("Call Gamma"))
+    put_gamma = _number(prev.get("Put Gamma"))
+    call_theta = _number(prev.get("Call Theta"))
+    put_theta = _number(prev.get("Put Theta"))
+    required = [
+        call_delta,
+        put_delta,
+        call_gamma,
+        put_gamma,
+        call_theta,
+        put_theta,
+    ]
+    if any(value is None for value in required):
+        return None
+
+    delta_pnl = (call_delta + put_delta) * spot_change
+    gamma_pnl = 0.5 * (call_gamma + put_gamma) * spot_change * spot_change
+    theta_pnl = (call_theta + put_theta) * _report_trading_day_step(
+        product,
+        prev,
+        current,
+    )
+    hedge_pnl = _report_close_to_close_hedge_greeks_pnl(prev, current)
+    if hedge_pnl is None:
+        return None
+    option_pnl = delta_pnl + gamma_pnl + theta_pnl
+    total = option_pnl + hedge_pnl
+    return {
+        "total": float(total),
+        "option": float(option_pnl),
+        "hedge": float(hedge_pnl),
+        "delta": float(delta_pnl + hedge_pnl),
+        "gamma": float(gamma_pnl),
+        "theta": float(theta_pnl),
+        "note": (
+            f"option={option_pnl:.6f};hedge={hedge_pnl:.6f};"
+            f"delta={delta_pnl:.6f};gamma={gamma_pnl:.6f};"
+            f"theta={theta_pnl:.6f};vega=ignored;"
+            "source=summary_report_fields"
+        ),
+    }
+
+
+def _report_trading_day_step(product, prev, current):
+    dates = pd.Series([prev.get("日期"), current.get("日期")])
+    steps = account_report._trading_day_steps(dates, product=product)
+    value = _number(steps.iloc[-1]) if len(steps) else None
+    return value if value is not None else 1.0
+
+
+def _report_close_to_close_hedge_greeks_pnl(prev, current):
+    start_price = _first_number(prev, "对冲最新价", "标的价格")
+    end_price = _first_number(current, "对冲最新价", "标的价格")
+    if start_price is None or end_price is None:
+        return None
+    previous_qty = _number(prev.get("对冲持仓")) or 0.0
+    return previous_qty * (end_price - start_price)
 
 
 def _option_greeks_pnl(prev, current):

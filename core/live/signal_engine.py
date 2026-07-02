@@ -210,12 +210,20 @@ def _load_market_context(config, date, quote_snapshot=None):
             latest_date,
             config,
         )
-        etf_by_date = core.data_loader.load_etf_series(
-            incremental_start,
-            latest_date,
-        )
         if quote_snapshot is not None:
+            try:
+                etf_by_date = core.data_loader.load_etf_series(
+                    incremental_start,
+                    latest_date,
+                )
+            except ValueError:
+                etf_by_date = {}
             etf_by_date[latest_date] = snapshot_etf
+        else:
+            etf_by_date = core.data_loader.load_etf_series(
+                incremental_start,
+                latest_date,
+            )
 
     latest_enriched = _build_latest_enriched_chain(
         etf_by_date,
@@ -992,19 +1000,37 @@ def _roll_payload(
         return None
 
     feature_atm_strike = feature_row.get("atm_strike", pd.NA)
+    atm_strike_source = "current_signal_row"
     if pd.isna(feature_atm_strike):
-        raise ValueError(
-            "Missing current ATM strike for roll mismatch check. "
-            "No strategy_state fallback is used."
-        )
+        feature_atm_strike = atm.get("strike") if atm is not None else pd.NA
+        atm_strike_source = "current_atm_selection"
+    if pd.isna(feature_atm_strike):
+        try:
+            feature_atm_strike, atm_strike_source = _atm_strike_for_roll_check(
+                product,
+                signals,
+                latest_date,
+                latest_date,
+            )
+        except ValueError:
+            return None
 
     dte_too_low = position_dte <= config.strategy.roll_dte_threshold
-    strike_roll_ready = core.vol_engine.spot_exceeds_one_strike_step(
-        position.get("strike"),
-        spot,
+    within_one_strike = core.vol_engine.strikes_within_chain_steps(
         chain_df,
-        fallback_atm_strike=feature_atm_strike,
+        position.get("strike"),
+        feature_atm_strike,
+        max_steps=1,
     )
+    if within_one_strike is None:
+        strike_roll_ready = core.vol_engine.spot_exceeds_one_strike_step(
+            position.get("strike"),
+            spot,
+            chain_df,
+            fallback_atm_strike=feature_atm_strike,
+        )
+    else:
+        strike_roll_ready = not within_one_strike
     if not dte_too_low and not strike_roll_ready:
         return None
 
@@ -1022,7 +1048,7 @@ def _roll_payload(
             "reason": "roll_condition_active_but_no_valid_target_atm",
             "roll_cooldown_left": cooldown_left,
             "strike_mismatch_days": mismatch_days,
-            "strike_mismatch_days_source": "current_signal_row",
+            "strike_mismatch_days_source": atm_strike_source,
             "strike_mismatch_trace": [],
             "latest_holding_snapshot_date": None,
             "snapshot_lag_days": None,
@@ -1040,7 +1066,7 @@ def _roll_payload(
         "reason": "+".join(reasons),
         "roll_cooldown_left": cooldown_left,
         "strike_mismatch_days": mismatch_days,
-        "strike_mismatch_days_source": "current_signal_row",
+        "strike_mismatch_days_source": atm_strike_source,
         "strike_mismatch_trace": [],
         "latest_holding_snapshot_date": None,
         "snapshot_lag_days": None,
@@ -1667,7 +1693,7 @@ def _hedge_advice(config, live_account, greeks, spot, chain_df, atm):
         chain_df,
         atm,
         action="DELTA_HEDGE",
-        option_action="OPTION_DELTA_HEDGE_SHORT_CALL",
+        option_action="ATM_STRADDLE_DELTA_REBALANCE",
         reason="Account delta exceeds tolerance.",
     )
 
@@ -1711,7 +1737,7 @@ def _final_hedge_advice(
         chain_df,
         atm,
         action="FINAL_DELTA_HEDGE",
-        option_action="FINAL_OPTION_DELTA_HEDGE_SHORT_CALL",
+        option_action="FINAL_ATM_STRADDLE_DELTA_REBALANCE",
         reason=(
             "After executing the option plan, projected account delta exceeds "
             "tolerance."
@@ -1788,6 +1814,24 @@ def _delta_hedge_plan(
 
     option_delta = float(greeks["delta"])
     current_hedge_qty = float(live_account.hedge.qty or 0.0)
+    spot = float(spot)
+    if (
+        not math.isfinite(option_delta)
+        or not math.isfinite(current_hedge_qty)
+        or not math.isfinite(spot)
+    ):
+        return [
+            {
+                "action": "DATA_WARNING",
+                "priority": "warning",
+                "reason": "Cannot evaluate delta hedge because account delta, ETF hedge quantity, or spot is not finite.",
+                "option_delta": option_delta if math.isfinite(option_delta) else None,
+                "current_hedge_qty": (
+                    current_hedge_qty if math.isfinite(current_hedge_qty) else None
+                ),
+                "estimated_price": spot if math.isfinite(spot) else None,
+            }
+        ]
     account_delta = option_delta + current_hedge_qty
     normalized_delta, delta_capacity = core.strategy.normalized_account_delta(
         account_delta,
@@ -1954,74 +1998,36 @@ def _delta_hedge_plan(
         )
         return plan
 
-    if getattr(config.strategy, "option_delta_hedge_combination_enabled", False):
-        combination_item = None
-        if _can_plan_option_delta_hedge_after(after_actions):
-            combination_item = _option_delta_hedge_combination_item(
-                config,
-                live_account,
-                chain_df,
-                residual_delta,
-                spot,
-                underlying_order_book_id,
-                after_actions=after_actions,
-                current_hedge_qty=etf_target_qty,
-                option_delta=option_delta,
-                final=action.startswith("FINAL_"),
-            )
-        if combination_item is not None:
-            if combination_item.get("action") == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
-                return [combination_item]
-            plan.append(combination_item)
-        else:
-            plan.append(
-                {
-                    "action": "DATA_WARNING",
-                    "priority": "warning",
-                    "reason": (
-                        "No liquid lightly-ITM option delta hedge is feasible with "
-                        "current short-call inventory and listed call contracts, "
-                        "or the core option position is already changing in this plan."
-                    ),
-                    "residual_delta": residual_delta,
-                    "after_actions": after_actions,
-                }
-            )
-        return plan
-
-    call_row = _select_itm_call_for_delta_hedge(
-        config,
-        chain_df,
-        spot,
-        atm,
-        exclude_call_codes=_existing_call_codes(live_account) | set(exclude_call_codes or []),
-    )
-    if call_row is None:
-        plan.append(
-            {
-                "action": "DATA_WARNING",
-                "priority": "warning",
-                "reason": "No valid lightly ITM call found for option delta hedge.",
-                "residual_delta": residual_delta,
-                "after_actions": after_actions,
-            }
-        )
-        return plan
-
-    plan.append(
-        _short_call_delta_hedge_item(
+    rebalance_item = None
+    if _can_plan_option_delta_hedge_after(after_actions):
+        rebalance_item = _atm_straddle_delta_rebalance_item(
             config,
-            option_action,
-            reason,
-            call_row,
+            live_account,
+            chain_df,
             residual_delta,
             spot,
+            atm,
             underlying_order_book_id,
             after_actions=after_actions,
             current_hedge_qty=etf_target_qty,
             option_delta=option_delta,
+            final=action.startswith("FINAL_"),
         )
-    )
+    if rebalance_item is not None:
+        plan.append(rebalance_item)
+    else:
+        plan.append(
+            {
+                "action": "DATA_WARNING",
+                "priority": "warning",
+                "reason": (
+                    "No feasible ATM straddle leg rebalance can reduce the residual "
+                    "positive delta while keeping the straddle market value stable."
+                ),
+                "residual_delta": residual_delta,
+                "after_actions": after_actions,
+            }
+        )
     return plan
 
 
@@ -2029,6 +2035,379 @@ def _can_plan_option_delta_hedge_after(after_actions):
     return not after_actions or all(
         action == "CLOSE_OPTION_HEDGE" for action in after_actions
     )
+
+
+def _atm_straddle_delta_rebalance_item(
+    config,
+    live_account,
+    chain_df,
+    residual_delta,
+    spot,
+    atm,
+    underlying_order_book_id,
+    after_actions=None,
+    current_hedge_qty=0.0,
+    option_delta=0.0,
+    final=False,
+):
+    short_position = (live_account.positions or {}).get("short")
+    if short_position is None:
+        return None
+    if not _position_is_atm_tolerated_main_straddle(
+        short_position,
+        chain_df,
+        spot,
+        atm,
+    ):
+        return None
+    try:
+        call_row, put_row = core.vol_engine.resolve_position_pair(
+            short_position,
+            chain_df,
+        )
+    except IndexError:
+        return None
+
+    current_call_qty = int(short_position.get("call_qty", 0) or 0)
+    current_put_qty = int(short_position.get("put_qty", 0) or 0)
+    if current_put_qty <= 0:
+        return None
+    call_price = _positive_float(call_row.get("mid"))
+    put_price = _positive_float(put_row.get("mid"))
+    multiplier = float(
+        call_row.get("contract_multiplier", config.vol.contract_multiplier)
+        or config.vol.contract_multiplier
+    )
+    if call_price is None or put_price is None or multiplier <= 0:
+        return None
+
+    call_capacity = core.position.liquidity_capacity(call_row)
+    one_call_delta_effect = -float(call_row.get("delta", 0.0) or 0.0) * multiplier
+    if one_call_delta_effect >= 0:
+        return None
+    needed_call_only = int(math.ceil(float(residual_delta) / abs(one_call_delta_effect)))
+    max_open_call = max(current_put_qty * 4, needed_call_only + current_put_qty, 1)
+    if call_capacity > 0:
+        max_open_call = min(max_open_call, call_capacity)
+
+    best = None
+    fallback_best = None
+    target_pair_qty = int(
+        getattr(config.strategy, "atm_rebalance_target_pair_qty", 10) or 10
+    )
+    target_pair_value = (
+        target_pair_qty * call_price + target_pair_qty * put_price
+    ) * multiplier
+    normalized_delta_tolerance = 0.05
+    for close_put_qty in range(0, current_put_qty + 1):
+        for open_call_qty in range(0, max_open_call + 1):
+            if close_put_qty <= 0 and open_call_qty <= 0:
+                continue
+            target_call_qty = current_call_qty + open_call_qty
+            target_put_qty = current_put_qty - close_put_qty
+            delta_effect = _atm_rebalance_greek_effect(
+                call_row,
+                put_row,
+                open_call_qty,
+                close_put_qty,
+                multiplier,
+                "delta",
+            )
+            projected_delta = float(residual_delta) + delta_effect
+            projected_capacity = max(target_call_qty, target_put_qty) * multiplier
+            normalized_projected_delta = (
+                abs(projected_delta) / projected_capacity
+                if projected_capacity > 0
+                else float("inf")
+            )
+            etf_delta_correction = (
+                core.strategy.round_etf_hedge_target(-projected_delta)
+                if projected_delta < 0
+                else 0.0
+            )
+            combined_delta = projected_delta + etf_delta_correction
+            normalized_combined_delta = (
+                abs(combined_delta) / projected_capacity
+                if projected_capacity > 0
+                else float("inf")
+            )
+            premium_effect = (
+                open_call_qty * call_price - close_put_qty * put_price
+            ) * multiplier
+            target_straddle_value = (
+                target_call_qty * call_price + target_put_qty * put_price
+            ) * multiplier
+            target_pair_value_error = target_straddle_value - target_pair_value
+            ratio_error = (
+                abs(float(target_call_qty) - float(target_put_qty))
+                / float(max(target_call_qty, target_put_qty))
+                if max(target_call_qty, target_put_qty) > 0
+                else float("inf")
+            )
+            call_qty_deviation = abs(target_call_qty - target_pair_qty)
+            put_qty_deviation = abs(target_put_qty - target_pair_qty)
+            target_pair_qty_deviation = call_qty_deviation + put_qty_deviation
+            target_pair_qty_deviation_balance = abs(
+                call_qty_deviation - put_qty_deviation
+            )
+            delta_tolerance_met = normalized_combined_delta < normalized_delta_tolerance
+            score = (
+                0 if delta_tolerance_met else 1,
+                0.0 if delta_tolerance_met else abs(combined_delta),
+                target_pair_qty_deviation_balance,
+                target_pair_qty_deviation,
+                abs(target_pair_value_error),
+                open_call_qty + close_put_qty,
+            )
+            fallback_score = (
+                abs(combined_delta),
+                target_pair_qty_deviation_balance,
+                target_pair_qty_deviation,
+                abs(target_pair_value_error),
+                open_call_qty + close_put_qty,
+            )
+            candidate = {
+                "open_call_qty": open_call_qty,
+                "close_put_qty": close_put_qty,
+                "delta_effect": delta_effect,
+                "projected_delta": projected_delta,
+                "normalized_projected_delta": normalized_projected_delta,
+                "etf_delta_correction": etf_delta_correction,
+                "combined_delta": combined_delta,
+                "normalized_combined_delta": normalized_combined_delta,
+                "premium_effect": premium_effect,
+                "ratio_error": ratio_error,
+                "target_pair_qty": target_pair_qty,
+                "target_pair_qty_deviation": target_pair_qty_deviation,
+                "target_pair_qty_deviation_balance": target_pair_qty_deviation_balance,
+                "target_pair_value": target_pair_value,
+                "target_straddle_value": target_straddle_value,
+                "target_pair_value_error": target_pair_value_error,
+                "delta_tolerance_met": delta_tolerance_met,
+                "score": score,
+                "fallback_score": fallback_score,
+            }
+            if best is None or score < best["score"]:
+                best = candidate
+            if fallback_best is None or fallback_score < fallback_best["fallback_score"]:
+                fallback_best = candidate
+    if best is None:
+        best = fallback_best
+    if best is None:
+        return None
+
+    target_call_qty = current_call_qty + best["open_call_qty"]
+    target_put_qty = current_put_qty - best["close_put_qty"]
+    current_margin = _current_short_margin(
+        config,
+        short_position,
+        call_row,
+        put_row,
+        spot,
+    )
+    target_margin = core.position.calc_short_margin(
+        call_row,
+        put_row,
+        target_call_qty,
+        target_put_qty,
+        spot,
+    )
+    fee = core.position.calc_option_fee(
+        best["open_call_qty"],
+        best["close_put_qty"],
+        config.backtest.option_fee_per_contract,
+    )
+    cash_delta = best["premium_effect"] - fee
+    etf_correction_cost = float(best["etf_delta_correction"]) * float(spot) * (
+        1.0 + float(config.backtest.etf_fee_rate)
+    )
+    projected_cash = float(live_account.cash) + cash_delta - etf_correction_cost
+    min_cash = float(config.backtest.min_cash_reserve)
+    if projected_cash < min_cash:
+        return {
+            "action": "DATA_WARNING",
+            "priority": "warning",
+            "reason": "Planned ATM straddle delta rebalance would breach the live cash reserve.",
+            "projected_cash": projected_cash,
+            "min_cash_reserve": min_cash,
+        }
+
+    gamma_effect = _atm_rebalance_greek_effect(
+        call_row,
+        put_row,
+        best["open_call_qty"],
+        best["close_put_qty"],
+        multiplier,
+        "gamma",
+    )
+    vega_effect = _atm_rebalance_greek_effect(
+        call_row,
+        put_row,
+        best["open_call_qty"],
+        best["close_put_qty"],
+        multiplier,
+        "vega",
+    )
+    theta_effect = _atm_rebalance_greek_effect(
+        call_row,
+        put_row,
+        best["open_call_qty"],
+        best["close_put_qty"],
+        multiplier,
+        "theta",
+    )
+    combined_delta = best["combined_delta"]
+    item = {
+        "action": (
+            "FINAL_ATM_STRADDLE_DELTA_REBALANCE"
+            if final
+            else "ATM_STRADDLE_DELTA_REBALANCE"
+        ),
+        "priority": "action",
+        "side": "short",
+        "reason": (
+            "ETF hedge is reduced to zero and residual positive delta remains; "
+            "rebalance only the current ATM short straddle legs to minimize delta "
+            "while preserving total option market value."
+        ),
+        "close_source": "core_short_put",
+        "close_put_code": put_row.get("order_book_id"),
+        "close_put_qty": best["close_put_qty"],
+        "estimated_close_put_price": put_price,
+        "open_call_code": call_row.get("order_book_id"),
+        "open_call_qty": best["open_call_qty"],
+        "estimated_open_call_price": call_price,
+        "current_call_code": call_row.get("order_book_id"),
+        "current_put_code": put_row.get("order_book_id"),
+        "current_call_qty": current_call_qty,
+        "current_put_qty": current_put_qty,
+        "target_call_code": call_row.get("order_book_id"),
+        "target_put_code": put_row.get("order_book_id"),
+        "target_call_qty": target_call_qty,
+        "target_put_qty": target_put_qty,
+        "strike": float(short_position.get("strike", call_row.get("strike_price"))),
+        "expiry": short_position.get("expiry")
+        or str(pd.Timestamp(call_row.get("maturity_date")).date()),
+        "estimated_delta_effect": best["delta_effect"],
+        "estimated_gamma_effect": gamma_effect,
+        "estimated_vega_effect": vega_effect,
+        "estimated_theta_effect": theta_effect,
+        "residual_delta_before_option_hedge": residual_delta,
+        "projected_account_delta_after_option_hedge": best["projected_delta"],
+        "etf_delta_correction": best["etf_delta_correction"],
+        "projected_account_delta_after_combined_hedge": combined_delta,
+        "option_delta": option_delta,
+        "current_hedge_qty": current_hedge_qty,
+        "target_hedge_qty": current_hedge_qty + best["etf_delta_correction"],
+        "trade_etf_qty": best["etf_delta_correction"],
+        "estimated_price": float(spot),
+        "estimated_fee": fee,
+        "estimated_cash_effect": cash_delta,
+        "estimated_etf_correction_cost": etf_correction_cost,
+        "estimated_option_margin": target_margin,
+        "estimated_margin_change": target_margin - current_margin,
+        "estimated_market_value_effect": best["premium_effect"],
+        "market_value_preservation_error": abs(best["premium_effect"]),
+        "target_call_put_ratio_error": best["ratio_error"],
+        "target_pair_qty": best["target_pair_qty"],
+        "target_pair_qty_deviation": best["target_pair_qty_deviation"],
+        "target_pair_qty_deviation_balance": best["target_pair_qty_deviation_balance"],
+        "target_pair_market_value": best["target_pair_value"],
+        "target_straddle_market_value": best["target_straddle_value"],
+        "target_pair_market_value_error": best["target_pair_value_error"],
+        "normalized_projected_delta": best["normalized_projected_delta"],
+        "normalized_combined_delta": best["normalized_combined_delta"],
+        "normalized_delta_tolerance": normalized_delta_tolerance,
+        "delta_tolerance_met": best["delta_tolerance_met"],
+        "projected_cash_after": projected_cash,
+        "min_cash_reserve": min_cash,
+        "solver_priority": (
+            "normalized_delta_lt_0.05_then_target_pair_qty_deviation_balance_then_deviation_then_market_value"
+        ),
+        "underlying_order_book_id": underlying_order_book_id,
+        "open_legs": [
+            {
+                "order_book_id": call_row.get("order_book_id"),
+                "option_type": "c",
+                "qty": best["open_call_qty"],
+                "estimated_price": call_price,
+                "strike": float(call_row.get("strike_price")),
+                "volume": call_row.get("volume"),
+                "liquidity_capacity": call_capacity,
+            }
+        ],
+    }
+    if after_actions is not None:
+        item["after_actions"] = after_actions
+    return item
+
+
+def _position_is_atm_tolerated_main_straddle(position, chain_df, spot, atm):
+    if atm is None:
+        return False
+    call = atm.get("call")
+    put = atm.get("put")
+    if call is None or put is None:
+        return False
+    if str(position.get("call_code")) == str(call.get("order_book_id")) and str(
+        position.get("put_code")
+    ) == str(put.get("order_book_id")):
+        return True
+
+    try:
+        position_strike = float(position.get("strike"))
+        atm_strike = float(atm.get("strike"))
+    except (TypeError, ValueError):
+        return False
+    if math.isnan(position_strike) or math.isnan(atm_strike):
+        return False
+
+    within_one_strike = core.vol_engine.strikes_within_chain_steps(
+        chain_df,
+        position_strike,
+        atm_strike,
+        max_steps=1,
+    )
+    if within_one_strike is not None:
+        return within_one_strike
+
+    step = core.vol_engine.strike_step_from_chain(chain_df, atm_strike)
+    if step is None or step <= 0:
+        try:
+            return math.isclose(position_strike, float(spot)) or math.isclose(
+                position_strike,
+                atm_strike,
+            )
+        except (TypeError, ValueError):
+            return math.isclose(position_strike, atm_strike)
+    deviation = abs(position_strike - atm_strike)
+    return deviation < float(step) or math.isclose(deviation, float(step))
+
+
+def _positive_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or number <= 0:
+        return None
+    return number
+
+
+def _atm_rebalance_greek_effect(
+    call_row,
+    put_row,
+    open_call_qty,
+    close_put_qty,
+    multiplier,
+    greek_key,
+):
+    call_value = float(call_row.get(greek_key, 0.0) or 0.0)
+    put_value = float(put_row.get(greek_key, 0.0) or 0.0)
+    return (
+        -float(open_call_qty) * call_value
+        + float(close_put_qty) * put_value
+    ) * float(multiplier)
 
 
 def _close_existing_option_hedge_plan(live_account, chain_df, account_greeks):
@@ -2064,249 +2443,6 @@ def _close_existing_option_hedge_plan(live_account, chain_df, account_greeks):
     return close_items, core_greeks
 
 
-def _option_delta_hedge_combination_item(
-    config,
-    live_account,
-    chain_df,
-    residual_delta,
-    spot,
-    underlying_order_book_id,
-    after_actions=None,
-    current_hedge_qty=0.0,
-    option_delta=0.0,
-    final=False,
-):
-    sources = _short_call_close_sources(live_account, chain_df)
-    if not sources:
-        return None
-
-    candidates = chain_df.copy()
-    candidates = candidates[candidates["option_type"].astype(str).str.lower().eq("c")]
-    candidates = candidates[pd.to_numeric(candidates["mid"], errors="coerce") > 0]
-    candidates = candidates[pd.to_numeric(candidates["delta"], errors="coerce") > 0]
-    candidates = candidates[pd.to_numeric(candidates["gamma"], errors="coerce") > 0]
-    existing_call_codes = _existing_call_codes(live_account)
-    candidates = candidates[
-        ~candidates["order_book_id"].astype(str).isin(existing_call_codes)
-    ]
-    if candidates.empty:
-        return None
-
-    best = None
-    for source in sources:
-        source_row = source["row"]
-        source_code = str(source_row.get("order_book_id"))
-        same_expiry = candidates[
-            pd.to_datetime(candidates["maturity_date"]).dt.normalize().eq(
-                pd.Timestamp(source_row.get("maturity_date")).normalize()
-            )
-        ]
-        same_expiry = _light_itm_call_candidates(config, same_expiry, spot)
-        same_expiry = same_expiry[
-            ~same_expiry["order_book_id"].astype(str).eq(source_code)
-            & (
-                pd.to_numeric(same_expiry["contract_multiplier"], errors="coerce")
-                == float(source_row.get("contract_multiplier"))
-            )
-        ]
-        solution = core.position.solve_liquid_call_delta_hedge(
-            source,
-            [row for _, row in same_expiry.iterrows()],
-            residual_delta,
-        )
-        if solution is not None and (best is None or solution["score"] < best["score"]):
-            best = {
-                **solution,
-                "source": source,
-            }
-    if best is None:
-        return None
-
-    source = best["source"]
-    open_legs = best["open_legs"]
-    primary_open_row = open_legs[0]["row"]
-    open_qty = int(best["open_qty"])
-    close_qty = best["close_qty"]
-    close_price = float(source["row"].get("mid"))
-    fee = core.position.calc_option_fee(open_qty + close_qty, 0, config.backtest.option_fee_per_contract)
-    margin = sum(
-        core.position.margin_call(
-            float(spot),
-            float(leg["row"].get("strike_price")),
-            float(leg["row"].get("mid")),
-            float(leg["row"].get("contract_multiplier", config.vol.contract_multiplier)),
-        ) * int(leg["qty"])
-        for leg in open_legs
-    )
-    open_value = sum(
-        float(leg["row"].get("mid"))
-        * int(leg["qty"])
-        * float(
-            leg["row"].get(
-                "contract_multiplier",
-                config.vol.contract_multiplier,
-            )
-        )
-        for leg in open_legs
-    )
-    close_value = (
-        close_price
-        * int(close_qty)
-        * float(source["row"].get("contract_multiplier", config.vol.contract_multiplier))
-    )
-    close_margin_release = core.position.margin_call(
-        float(spot),
-        float(source["row"].get("strike_price")),
-        close_price,
-        float(source["row"].get("contract_multiplier", config.vol.contract_multiplier)),
-    ) * int(close_qty)
-    etf_buy_qty = core.strategy.round_etf_hedge_target(best["etf_buy_qty"])
-    combined_delta = float(best["projected_delta"]) + float(etf_buy_qty)
-    executable_delta_tolerance = core.strategy.ETF_HEDGE_LOT_SIZE / 2.0
-    etf_correction_cost = float(etf_buy_qty) * float(spot) * (
-        1.0 + float(config.backtest.etf_fee_rate)
-    )
-    estimated_cash_effect = (
-        close_margin_release
-        + open_value
-        - close_value
-        - fee
-        - margin
-        - etf_correction_cost
-    )
-    etf_reduction_cash_effect = max(0.0, float(live_account.hedge.qty or 0.0)) * float(
-        spot
-    ) * (1.0 - float(config.backtest.etf_fee_rate))
-    projected_cash = (
-        float(live_account.cash)
-        + etf_reduction_cash_effect
-        + estimated_cash_effect
-    )
-    min_cash = float(config.backtest.min_cash_reserve)
-    if projected_cash < min_cash:
-        reduction_item = _live_capacity_reduction_item(
-            config,
-            live_account,
-            chain_df,
-            spot,
-            required_cash_relief=min_cash - projected_cash,
-            reason=(
-                "Reduce the short straddle before the planned option-combination "
-                "delta hedge would breach the live cash reserve."
-            ),
-        )
-        if reduction_item is not None:
-            return reduction_item
-        return {
-            "action": "DATA_WARNING",
-            "priority": "warning",
-            "reason": (
-                "Planned option-combination delta hedge would breach the live "
-                "cash reserve."
-            ),
-            "projected_cash": projected_cash,
-            "min_cash_reserve": min_cash,
-        }
-    item = {
-        "action": (
-            "FINAL_OPTION_DELTA_HEDGE_COMBINATION"
-            if final
-            else "OPTION_DELTA_HEDGE_COMBINATION"
-        ),
-        "priority": "action",
-        "side": "short",
-        "reason": (
-            "Use liquid lightly-ITM calls to minimize account delta, then minimize "
-            "the resulting gamma change."
-        ),
-        "close_source": source["kind"],
-        "close_call_code": source["row"].get("order_book_id"),
-        "close_call_qty": close_qty,
-        "estimated_close_call_price": close_price,
-        "open_call_code": primary_open_row.get("order_book_id"),
-        "open_call_qty": open_qty,
-        "estimated_open_call_price": float(primary_open_row.get("mid")),
-        "open_strike": float(primary_open_row.get("strike_price")),
-        "open_expiry": str(pd.Timestamp(primary_open_row.get("maturity_date")).date()),
-        "open_legs": [
-            {
-                "order_book_id": leg["row"].get("order_book_id"),
-                "qty": int(leg["qty"]),
-                "estimated_price": float(leg["row"].get("mid")),
-                "strike": float(leg["row"].get("strike_price")),
-                "volume": float(leg["row"].get("volume")),
-                "liquidity_capacity": int(leg["liquidity_capacity"]),
-            }
-            for leg in open_legs
-        ],
-        "estimated_delta_effect": best["delta_effect"],
-        "estimated_gamma_effect": best["gamma_effect"],
-        "residual_delta_before_option_hedge": residual_delta,
-        "projected_account_delta_after_option_hedge": best["projected_delta"],
-        "etf_delta_correction": etf_buy_qty,
-        "projected_account_delta_after_combined_hedge": combined_delta,
-        "option_delta": option_delta,
-        "current_hedge_qty": current_hedge_qty,
-        "target_hedge_qty": current_hedge_qty + etf_buy_qty,
-        "trade_etf_qty": etf_buy_qty,
-        "estimated_price": float(spot),
-        "estimated_fee": fee,
-        "estimated_option_margin": margin,
-        "estimated_close_margin_release": close_margin_release,
-        "estimated_cash_effect": estimated_cash_effect,
-        "preceding_etf_reduction_cash_effect": etf_reduction_cash_effect,
-        "estimated_etf_correction_cost": etf_correction_cost,
-        "projected_cash_after": projected_cash,
-        "min_cash_reserve": min_cash,
-        "open_liquidity_capacity": sum(
-            int(leg["liquidity_capacity"]) for leg in open_legs
-        ),
-        "close_liquidity_capacity": best["close_liquidity_capacity"],
-        "solver_priority": "liquidity_then_delta_then_gamma",
-        "delta_neutral_achieved": abs(combined_delta) <= executable_delta_tolerance,
-        "executable_delta_tolerance": executable_delta_tolerance,
-        "liquidity_capacity_exhausted": best["liquidity_capacity_exhausted"],
-        "underlying_order_book_id": underlying_order_book_id,
-    }
-    if after_actions is not None:
-        item["after_actions"] = after_actions
-    return item
-
-
-def _short_call_close_sources(live_account, chain_df):
-    sources = []
-    short_position = live_account.positions.get("short")
-    if short_position is not None and int(short_position.get("call_qty", 0) or 0) > 0:
-        try:
-            row = _chain_row(chain_df, short_position.get("call_code"))
-            sources.append(
-                {
-                    "kind": "core_short_call",
-                    "max_qty": int(short_position.get("call_qty", 0) or 0),
-                    "row": row,
-                }
-            )
-        except IndexError:
-            pass
-    for hedge in getattr(live_account, "option_hedges", []) or []:
-        if str(hedge.get("side")).lower() != "short":
-            continue
-        if str(hedge.get("option_type")).lower() != "c":
-            continue
-        try:
-            row = _chain_row(chain_df, hedge.get("order_book_id"))
-            sources.append(
-                {
-                    "kind": "option_hedge_short_call",
-                    "max_qty": int(hedge.get("qty", 0) or 0),
-                    "row": row,
-                }
-            )
-        except IndexError:
-            pass
-    return sources
-
-
 def _etf_hedge_item(
     action,
     reason,
@@ -2337,132 +2473,6 @@ def _etf_hedge_item(
     if after_actions is not None:
         item["after_actions"] = after_actions
     return item
-
-
-def _short_call_delta_hedge_item(
-    config,
-    action,
-    reason,
-    call_row,
-    residual_delta,
-    spot,
-    underlying_order_book_id,
-    after_actions=None,
-    current_hedge_qty=0.0,
-    option_delta=0.0,
-):
-    raw_delta = float(call_row.get("delta"))
-    multiplier = float(call_row.get("contract_multiplier", config.vol.contract_multiplier))
-    hedge_delta_per_contract = -raw_delta * multiplier
-    qty = int(math.ceil(residual_delta / abs(hedge_delta_per_contract)))
-    hedge_delta = hedge_delta_per_contract * qty
-    estimated_price = float(call_row.get("mid"))
-    fee = core.position.calc_option_fee(qty, 0, config.backtest.option_fee_per_contract)
-    margin = core.position.margin_call(
-        float(spot),
-        float(call_row.get("strike_price")),
-        estimated_price,
-        multiplier,
-    ) * qty
-    cash_effect = estimated_price * qty * multiplier - fee - margin
-    item = {
-        "action": action,
-        "priority": "action",
-        "side": "short",
-        "reason": reason,
-        "option_hedge_type": "short_otm_call",
-        "call_code": call_row.get("order_book_id"),
-        "put_code": None,
-        "strike": float(call_row.get("strike_price")),
-        "expiry": str(pd.Timestamp(call_row.get("maturity_date")).date()),
-        "call_qty": qty,
-        "put_qty": 0,
-        "estimated_call_price": estimated_price,
-        "estimated_put_price": None,
-        "single_call_delta": -raw_delta,
-        "hedge_delta_per_contract": hedge_delta_per_contract,
-        "estimated_hedge_delta": hedge_delta,
-        "residual_delta_before_option_hedge": residual_delta,
-        "projected_account_delta_after_option_hedge": residual_delta + hedge_delta,
-        "option_delta": option_delta,
-        "current_hedge_qty": current_hedge_qty,
-        "target_hedge_qty": current_hedge_qty,
-        "trade_etf_qty": 0.0,
-        "estimated_fee": fee,
-        "estimated_option_margin": margin,
-        "estimated_cash_effect": cash_effect,
-        "underlying_order_book_id": underlying_order_book_id or call_row.get("underlying_order_book_id"),
-        "contract_symbol": call_row.get("contract_symbol"),
-        "contract_multiplier": multiplier,
-    }
-    if action.startswith("FINAL_"):
-        item["planned_option_delta"] = option_delta
-        item["planned_account_delta"] = option_delta + current_hedge_qty
-    if after_actions is not None:
-        item["after_actions"] = after_actions
-    return item
-
-
-def _light_itm_call_candidates(config, calls, spot):
-    if calls.empty:
-        return calls
-    calls = core.vol_engine.filter_standard_option_contracts(calls).copy()
-    calls["_strike"] = pd.to_numeric(calls["strike_price"], errors="coerce")
-    calls["_volume"] = pd.to_numeric(calls.get("volume"), errors="coerce").fillna(-1.0)
-    max_itm_ratio = float(
-        getattr(config.strategy, "option_delta_hedge_max_itm_ratio", 0.10)
-    )
-    calls = calls[
-        (calls["_strike"] < float(spot))
-        & (calls["_strike"] >= float(spot) * (1.0 - max_itm_ratio))
-    ]
-    calls["_liquidity_capacity"] = calls.apply(
-        core.position.liquidity_capacity,
-        axis=1,
-    )
-    return calls[calls["_liquidity_capacity"] > 0].sort_values(
-        "_volume",
-        ascending=False,
-    )
-
-
-def _select_itm_call_for_delta_hedge(config, chain_df, spot, atm, exclude_call_codes=None):
-    if chain_df is None or chain_df.empty:
-        return None
-    calls = chain_df.copy()
-    calls = calls[calls["option_type"].astype(str).str.lower().eq("c")]
-    calls = calls[calls["contract_multiplier"] == config.vol.contract_multiplier]
-    if exclude_call_codes:
-        calls = calls[~calls["order_book_id"].astype(str).isin({str(code) for code in exclude_call_codes})]
-    calls = calls[pd.to_numeric(calls["delta"], errors="coerce") > 0]
-    calls = calls[pd.to_numeric(calls["mid"], errors="coerce") > 0]
-    if calls.empty:
-        return None
-
-    if atm is not None and atm.get("expiry") is not None:
-        expiry = pd.Timestamp(atm.get("expiry")).normalize()
-        same_expiry = calls[pd.to_datetime(calls["maturity_date"]).dt.normalize().eq(expiry)]
-        if not same_expiry.empty:
-            calls = same_expiry
-
-    calls = _light_itm_call_candidates(config, calls, spot)
-    if calls.empty:
-        return None
-    return calls.iloc[0]
-
-
-def _existing_call_codes(live_account):
-    codes = set()
-    for position in live_account.positions.values():
-        if position is not None and position.get("call_code") is not None:
-            codes.add(str(position.get("call_code")))
-    for position in getattr(live_account, "option_hedges", []) or []:
-        option_type = str(position.get("option_type") or "").lower()
-        if option_type == "c" and position.get("order_book_id") is not None:
-            codes.add(str(position.get("order_book_id")))
-        if position.get("call_code") is not None:
-            codes.add(str(position.get("call_code")))
-    return codes
 
 
 def _planned_call_codes(option_actions):

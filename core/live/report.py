@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from . import etf_netting, storage
+import pandas as pd
+
+from . import etf_netting, option_netting, storage
 
 
 def write_signal_report(product, signal_payload):
@@ -8,29 +10,47 @@ def write_signal_report(product, signal_payload):
     path = storage.output_dir(product) / f"{stamp}_signal.md"
     rows, notices = _execution_rows(signal_payload)
     reasons = _advice_reason_lines(signal_payload)
+    greek_impact_rows = _option_hedge_greek_impact_rows(signal_payload)
     lines = [
         f"# Live Signal: {product}",
     ]
     if reasons:
         lines.extend(["", "## Reasons", ""])
         lines.extend(f"- {reason}" for reason in reasons)
+    if greek_impact_rows:
+        lines.extend(
+            [
+                "",
+                "## Option Hedge Greek Impact",
+                "",
+                "| Greek | 对冲前 | 期权影响 | 影响/原值 | 对冲后 |",
+                "| --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in greek_impact_rows:
+            lines.append(
+                f"| {row['Greek']} | {_fmt(row['对冲前'])} | "
+                f"{_fmt(row['期权影响'])} | {_fmt_pct(row['影响/原值'])} | "
+                f"{_fmt(row['对冲后'])} |"
+            )
     lines.extend(
         [
             "",
             "## Execution Plan",
             "",
-            "| 执行顺序 | 合约代码 | 方向 | 数量 | 执行价格 |",
-            "| ---: | --- | --- | ---: | ---: |",
+            "| 执行顺序 | 合约代码 | 方向 | 数量 | 执行后预计数量 | 执行价格 |",
+            "| ---: | --- | --- | ---: | ---: | ---: |",
         ]
     )
     if rows:
         for row in rows:
             lines.append(
-                f"| {row['执行顺序']} | {row['合约代码']} | {row['方向']} | "
-                f"{_fmt_qty(row['数量'])} | {_fmt(row['执行价格'])} |"
+                f"| {row['执行顺序']} | {_contract_display(row)} | {row['方向']} | "
+                f"{_fmt_qty(row['数量'])} | {_fmt_qty(row['执行后预计数量'])} | "
+                f"{_fmt(row['执行价格'])} |"
             )
     else:
-        lines.append("| - | - | 无操作 | 0 | - |")
+        lines.append("| - | - | 无操作 | 0 | - | - |")
     if notices:
         lines.extend(["", "## Notices", ""])
         lines.extend(f"- {notice}" for notice in notices)
@@ -43,13 +63,23 @@ def format_signal_summary(signal_payload):
     """Return terminal-friendly live advice lines for manual execution."""
     rows, notices = _execution_rows(signal_payload)
     lines = _advice_reason_lines(signal_payload)
-    lines.append("执行顺序 | 合约代码 | 方向 | 数量 | 执行价格")
+    greek_impact_rows = _option_hedge_greek_impact_rows(signal_payload)
+    if greek_impact_rows:
+        lines.append("期权对冲Greeks影响 | Greek | 对冲前 | 期权影响 | 影响/原值 | 对冲后")
+        for row in greek_impact_rows:
+            lines.append(
+                f"期权对冲Greeks影响 | {row['Greek']} | {_fmt(row['对冲前'])} | "
+                f"{_fmt(row['期权影响'])} | {_fmt_pct(row['影响/原值'])} | "
+                f"{_fmt(row['对冲后'])}"
+            )
+    lines.append("执行顺序 | 合约代码 | 方向 | 数量 | 执行后预计数量 | 执行价格")
     if not rows:
-        lines.append("- | - | 无操作 | 0 | -")
+        lines.append("- | - | 无操作 | 0 | - | -")
     for row in rows:
         lines.append(
-            f"{row['执行顺序']} | {row['合约代码']} | {row['方向']} | "
-            f"{_fmt_qty(row['数量'])} | {_fmt(row['执行价格'])}"
+            f"{row['执行顺序']} | {_contract_display(row)} | {row['方向']} | "
+            f"{_fmt_qty(row['数量'])} | {_fmt_qty(row['执行后预计数量'])} | "
+            f"{_fmt(row['执行价格'])}"
         )
     lines.extend(f"提示: {notice}" for notice in notices)
     return lines
@@ -61,6 +91,104 @@ def _advice_reason_lines(signal_payload):
         for item in signal_payload.get("advice", [])
         if item.get("reason")
     ]
+
+
+OPTION_HEDGE_GREEK_IMPACT_ACTIONS = {
+    "ATM_STRADDLE_DELTA_REBALANCE",
+    "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
+}
+
+
+def _option_hedge_greek_impact_rows(signal_payload):
+    advice = signal_payload.get("advice", []) or []
+    items = [
+        item
+        for item in advice
+        if item.get("action") in OPTION_HEDGE_GREEK_IMPACT_ACTIONS
+    ]
+    if not items:
+        return []
+
+    greeks = signal_payload.get("planned_account_greeks") or signal_payload.get(
+        "account_greeks"
+    ) or {}
+    delta_before = _first_number(
+        items,
+        "residual_delta_before_option_hedge",
+        "planned_account_delta",
+        "account_delta",
+    )
+    if delta_before is None:
+        delta_before = _number(greeks.get("delta"))
+    delta_effect = sum(
+        _number(item.get("estimated_delta_effect"))
+        if _number(item.get("estimated_delta_effect")) is not None
+        else _number(item.get("estimated_hedge_delta")) or 0.0
+        for item in items
+    )
+    etf_correction = sum(_number(item.get("etf_delta_correction")) or 0.0 for item in items)
+    delta_after = _last_number(
+        items,
+        "projected_account_delta_after_combined_hedge",
+        "projected_account_delta_after_option_hedge",
+    )
+    if delta_after is None and delta_before is not None:
+        delta_after = delta_before + delta_effect + etf_correction
+
+    rows = [
+        _greek_impact_row("Delta", delta_before, delta_effect, delta_after),
+    ]
+    for label, key in [("Gamma", "gamma"), ("Vega", "vega"), ("Theta", "theta")]:
+        before = _first_number(items, f"planned_account_{key}", f"account_{key}")
+        if before is None:
+            before = _number(greeks.get(key))
+        effect = sum(
+            _number(item.get(f"estimated_{key}_effect")) or 0.0 for item in items
+        )
+        after = None if before is None else before + effect
+        rows.append(_greek_impact_row(label, before, effect, after))
+
+    return [
+        row
+        for row in rows
+        if row["对冲前"] is not None or abs(float(row["期权影响"] or 0.0)) > 1e-12
+    ]
+
+
+def _greek_impact_row(label, before, effect, after):
+    return {
+        "Greek": label,
+        "对冲前": before,
+        "期权影响": effect,
+        "影响/原值": _safe_ratio(effect, before),
+        "对冲后": after,
+    }
+
+
+def _first_number(items, *keys):
+    for item in items:
+        for key in keys:
+            value = _number(item.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _last_number(items, *keys):
+    for item in reversed(items):
+        for key in keys:
+            value = _number(item.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _safe_ratio(numerator, denominator):
+    numerator = _number(numerator)
+    denominator = _number(denominator)
+    if numerator is None or denominator is None or abs(denominator) <= 1e-12:
+        return None
+    return numerator / denominator
 
 
 def _execution_rows(signal_payload):
@@ -76,9 +204,121 @@ def _execution_rows(signal_payload):
             notices.append(f"{item.get('action')}: {item.get('reason')}")
     for item in netted_etf_items:
         rows.extend(_advice_execution_rows(item, include_etf=True))
+    rows = option_netting.net_exact_report_rows(rows)
+    _annotate_projected_quantities(rows, signal_payload)
+    _annotate_contract_symbols(rows, signal_payload)
     for index, row in enumerate(rows, start=1):
         row["执行顺序"] = index
     return rows, notices
+
+
+def _annotate_projected_quantities(rows, signal_payload):
+    quantities = _initial_display_quantities(signal_payload)
+    for row in rows:
+        code = str(row.get("合约代码") or "")
+        if not code:
+            row["执行后预计数量"] = None
+            continue
+        current_qty = float(quantities.get(code, 0.0) or 0.0)
+        trade_qty = _number(row.get("数量")) or 0.0
+        direction = row.get("方向")
+        if direction in {"买入开仓", "卖出开仓", "买入"}:
+            current_qty += trade_qty
+        elif direction in {"买入平仓", "卖出平仓", "卖出"}:
+            current_qty -= trade_qty
+        quantities[code] = current_qty
+        row["执行后预计数量"] = _display_quantity(current_qty)
+
+
+def _annotate_contract_symbols(rows, signal_payload):
+    symbol_by_code = _contract_symbol_map(signal_payload)
+    if not symbol_by_code:
+        return
+    for row in rows:
+        code = _display_code(row.get("合约代码"))
+        if code is None:
+            continue
+        symbol = symbol_by_code.get(str(code))
+        if symbol:
+            row["contract_symbol"] = symbol
+
+
+def _contract_symbol_map(signal_payload):
+    mapping = {}
+    account = signal_payload.get("account") or {}
+    for hedge in account.get("option_hedges") or []:
+        _add_contract_symbol(mapping, hedge.get("order_book_id"), hedge.get("contract_symbol"))
+
+    snapshot = signal_payload.get("quote_snapshot") or {}
+    option_snapshot = snapshot.get("option_snapshot")
+    if option_snapshot:
+        try:
+            frame = pd.read_parquet(option_snapshot, columns=["order_book_id", "contract_symbol"])
+        except Exception:
+            frame = None
+        if frame is not None and not frame.empty:
+            for _, row in frame.iterrows():
+                _add_contract_symbol(
+                    mapping,
+                    row.get("order_book_id"),
+                    row.get("contract_symbol"),
+                )
+    return mapping
+
+
+def _add_contract_symbol(mapping, code, symbol):
+    display_code = _display_code(code)
+    if display_code is None or symbol is None:
+        return
+    symbol_text = str(symbol).strip()
+    if not symbol_text or symbol_text.lower() == "nan":
+        return
+    mapping[str(display_code)] = symbol_text
+
+
+def _contract_display(row):
+    code = row.get("合约代码")
+    symbol = row.get("contract_symbol")
+    if symbol and str(symbol) != str(code):
+        return f"{code} ({symbol})"
+    return code
+
+
+def _initial_display_quantities(signal_payload):
+    account = signal_payload.get("account") or {}
+    quantities = {}
+    positions = account.get("positions") or {}
+    for position in positions.values():
+        if not position:
+            continue
+        _add_quantity(quantities, position.get("call_code"), position.get("call_qty"))
+        _add_quantity(quantities, position.get("put_code"), position.get("put_qty"))
+    for hedge in account.get("option_hedges") or []:
+        _add_quantity(quantities, hedge.get("order_book_id"), hedge.get("qty"))
+    hedge_state = account.get("hedge") or {}
+    hedge_code = _display_code(hedge_state.get("underlying_order_book_id"))
+    _add_quantity(quantities, hedge_code, hedge_state.get("qty"))
+    return quantities
+
+
+def _add_quantity(quantities, code, qty):
+    display_code = _display_code(code)
+    if display_code is None:
+        return
+    number = _number(qty)
+    if number is None:
+        return
+    quantities[str(display_code)] = float(quantities.get(str(display_code), 0.0)) + number
+
+
+def _display_quantity(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return value
+    if abs(number) <= 1e-9:
+        number = 0.0
+    return int(number) if number.is_integer() else number
 
 
 def _advice_execution_rows(item, include_etf=True):
@@ -167,53 +407,28 @@ def _advice_execution_rows(item, include_etf=True):
             item.get("estimated_price"),
         )]
 
-    if action in {"OPTION_DELTA_HEDGE_SHORT_CALL", "FINAL_OPTION_DELTA_HEDGE_SHORT_CALL"}:
-        return [_execution_row(
-            item.get("call_code"),
-            "卖出开仓",
-            item.get("call_qty"),
-            item.get("estimated_call_price"),
-        )]
     if action in {
-        "OPTION_DELTA_HEDGE_COMBINATION",
-        "FINAL_OPTION_DELTA_HEDGE_COMBINATION",
-        "GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
-        "FINAL_GAMMA_NEUTRAL_OPTION_DELTA_HEDGE",
+        "ATM_STRADDLE_DELTA_REBALANCE",
+        "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
     }:
-        rows = []
-        if float(item.get("close_call_qty", 0.0) or 0.0) > 0:
-            rows.append(_execution_row(
-                item.get("close_call_code"),
-                "买入平仓",
-                item.get("close_call_qty"),
-                item.get("estimated_close_call_price"),
-            ))
-        open_legs = item.get("open_legs") or [
-            {
-                "order_book_id": item.get("open_call_code"),
-                "qty": item.get("open_call_qty"),
-                "estimated_price": item.get("estimated_open_call_price"),
-            }
-        ]
-        rows.extend(
+        return [
+            row
+            for row in [
             _execution_row(
-                leg.get("order_book_id"),
+                item.get("close_put_code"),
+                "买入平仓",
+                item.get("close_put_qty"),
+                item.get("estimated_close_put_price"),
+            ),
+            _execution_row(
+                item.get("open_call_code"),
                 "卖出开仓",
-                leg.get("qty"),
-                leg.get("estimated_price"),
-            )
-            for leg in open_legs
-        )
-        if include_etf and float(item.get("trade_etf_qty", 0.0) or 0.0) > 0:
-            rows.append(
-                _execution_row(
-                    item.get("underlying_order_book_id"),
-                    "买入",
-                    item.get("trade_etf_qty"),
-                    item.get("estimated_price"),
-                )
-            )
-        return rows
+                item.get("open_call_qty"),
+                item.get("estimated_open_call_price"),
+            ),
+        ]
+            if (_number(row.get("数量")) or 0.0) > 0
+        ]
     return []
 
 
@@ -293,3 +508,22 @@ def _fmt(value):
         return f"{float(value):.6f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def _fmt_pct(value):
+    if value is None:
+        return "None"
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _number(value):
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number

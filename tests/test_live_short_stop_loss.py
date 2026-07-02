@@ -10,8 +10,8 @@ from core.live import signal_engine
 def test_short_daily_loss_aum_stop_uses_strict_negative_threshold():
     config = core.config.load_config("300etf")
     with mock.patch.object(core.strategy, "CONFIG", config):
-        assert core.strategy.is_short_daily_loss_aum_stop(-7_500.0, 500_000.0) is False
-        assert core.strategy.is_short_daily_loss_aum_stop(-7_501.0, 500_000.0) is True
+        assert core.strategy.is_short_daily_loss_aum_stop(-15_000.0, 500_000.0) is False
+        assert core.strategy.is_short_daily_loss_aum_stop(-15_001.0, 500_000.0) is True
         assert core.strategy.is_short_daily_loss_aum_stop(1_000.0, 500_000.0) is False
 
 

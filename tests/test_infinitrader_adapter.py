@@ -1,40 +1,45 @@
 from core.live import infinitrader
 
 
-def test_compile_combination_option_hedge_signal_orders():
+def test_compile_atm_straddle_delta_rebalance_orders_and_fill():
     payload = {
+        "product": "300etf",
+        "account_id": "default",
+        "date": "2026-07-01",
+        "account": {
+            "positions": {
+                "short": {
+                    "call_code": "100CALL",
+                    "put_code": "100PUT",
+                    "call_qty": 10,
+                    "put_qty": 10,
+                    "strike": 5.0,
+                    "expiry": "2026-07-22",
+                    "entry_call_price": 0.10,
+                    "entry_put_price": 0.10,
+                    "entry_option_value": 20_000.0,
+                    "option_margin": 100_000.0,
+                    "contract_multiplier": 10000,
+                }
+            }
+        },
         "advice": [
             {
-                "action": "DELTA_HEDGE",
-                "priority": "action",
-                "trade_etf_qty": -21800,
-                "estimated_price": 4.931,
-                "underlying_order_book_id": "510300.XSHG",
-            },
-            {
-                "action": "OPTION_DELTA_HEDGE_COMBINATION",
+                "action": "ATM_STRADDLE_DELTA_REBALANCE",
                 "priority": "action",
                 "side": "short",
-                "close_call_code": "10011704",
-                "close_call_qty": 4,
-                "estimated_close_call_price": 0.08535,
-                "open_legs": [
-                    {
-                        "order_book_id": "10011699",
-                        "qty": 3,
-                        "estimated_price": 0.4352,
-                    },
-                    {
-                        "order_book_id": "10011700",
-                        "qty": 1,
-                        "estimated_price": 0.3456,
-                    },
-                ],
-                "trade_etf_qty": 5434,
-                "estimated_price": 4.931,
+                "close_put_code": "100PUT",
+                "close_put_qty": 1,
+                "estimated_close_put_price": 0.10,
+                "open_call_code": "100CALL",
+                "open_call_qty": 1,
+                "estimated_open_call_price": 0.11,
+                "target_call_qty": 11,
+                "target_put_qty": 9,
+                "estimated_option_margin": 105_000.0,
                 "underlying_order_book_id": "510300.XSHG",
-            },
-        ]
+            }
+        ],
     }
 
     orders = infinitrader.compile_signal_orders(payload)
@@ -48,98 +53,20 @@ def test_compile_combination_option_hedge_signal_orders():
         )
         for order in orders
     ] == [
-        ("10011704", "buy", "1", 4),
-        ("10011699", "sell", "0", 3),
-        ("10011700", "sell", "0", 1),
-        ("510300", "sell", None, 16400),
+        ("100PUT", "buy", "1", 1),
+        ("100CALL", "sell", "0", 1),
     ]
-    assert all(order["exchange"] == "SSE" for order in orders)
 
+    fills = infinitrader.build_fills_from_command(
+        {"product": "300etf", "date": "2026-07-01", "signal": payload}
+    )
 
-def test_build_fills_from_combination_command():
-    signal = {
-        "product": "300etf",
-        "account_id": "default",
-        "date": "2026-06-23",
-        "account": {
-            "positions": {
-                "short": {
-                    "call_code": "10011704",
-                    "put_code": "10011713",
-                    "call_qty": 10,
-                    "put_qty": 10,
-                    "strike": 5.0,
-                    "expiry": "2026-07-22",
-                    "entry_call_price": 0.1625,
-                    "entry_put_price": 0.0839,
-                    "entry_option_value": 24640.0,
-                    "option_margin": 141496.0,
-                    "contract_multiplier": 10000,
-                }
-            }
-        },
-        "advice": [
-            {
-                "action": "DELTA_HEDGE",
-                "priority": "action",
-                "trade_etf_qty": -21800,
-                "target_hedge_qty": 0,
-                "estimated_price": 4.931,
-                "underlying_order_book_id": "510300.XSHG",
-            },
-            {
-                "action": "OPTION_DELTA_HEDGE_COMBINATION",
-                "priority": "action",
-                "side": "short",
-                "close_source": "core_short_call",
-                "close_call_code": "10011704",
-                "close_call_qty": 4,
-                "estimated_close_call_price": 0.08535,
-                "estimated_close_margin_release": 24322.8,
-                "open_call_qty": 4,
-                "open_expiry": "2026-07-22",
-                "open_legs": [
-                    {
-                        "order_book_id": "10011699",
-                        "qty": 3,
-                        "estimated_price": 0.4352,
-                        "strike": 4.5,
-                    },
-                    {
-                        "order_book_id": "10011700",
-                        "qty": 1,
-                        "estimated_price": 0.3456,
-                        "strike": 4.6,
-                    },
-                ],
-                "trade_etf_qty": 5434,
-                "target_hedge_qty": 5434,
-                "estimated_price": 4.931,
-                "estimated_option_margin": 40180.8,
-                "underlying_order_book_id": "510300.XSHG",
-            },
-        ],
-    }
-    command = {
-        "product": "300etf",
-        "account_id": "default",
-        "date": "2026-06-23",
-        "signal": signal,
-        "orders": infinitrader.compile_signal_orders(signal),
-    }
-
-    fills = infinitrader.build_fills_from_command(command)
-
-    assert [fill["action"] for fill in fills] == [
-        "rebalance_straddle_legs",
-        "open_option_hedge",
-        "open_option_hedge",
-        "delta_hedge",
-    ]
-    assert fills[0]["call_qty"] == 6
-    assert fills[1]["order_book_id"] == "10011699"
-    assert fills[3]["trade_etf_qty"] == -16400
-    assert fills[3]["target_hedge_qty"] == 5400
+    assert [fill["action"] for fill in fills] == ["rebalance_straddle_legs"]
+    fill = fills[0]
+    assert fill["call_qty"] == 11
+    assert fill["put_qty"] == 9
+    assert fill["option_margin"] == 105_000.0
+    assert fill["cash_delta"] == 96.0
 
 
 def test_compile_roll_short_straddle_orders_close_then_open():

@@ -470,6 +470,13 @@ def load_latest_quote_snapshot(product, date="latest"):
             option_path = day_dir / f"{time_part}_option_chain.parquet"
             if not etf_path.exists() or not option_path.exists():
                 continue
+            if not _quote_snapshot_has_positive_prices(etf_path, option_path):
+                raise ValueError(
+                    f"Latest AKShare quote snapshot for {product} "
+                    f"{quote_date} {time_part} is invalid: ETF close and "
+                    "option close/bid/ask must contain positive prices. "
+                    "Fetch and save a new AKShare snapshot after quotes are valid."
+                )
             result = dict(metadata)
             result["source"] = "snapshot"
             result["snapshot_source"] = "akshare"
@@ -483,6 +490,28 @@ def load_latest_quote_snapshot(product, date="latest"):
         f"No complete saved AKShare quote snapshot for {product} {date_text}. "
         "Fetch and save an AKShare snapshot first."
     )
+
+
+def _quote_snapshot_has_positive_prices(etf_path, option_path):
+    try:
+        etf_df = pd.read_parquet(etf_path)
+        option_df = pd.read_parquet(option_path, columns=["close", "bid", "ask"])
+    except Exception:
+        return False
+
+    etf_close = pd.to_numeric(etf_df.get("close"), errors="coerce")
+    if etf_close.empty or not (etf_close > 0).any():
+        return False
+
+    price_columns = [
+        pd.to_numeric(option_df[column], errors="coerce")
+        for column in ("close", "bid", "ask")
+        if column in option_df.columns
+    ]
+    if not price_columns:
+        return False
+    prices = pd.concat(price_columns, ignore_index=True)
+    return bool((prices > 0).any())
 
 
 def load_previous_quote_snapshot(product, before_date):

@@ -89,6 +89,7 @@ def build_portfolio_report(
             "All products must use the same valuation date for a unified account "
             f"report. {detail}"
         )
+    frames = _combined_daily_frames(payloads, errors)
     return {
         "account_id": account_id,
         "products": list(products),
@@ -100,7 +101,7 @@ def build_portfolio_report(
         ),
         "subaccounts": payloads,
         "errors": errors,
-        "frames": _combined_daily_frames(payloads, errors),
+        "frames": frames,
     }
 
 
@@ -112,8 +113,9 @@ def write_portfolio_report(payload):
     existing_path = _latest_account_report_path(out_dir, before_path=path)
     if existing_path is None and TEMPLATE_REPORT_PATH.exists():
         existing_path = TEMPLATE_REPORT_PATH
+    current_frames = payload["frames"]
     combined = _merge_with_existing(
-        payload["frames"],
+        current_frames,
         existing_path,
         payloads=payload.get("subaccounts"),
         products=payload.get("products"),
@@ -122,7 +124,10 @@ def write_portfolio_report(payload):
     temp_path = path.with_name(f"{path.stem}.{os.getpid()}.tmp{path.suffix}")
     with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
         for sheet_name in REPORT_SHEETS:
-            combined[sheet_name].to_excel(writer, sheet_name=sheet_name, index=False)
+            combined.get(
+                sheet_name,
+                pd.DataFrame(columns=_report_sheet_columns(sheet_name)),
+            ).to_excel(writer, sheet_name=sheet_name, index=False)
         _apply_template_layout(writer.book)
         account_report._format_account_report_workbook(writer.book)
     temp_path.replace(path)
@@ -137,7 +142,7 @@ def write_portfolio_report(payload):
             "products": payload["products"],
             "shared_cash": payload.get("shared_cash"),
             "errors": payload["errors"],
-            "账户总体情况": payload["frames"][SUMMARY_TEMPLATE_SHEET].to_dict(
+            "账户总体情况": current_frames[SUMMARY_TEMPLATE_SHEET].to_dict(
                 "records"
             ),
         },
@@ -192,6 +197,16 @@ def _portfolio_snapshot_time_line(payload):
         for product in payload.get("products", [])
     )
     return f"报告快照时间: {times}" if times else "报告快照时间: 不可用"
+
+
+def _report_sheet_columns(sheet_name):
+    if sheet_name == SUMMARY_TEMPLATE_SHEET:
+        return SUMMARY_REPORT_COLUMNS
+    if sheet_name == "持仓记录":
+        return POSITION_REPORT_COLUMNS
+    if sheet_name == "交易记录":
+        return account_report.TRADE_COLUMNS
+    return []
 
 
 def _combined_daily_frames(payloads, errors):
@@ -450,12 +465,23 @@ def _merge_with_existing(current, existing_path, payloads=None, products=None):
         if sheet_name == "持仓记录":
             frame = _backfill_position_strategy_name(frame, payloads)
             frame = _backfill_position_aum(frame, payloads)
-            frame = _backfill_position_holding_pnl(frame, payloads)
         combined[sheet_name] = _sort_portfolio_report_frame(sheet_name, frame)
-    combined[SUMMARY_TEMPLATE_SHEET] = _backfill_summary_aum_from_positions(
+    if "持仓记录" in combined:
+        frame = _backfill_position_holding_pnl(
+            combined["持仓记录"],
+            payloads,
+            trade_frame=combined.get("交易记录"),
+        )
+        combined["持仓记录"] = _sort_portfolio_report_frame("持仓记录", frame)
+    summary = _backfill_summary_aum_from_positions(
         combined.get(SUMMARY_TEMPLATE_SHEET),
         combined.get("持仓记录"),
     )
+    summary = _backfill_summary_pnl_from_positions(
+        summary,
+        combined.get("持仓记录"),
+    )
+    combined[SUMMARY_TEMPLATE_SHEET] = summary
     return combined
 
 
@@ -607,6 +633,110 @@ def _backfill_summary_aum_from_positions(summary_frame, position_frame):
     return result
 
 
+def _backfill_summary_pnl_from_positions(summary_frame, position_frame):
+    if (
+        not isinstance(summary_frame, pd.DataFrame)
+        or summary_frame.empty
+        or not isinstance(position_frame, pd.DataFrame)
+        or position_frame.empty
+    ):
+        return summary_frame
+    summary_required = {"日期", STRATEGY_NAME_COLUMN}
+    position_required = {
+        "日期",
+        STRATEGY_NAME_COLUMN,
+        "持仓盈亏",
+        "交易盈亏",
+        "到期日",
+    }
+    if not summary_required.issubset(summary_frame.columns) or not position_required.issubset(
+        position_frame.columns
+    ):
+        return summary_frame
+
+    positions = position_frame.copy()
+    positions["_summary_pnl_date"] = pd.to_datetime(
+        positions["日期"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    positions["_summary_pnl_strategy"] = positions[STRATEGY_NAME_COLUMN].map(
+        _canonical_strategy_name
+    )
+    positions["_summary_pnl_holding"] = pd.to_numeric(
+        positions["持仓盈亏"],
+        errors="coerce",
+    ).fillna(0.0)
+    positions["_summary_pnl_trade"] = pd.to_numeric(
+        positions["交易盈亏"],
+        errors="coerce",
+    ).fillna(0.0)
+    positions["_summary_pnl_total"] = (
+        positions["_summary_pnl_holding"] + positions["_summary_pnl_trade"]
+    )
+    positions["_summary_pnl_is_option"] = positions["到期日"].notna()
+    positions = positions.dropna(subset=["_summary_pnl_date", "_summary_pnl_strategy"])
+    if positions.empty:
+        return summary_frame
+
+    group_columns = ["_summary_pnl_date", "_summary_pnl_strategy"]
+    total_lookup = positions.groupby(group_columns)["_summary_pnl_total"].sum().to_dict()
+    option_lookup = (
+        positions.loc[positions["_summary_pnl_is_option"]]
+        .groupby(group_columns)["_summary_pnl_total"]
+        .sum()
+        .to_dict()
+    )
+    hedge_lookup = (
+        positions.loc[~positions["_summary_pnl_is_option"]]
+        .groupby(group_columns)["_summary_pnl_total"]
+        .sum()
+        .to_dict()
+    )
+
+    result = summary_frame.copy()
+    for column in (
+        "期权单日盈亏",
+        "ETF单日盈亏",
+        "总单日盈亏(手续费前)",
+        "净单日盈亏",
+        "单日盈亏/AUM",
+    ):
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce").astype(
+                "float64"
+            )
+    result["_summary_pnl_date"] = pd.to_datetime(
+        result["日期"],
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+    result["_summary_pnl_strategy"] = result[STRATEGY_NAME_COLUMN].map(
+        _canonical_strategy_name
+    )
+    for index, row in result.iterrows():
+        key = (row["_summary_pnl_date"], row["_summary_pnl_strategy"])
+        if key not in total_lookup:
+            continue
+        option_pnl = float(option_lookup.get(key, 0.0))
+        hedge_pnl = float(hedge_lookup.get(key, 0.0))
+        total_pnl = float(total_lookup[key])
+        if "期权单日盈亏" in result.columns:
+            result.at[index, "期权单日盈亏"] = option_pnl
+        if "ETF单日盈亏" in result.columns:
+            result.at[index, "ETF单日盈亏"] = hedge_pnl
+        if "总单日盈亏(手续费前)" in result.columns:
+            result.at[index, "总单日盈亏(手续费前)"] = total_pnl
+        fee = _number(row.get("当日手续费")) or 0.0
+        if "净单日盈亏" in result.columns:
+            result.at[index, "净单日盈亏"] = total_pnl - fee
+        if "单日盈亏/AUM" in result.columns:
+            aum = _number(row.get(SUMMARY_AUM_COLUMN))
+            result.at[index, "单日盈亏/AUM"] = (
+                total_pnl / aum if aum is not None and abs(aum) > 1e-12 else None
+            )
+
+    return result.drop(columns=["_summary_pnl_date", "_summary_pnl_strategy"])
+
+
 def _drop_replaced_history_rows(sheet_name, old, daily):
     if sheet_name == SUMMARY_TEMPLATE_SHEET and STRATEGY_NAME_COLUMN in daily.columns:
         if STRATEGY_NAME_COLUMN not in old.columns:
@@ -652,7 +782,7 @@ def _sort_portfolio_report_frame(sheet_name, frame):
     ).reset_index(drop=True)
 
 
-def _backfill_position_holding_pnl(frame, payloads=None):
+def _backfill_position_holding_pnl(frame, payloads=None, trade_frame=None):
     if frame.empty or payloads is None:
         return frame
     required = {
@@ -668,11 +798,17 @@ def _backfill_position_holding_pnl(frame, payloads=None):
     if not required.issubset(frame.columns):
         return frame
     result = frame.copy()
+    for column in ("持仓盈亏", "交易盈亏", "当日盯市交易盈亏", "当日盈亏分解合计"):
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce").astype(
+                "float64"
+            )
     product_markers = _position_product_markers(payloads)
     result["_position_date"] = pd.to_datetime(result["日期"], errors="coerce")
     result["_position_code"] = result["合约代码"].map(_position_code_key)
-    result["_position_product"] = result["合约名称"].map(
-        lambda name: _product_from_contract_name(name, product_markers)
+    result["_position_product"] = result.apply(
+        lambda row: _product_from_position_row(row, product_markers),
+        axis=1,
     )
     result["_original_order"] = range(len(result))
 
@@ -697,16 +833,15 @@ def _backfill_position_holding_pnl(frame, payloads=None):
             if qty is not None:
                 result.at[index, "今日变化"] = qty - (previous_qty or 0.0)
             product = row.get("_position_product")
-            trade_rows = _position_trade_rows(
+            trade_rows = _position_trade_rows_from_sources(
                 payloads.get(product, {}),
+                trade_frame,
                 row.get("日期"),
                 row.get("合约代码"),
             )
             multiplier = 1.0
             if not pd.isna(row.get("到期日")):
-                multiplier = _contract_multiplier(
-                    _product_from_contract_name(row.get("合约名称"), product_markers)
-                )
+                multiplier = _contract_multiplier(product)
             pnl = account_report._daily_position_pnl_breakdown(
                 current_qty=qty,
                 current_side=(
@@ -729,6 +864,16 @@ def _backfill_position_holding_pnl(frame, payloads=None):
                 multiplier=multiplier,
             )
             result.at[index, "持仓盈亏"] = pnl["holding_pnl"]
+            if "交易盈亏" in result.columns:
+                result.at[index, "交易盈亏"] = pnl["realized_cost_pnl"]
+            if "当日盯市交易盈亏" in result.columns:
+                result.at[index, "当日盯市交易盈亏"] = pnl[
+                    "mark_to_market_trade_pnl"
+                ]
+            if "当日盈亏分解合计" in result.columns:
+                result.at[index, "当日盈亏分解合计"] = pnl[
+                    "daily_pnl_decomposition"
+                ]
             previous_row = row
 
     return result.drop(
@@ -750,6 +895,22 @@ def _position_trade_rows(payload, date, code):
         if str(trade.get("日期")) == date_text
         and _position_code_key(trade.get("合约代码")) == code_key
     ]
+
+
+def _position_trade_rows_from_sources(payload, trade_frame, date, code):
+    date_text = str(pd.Timestamp(date).date()) if not pd.isna(date) else ""
+    code_key = _position_code_key(code)
+    if isinstance(trade_frame, pd.DataFrame) and not trade_frame.empty:
+        required = {"日期", "合约代码"}
+        if required.issubset(trade_frame.columns):
+            dates = pd.to_datetime(trade_frame["日期"], errors="coerce").dt.strftime(
+                "%Y-%m-%d"
+            )
+            codes = trade_frame["合约代码"].map(_position_code_key)
+            rows = trade_frame.loc[dates.eq(date_text) & codes.eq(code_key)]
+            if not rows.empty:
+                return rows.to_dict("records")
+    return _position_trade_rows(payload, date, code)
 
 
 def _position_code_key(value):

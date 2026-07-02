@@ -14,6 +14,7 @@ def _config():
             enable_delta_hedge=True,
             delta_hedge_tolerance_ratio=0.10,
             allow_etf_short_hedge=True,
+            enable_option_delta_hedge=False,
         ),
         backtest=SimpleNamespace(
             etf_fee_rate=0.0,
@@ -65,7 +66,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             None,
             {"underlying_order_book_id": "588000.XSHG"},
             action="DELTA_HEDGE",
-            option_action="OPTION_DELTA_HEDGE_SHORT_CALL",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -87,7 +88,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             None,
             {"underlying_order_book_id": "588000.XSHG"},
             action="DELTA_HEDGE",
-            option_action="OPTION_DELTA_HEDGE_SHORT_CALL",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -111,15 +112,18 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             None,
             {"underlying_order_book_id": "588000.XSHG"},
             action="DELTA_HEDGE",
-            option_action="OPTION_DELTA_HEDGE_SHORT_CALL",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
         self.assertEqual(plan[0]["target_hedge_qty"], 259300)
         self.assertEqual(plan[0]["trade_etf_qty"], 206200)
 
-    def test_option_combination_etf_correction_uses_board_lot(self):
+    def test_positive_delta_after_etf_zero_uses_atm_straddle_leg_rebalance(self):
         config = _config()
+        config.strategy.allow_etf_short_hedge = False
+        config.strategy.enable_option_delta_hedge = True
+        config.strategy.delta_hedge_tolerance_ratio = 0.0
         live_account = account.AccountState(
             product="300etf",
             cash=10_000_000,
@@ -127,81 +131,335 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
                 "long": None,
                 "short": {
                     **_short_straddle(qty=10),
-                    "call_code": "SOURCE",
+                    "call_code": "CALL",
+                    "put_code": "PUT",
+                    "strike": 5.0,
+                    "expiry": "2026-07-22",
+                    "option_margin": 100_000.0,
                 },
             },
-            hedge=account.HedgeState(qty=0),
+            hedge=account.HedgeState(qty=5_000),
         )
         expiry = pd.Timestamp("2026-07-22")
         chain = pd.DataFrame(
             [
                 {
-                    "order_book_id": "SOURCE",
+                    "order_book_id": "CALL",
                     "option_type": "c",
                     "maturity_date": expiry,
-                    "strike_price": 4.9,
-                    "mid": 0.10,
-                    "delta": 0.60,
+                    "strike_price": 5.0,
+                    "mid": 0.11,
+                    "delta": 0.55,
                     "gamma": 0.08,
+                    "vega": 0.020,
+                    "theta": -0.010,
                     "volume": 10000,
                     "contract_multiplier": 10000,
                 },
                 {
-                    "order_book_id": "OPEN",
-                    "option_type": "c",
+                    "order_book_id": "PUT",
+                    "option_type": "p",
                     "maturity_date": expiry,
-                    "strike_price": 4.8,
-                    "mid": 0.12,
-                    "delta": 0.70,
-                    "gamma": 0.06,
+                    "strike_price": 5.0,
+                    "mid": 0.10,
+                    "delta": -0.45,
+                    "gamma": 0.07,
+                    "vega": 0.018,
+                    "theta": -0.009,
                     "volume": 10000,
                     "contract_multiplier": 10000,
                 },
             ]
         )
-        solution = {
-            "open_legs": [
-                {
-                    "row": chain.iloc[1],
-                    "qty": 1,
-                    "liquidity_capacity": 100,
-                }
-            ],
-            "open_qty": 1,
-            "close_qty": 1,
-            "delta_effect": -10000.0,
-            "gamma_effect": -100.0,
-            "projected_delta": -730.9459505262275,
-            "etf_buy_qty": 731.0,
-            "combined_delta": 0.05404947377251071,
-            "delta_neutral_achieved": True,
-            "liquidity_capacity_exhausted": False,
-            "close_liquidity_capacity": 9,
-            "score": (0.05404947377251071, 100.0, 2),
+        atm = {
+            "call": chain.iloc[0],
+            "put": chain.iloc[1],
+            "strike": 5.0,
+            "expiry": expiry,
+            "underlying_order_book_id": "510300.XSHG",
         }
 
-        with mock.patch.object(
-            signal_engine.core.position,
-            "solve_liquid_call_delta_hedge",
-            return_value=solution,
-        ):
-            item = signal_engine._option_delta_hedge_combination_item(
-                config,
-                live_account,
-                chain,
-                residual_delta=9272.685032822234,
-                spot=5.0,
-                underlying_order_book_id="510300.XSHG",
-            )
-
-        self.assertEqual(item["trade_etf_qty"], 700.0)
-        self.assertEqual(item["etf_delta_correction"], 700.0)
-        self.assertEqual(item["target_hedge_qty"], 700.0)
-        self.assertEqual(item["trade_etf_qty"] % strategy.ETF_HEDGE_LOT_SIZE, 0.0)
-        self.assertAlmostEqual(
-            item["projected_account_delta_after_combined_hedge"],
-            -30.94595052622749,
+        plan = signal_engine._delta_hedge_plan(
+            config,
+            live_account,
+            {"delta": 12_000.0},
+            5.0,
+            chain,
+            atm,
+            action="DELTA_HEDGE",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
+            reason="test",
         )
+
+        self.assertEqual([item["action"] for item in plan], [
+            "DELTA_HEDGE",
+            "ATM_STRADDLE_DELTA_REBALANCE",
+        ])
+        self.assertEqual(plan[0]["target_hedge_qty"], 0.0)
+        self.assertEqual(plan[0]["trade_etf_qty"], -5000.0)
+        rebalance = plan[1]
+        self.assertEqual(rebalance["close_put_code"], "PUT")
+        self.assertEqual(rebalance["close_put_qty"], 1)
+        self.assertEqual(rebalance["open_call_code"], "CALL")
+        self.assertEqual(rebalance["open_call_qty"], 1)
+        self.assertEqual(rebalance["target_call_qty"], 11)
+        self.assertEqual(rebalance["target_put_qty"], 9)
+        self.assertAlmostEqual(rebalance["estimated_delta_effect"], -10000.0)
+        self.assertAlmostEqual(rebalance["estimated_gamma_effect"], -100.0)
+        self.assertAlmostEqual(rebalance["estimated_vega_effect"], -20.0)
+        self.assertAlmostEqual(rebalance["estimated_theta_effect"], 10.0)
+        self.assertAlmostEqual(
+            rebalance["projected_account_delta_after_option_hedge"],
+            2000.0,
+        )
+        self.assertAlmostEqual(rebalance["etf_delta_correction"], 0.0)
+        self.assertAlmostEqual(
+            rebalance["projected_account_delta_after_combined_hedge"],
+            2000.0,
+        )
+        self.assertAlmostEqual(rebalance["normalized_combined_delta"], 1 / 55)
+        self.assertAlmostEqual(rebalance["target_call_put_ratio_error"], 2 / 11)
+        self.assertEqual(rebalance["target_pair_qty_deviation"], 2)
+        self.assertEqual(rebalance["target_pair_qty_deviation_balance"], 0)
+        self.assertAlmostEqual(rebalance["estimated_market_value_effect"], 100.0)
+
+    def test_one_strike_from_atm_main_straddle_can_rebalance_delta(self):
+        config = _config()
+        config.strategy.allow_etf_short_hedge = False
+        config.strategy.enable_option_delta_hedge = True
+        config.strategy.delta_hedge_tolerance_ratio = 0.0
+        live_account = account.AccountState(
+            product="300etf",
+            cash=10_000_000,
+            positions={
+                "long": None,
+                "short": {
+                    **_short_straddle(qty=10),
+                    "call_code": "HELD_CALL",
+                    "put_code": "HELD_PUT",
+                    "strike": 5.0,
+                    "expiry": "2026-07-22",
+                    "option_margin": 100_000.0,
+                },
+            },
+            hedge=account.HedgeState(qty=5_000),
+        )
+        expiry = pd.Timestamp("2026-07-22")
+        chain = pd.DataFrame(
+            [
+                {
+                    "order_book_id": "ATM_CALL",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 4.9,
+                    "mid": 0.106,
+                    "delta": 0.55,
+                    "gamma": 0.08,
+                    "vega": 0.020,
+                    "theta": -0.010,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "ATM_PUT",
+                    "option_type": "p",
+                    "maturity_date": expiry,
+                    "strike_price": 4.9,
+                    "mid": 0.095,
+                    "delta": -0.45,
+                    "gamma": 0.07,
+                    "vega": 0.018,
+                    "theta": -0.009,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "HELD_CALL",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 5.0,
+                    "mid": 0.063,
+                    "delta": 0.38,
+                    "gamma": 0.08,
+                    "vega": 0.020,
+                    "theta": -0.010,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "HELD_PUT",
+                    "option_type": "p",
+                    "maturity_date": expiry,
+                    "strike_price": 5.0,
+                    "mid": 0.152,
+                    "delta": -0.60,
+                    "gamma": 0.07,
+                    "vega": 0.018,
+                    "theta": -0.009,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+            ]
+        )
+        atm = {
+            "call": chain.iloc[0],
+            "put": chain.iloc[1],
+            "strike": 4.9,
+            "expiry": expiry,
+            "underlying_order_book_id": "510300.XSHG",
+        }
+
+        plan = signal_engine._delta_hedge_plan(
+            config,
+            live_account,
+            {"delta": 9_500.0},
+            4.922,
+            chain,
+            atm,
+            action="DELTA_HEDGE",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
+            reason="test",
+        )
+
+        self.assertEqual([item["action"] for item in plan], [
+            "DELTA_HEDGE",
+            "ATM_STRADDLE_DELTA_REBALANCE",
+        ])
+        rebalance = plan[1]
+        self.assertEqual(rebalance["close_put_code"], "HELD_PUT")
+        self.assertEqual(rebalance["open_call_code"], "HELD_CALL")
+        self.assertEqual(rebalance["open_call_qty"], 1)
+        self.assertEqual(rebalance["close_put_qty"], 1)
+        self.assertEqual(rebalance["target_call_qty"], 11)
+        self.assertEqual(rebalance["target_put_qty"], 9)
+        self.assertAlmostEqual(rebalance["estimated_delta_effect"], -9800.0)
+        self.assertAlmostEqual(rebalance["etf_delta_correction"], 300.0)
+        self.assertAlmostEqual(rebalance["normalized_combined_delta"], 0.0)
+        self.assertAlmostEqual(
+            rebalance["target_call_put_ratio_error"],
+            2 / 11,
+        )
+        self.assertEqual(rebalance["target_pair_qty_deviation"], 2)
+        self.assertEqual(rebalance["target_pair_qty_deviation_balance"], 0)
+        self.assertTrue(rebalance["delta_tolerance_met"])
+        self.assertEqual(rebalance["target_pair_qty"], 10)
+        self.assertAlmostEqual(rebalance["target_pair_market_value_error"], -890.0)
+
+    def test_adjacent_uneven_strike_is_treated_as_atm_tolerated_main_straddle(self):
+        config = _config()
+        config.strategy.allow_etf_short_hedge = False
+        config.strategy.enable_option_delta_hedge = True
+        config.strategy.delta_hedge_tolerance_ratio = 0.0
+        live_account = account.AccountState(
+            product="50etf",
+            cash=10_000_000,
+            positions={
+                "long": None,
+                "short": {
+                    **_short_straddle(qty=10),
+                    "call_code": "HELD_CALL",
+                    "put_code": "HELD_PUT",
+                    "strike": 3.1,
+                    "expiry": "2026-07-22",
+                    "option_margin": 50_000.0,
+                },
+            },
+            hedge=account.HedgeState(qty=1_600),
+        )
+        expiry = pd.Timestamp("2026-07-22")
+        chain = pd.DataFrame(
+            [
+                {
+                    "order_book_id": "LOW_CALL",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 2.95,
+                    "mid": 0.12,
+                    "delta": 0.70,
+                    "gamma": 0.08,
+                    "vega": 0.020,
+                    "theta": -0.010,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "ATM_CALL",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 3.0,
+                    "mid": 0.08,
+                    "delta": 0.52,
+                    "gamma": 0.08,
+                    "vega": 0.020,
+                    "theta": -0.010,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "ATM_PUT",
+                    "option_type": "p",
+                    "maturity_date": expiry,
+                    "strike_price": 3.0,
+                    "mid": 0.06,
+                    "delta": -0.48,
+                    "gamma": 0.07,
+                    "vega": 0.018,
+                    "theta": -0.009,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "HELD_CALL",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 3.1,
+                    "mid": 0.03,
+                    "delta": 0.32,
+                    "gamma": 0.08,
+                    "vega": 0.020,
+                    "theta": -0.010,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "HELD_PUT",
+                    "option_type": "p",
+                    "maturity_date": expiry,
+                    "strike_price": 3.1,
+                    "mid": 0.11,
+                    "delta": -0.66,
+                    "gamma": 0.07,
+                    "vega": 0.018,
+                    "theta": -0.009,
+                    "volume": 10000,
+                    "contract_multiplier": 10000,
+                },
+            ]
+        )
+        atm = {
+            "call": chain.iloc[1],
+            "put": chain.iloc[2],
+            "strike": 3.0,
+            "expiry": expiry,
+            "underlying_order_book_id": "510050.XSHG",
+        }
+
+        plan = signal_engine._delta_hedge_plan(
+            config,
+            live_account,
+            {"delta": 63_000.0},
+            3.025,
+            chain,
+            atm,
+            action="DELTA_HEDGE",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
+            reason="test",
+        )
+
+        self.assertEqual(plan[-1]["action"], "ATM_STRADDLE_DELTA_REBALANCE")
+        self.assertEqual(plan[-1]["open_call_code"], "HELD_CALL")
+        self.assertEqual(plan[-1]["close_put_code"], "HELD_PUT")
+        self.assertTrue(plan[-1]["delta_tolerance_met"])
 
     def test_live_plan_reduces_short_before_neutral_hedge_breaches_occupation_limit(self):
         config = _config()
@@ -269,7 +527,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
                 chain,
                 {"underlying_order_book_id": "588000.XSHG"},
                 action="DELTA_HEDGE",
-                option_action="OPTION_DELTA_HEDGE_SHORT_CALL",
+                option_action="ATM_STRADDLE_DELTA_REBALANCE",
                 reason="test",
             )
 
