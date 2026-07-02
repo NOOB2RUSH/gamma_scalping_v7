@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from . import storage
+from . import etf_netting, storage
 
 
 def write_signal_report(product, signal_payload):
@@ -66,18 +66,22 @@ def _advice_reason_lines(signal_payload):
 def _execution_rows(signal_payload):
     rows = []
     notices = []
-    for item in signal_payload["advice"]:
-        item_rows = _advice_execution_rows(item)
+    advice = signal_payload["advice"]
+    netted_etf_items = etf_netting.netted_etf_advice_items(advice)
+    for item in advice:
+        item_rows = _advice_execution_rows(item, include_etf=False)
         if item_rows:
             rows.extend(item_rows)
-        elif item.get("reason"):
+        elif item.get("reason") and etf_netting.extract_etf_trade(item) is None:
             notices.append(f"{item.get('action')}: {item.get('reason')}")
+    for item in netted_etf_items:
+        rows.extend(_advice_execution_rows(item, include_etf=True))
     for index, row in enumerate(rows, start=1):
         row["执行顺序"] = index
     return rows, notices
 
 
-def _advice_execution_rows(item):
+def _advice_execution_rows(item, include_etf=True):
     action = item.get("action", "")
     side = item.get("side")
 
@@ -148,7 +152,13 @@ def _advice_execution_rows(item):
             "estimated_target_put_price",
         )
 
-    if action in {"DELTA_HEDGE", "FINAL_DELTA_HEDGE"}:
+    if action in {
+        "DELTA_HEDGE",
+        "FINAL_DELTA_HEDGE",
+        etf_netting.NETTED_ETF_HEDGE_ACTION,
+    }:
+        if not include_etf:
+            return []
         trade_qty = item.get("trade_etf_qty")
         return [_execution_row(
             item.get("underlying_order_book_id"),
@@ -194,7 +204,7 @@ def _advice_execution_rows(item):
             )
             for leg in open_legs
         )
-        if float(item.get("trade_etf_qty", 0.0) or 0.0) > 0:
+        if include_etf and float(item.get("trade_etf_qty", 0.0) or 0.0) > 0:
             rows.append(
                 _execution_row(
                     item.get("underlying_order_book_id"),

@@ -12,7 +12,6 @@ def parse_args():
     parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--date", default=None)
-    parser.add_argument("--json", action="store_true")
     return parser.parse_args()
 
 

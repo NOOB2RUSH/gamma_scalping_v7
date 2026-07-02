@@ -464,7 +464,53 @@ def close_at_last_value(
     trades,
     exit_reason="missing_option_data_last_price",
 ):
-    close_value = abs(position["last_option_value"])
+    return close_at_value(
+        date,
+        cash,
+        position,
+        abs(position["last_option_value"]),
+        trades,
+        exit_reason=exit_reason,
+    )
+
+
+def intrinsic_value(position, spot):
+    strike = float(position["strike"])
+    multiplier = float(position["contract_multiplier"])
+    call_value = max(float(spot) - strike, 0.0)
+    put_value = max(strike - float(spot), 0.0)
+    return (
+        call_value * int(position.get("call_qty", 0) or 0) * multiplier
+        + put_value * int(position.get("put_qty", 0) or 0) * multiplier
+    )
+
+
+def close_at_intrinsic_value(
+    date,
+    cash,
+    position,
+    spot,
+    trades,
+    exit_reason="expired_missing_option_data_intrinsic",
+):
+    return close_at_value(
+        date,
+        cash,
+        position,
+        intrinsic_value(position, spot),
+        trades,
+        exit_reason=exit_reason,
+    )
+
+
+def close_at_value(
+    date,
+    cash,
+    position,
+    close_value,
+    trades,
+    exit_reason="missing_option_data_last_price",
+):
     fee = calc_option_fee(position["call_qty"], position["put_qty"])
     side = position.get("side", "long")
     margin_change = -position.get("option_margin", 0.0)

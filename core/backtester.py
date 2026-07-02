@@ -734,6 +734,8 @@ class BacktestEngine:
             position = state.positions[side]
             if position is None:
                 continue
+            if self._close_expired_missing_position(day, state, side):
+                continue
             self._record_data_warning(day, state, side, "missing_option_chain")
             self._set_side_eod(
                 day,
@@ -758,6 +760,8 @@ class BacktestEngine:
         try:
             call_row, put_row = self._get_position_rows(day, state, side)
         except IndexError:
+            if self._close_expired_missing_position(day, state, side):
+                return
             self._record_data_warning(
                 day,
                 state,
@@ -911,6 +915,8 @@ class BacktestEngine:
             try:
                 call_row, put_row = self._get_position_rows(day, state, side)
             except IndexError:
+                if self._close_expired_missing_position(day, state, side):
+                    continue
                 self._record_data_warning(
                     day,
                     state,
@@ -953,6 +959,43 @@ class BacktestEngine:
                 int(call_row["dte"]),
             )
         self._update_day_aggregates(day, state)
+
+    def _close_expired_missing_position(self, day, state, side):
+        position = state.positions.get(side)
+        if position is None:
+            return False
+
+        expiry = pd.Timestamp(position.get("expiry"))
+        if pd.isna(expiry):
+            return False
+        expiry = expiry.normalize()
+        if pd.Timestamp(day["date"]).normalize() < expiry:
+            return False
+
+        trade_count = len(state.trades)
+        state.cash, close_value = opt_position.close_at_intrinsic_value(
+            day["date"],
+            state.cash,
+            position,
+            day["spot"],
+            state.trades,
+        )
+        self._add_new_option_fees(day, state, trade_count)
+        state.positions[side] = None
+        day["skip_new_entry_by_side"].add(side)
+        record = day["side_records"][side]
+        record["option_value"] = (
+            -close_value if position.get("side", "long") == "short" else close_value
+        )
+        record["greeks"] = empty_greeks()
+        record["eod_position_dte"] = 0
+        self._record_data_warning(
+            day,
+            state,
+            side,
+            "expired_missing_position_contracts_settled_intrinsic",
+        )
+        return True
 
     def _refresh_short_margin(self, day, state, side, call_row, put_row):
         position = state.positions.get(side)

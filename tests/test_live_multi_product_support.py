@@ -583,6 +583,33 @@ class LiveMultiProductSupportTest(unittest.TestCase):
         self.assertEqual(local.positions["short"]["call_qty"], 10)
         self.assertEqual(local.positions["short"]["put_qty"], 10)
 
+    def test_roll_fill_starts_live_roll_cooldown_like_backtest(self):
+        fill = {
+            "action": "roll_short_straddle",
+            "side": "short",
+            "date": "2026-06-24",
+            "call_code": "CALL",
+            "put_code": "PUT",
+            "strike": 2.5,
+            "expiry": "2026-07-22",
+            "call_qty": 10,
+            "put_qty": 10,
+            "entry_call_price": 0.01,
+            "entry_put_price": 0.01,
+            "contract_multiplier": 10000,
+        }
+
+        state = account.AccountState(product="kc50etf")
+        with mock.patch.object(account, "_roll_cooldown_days", return_value=3):
+            account._apply_fill(state, "kc50etf", fill)
+
+        self.assertEqual(state.strategy_state.roll_cooldown_left["short"], 3)
+        self.assertEqual(state.strategy_state.cooldown_total_days["short"], 3)
+        self.assertEqual(
+            state.strategy_state.cooldown_started_date["short"],
+            "2026-06-24",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

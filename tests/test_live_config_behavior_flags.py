@@ -5,6 +5,7 @@ def test_live_etf_products_use_option_hedges_instead_of_short_etf():
     for product in ("50etf", "300etf", "500etf", "kc50etf"):
         strategy = core.config.load_config(product).strategy
         assert strategy.enable_delta_hedge is True
+        assert strategy.delta_hedge_tolerance_ratio == 0.0
         assert strategy.allow_etf_short_hedge is False
         assert strategy.enable_option_delta_hedge is True
         assert strategy.option_delta_hedge_combination_enabled is True

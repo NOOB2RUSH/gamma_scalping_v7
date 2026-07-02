@@ -249,6 +249,7 @@ def add_iv_for_day(
     )
     # vectorized_* 返回的 Series 索引从 0 开始；写回原 DataFrame 时必须按位置赋值。
     chain_df.loc[valid, "iv"] = iv_values.to_numpy()
+    chain_df.loc[valid, "iv"] = iv_values.to_numpy()
     chain_df.loc[valid, "iv"] = chain_df.loc[valid, "iv"].fillna(0.0)
 
     return chain_df
