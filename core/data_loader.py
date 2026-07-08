@@ -58,6 +58,8 @@ def load_hedge_series(start, end):
         df = _read_parquet(file_path).copy()
         if "order_book_id" not in df.columns:
             df.insert(0, "order_book_id", _parse_symbol_from_price_file(file_path))
+        else:
+            df["order_book_id"] = df["order_book_id"].map(_normalize_price_order_book_id)
         df = _validate_df(df, required_cols | {"order_book_id"}, date)
         if date in hedge_by_date:
             hedge_by_date[date] = pd.concat([hedge_by_date[date], df], ignore_index=True)
@@ -181,4 +183,8 @@ def _parse_date_from_file(file_path, suffix):
 
 
 def _parse_symbol_from_price_file(file_path):
-    return file_path.stem.rsplit("_", 1)[0]
+    return _normalize_price_order_book_id(file_path.stem.rsplit("_", 1)[0])
+
+
+def _normalize_price_order_book_id(value):
+    return str(value).rsplit("_", 1)[0]

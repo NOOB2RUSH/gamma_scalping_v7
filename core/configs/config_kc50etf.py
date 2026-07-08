@@ -48,20 +48,17 @@ CONFIG = AppConfig(
         short_open_iv_percentile_threshold=0.75,
         short_close_iv_percentile_threshold=0.60,
         short_stop_loss_enabled=False,
-        short_daily_loss_aum_threshold=-0.015,
+        short_daily_loss_aum_threshold=-0.030,
         enable_delta_hedge=True,
-        delta_hedge_tolerance_ratio=0.10,
+        delta_hedge_tolerance_ratio=0.0,
         allow_etf_short_hedge=False,
         enable_option_delta_hedge=True,
-        option_delta_hedge_combination_enabled=True,
-        option_delta_hedge_max_itm_ratio=0.10,
         # 该退出信号依赖估算后的单合约成交量，适合捕捉明显放量，
         # 但不代表真实逐合约成交量的严格放大。
         short_volume_spike_exit_enabled=True,
         short_volume_spike_multiplier=1.5,
         short_cooldown_after_long_iv_high_exit_days=0,
         roll_dte_threshold=7,
-        roll_strike_mismatch_days=2,
         roll_cooldown_days=10,
     ),
     vol=VolConfig(

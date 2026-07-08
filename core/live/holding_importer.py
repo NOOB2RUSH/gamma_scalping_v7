@@ -43,17 +43,17 @@ def import_holding_file(
         if trade_summary_path is not None
         else pd.DataFrame()
     )
-    trade_summary_timestamp = _parse_timestamp_from_filename(trade_summary_path)
-    if (
-        trade_summary_timestamp is not None
-        and source_timestamp is not None
-        and trade_summary_timestamp > source_timestamp
-    ):
+    if source_timestamp is not None:
         snapshot_rows = _remove_rows_fully_closed_after_snapshot(
             snapshot_rows,
             trade_summary,
+            source_timestamp,
         )
-        rows = _remove_rows_fully_closed_after_snapshot(rows, trade_summary)
+        rows = _remove_rows_fully_closed_after_snapshot(
+            rows,
+            trade_summary,
+            source_timestamp,
+        )
     codes = list(
         {
             row["order_book_id"]
@@ -141,6 +141,15 @@ def import_holding_file(
     for candidate in candidates:
         if candidate.get("kind") == "option_hedge":
             fill = candidate["fill"]
+            if _option_hedge_overlaps_core_position(local, fill):
+                skipped.append(
+                    {
+                        "side": fill.get("side"),
+                        "reason": "snapshot_option_hedge_overlaps_core_position",
+                        "fill": fill,
+                    }
+                )
+                continue
             existing = _matching_option_hedge(local, fill)
             if existing is not None:
                 skipped.append(
@@ -485,8 +494,10 @@ def _aggregate_trade_detail(df):
     return pd.DataFrame(rows)
 
 
-def _remove_rows_fully_closed_after_snapshot(rows, trade_summary):
-    summary_by_code = _trade_detail_by_code(trade_summary)
+def _remove_rows_fully_closed_after_snapshot(rows, trade_summary, source_timestamp):
+    summary_by_code = _trade_detail_by_code(
+        _trade_rows_after_snapshot(trade_summary, source_timestamp)
+    )
     result = []
     for row in rows:
         summary = summary_by_code.get(str(row.get("order_book_id")))
@@ -498,6 +509,39 @@ def _remove_rows_fully_closed_after_snapshot(rows, trade_summary):
             continue
         result.append(row)
     return result
+
+
+def _trade_rows_after_snapshot(trade_summary, source_timestamp):
+    if trade_summary is None or trade_summary.empty or source_timestamp is None:
+        return pd.DataFrame()
+    snapshot_time = pd.Timestamp(source_timestamp)
+    keep = []
+    for _, row in trade_summary.iterrows():
+        trade_time = _trade_execution_timestamp(row)
+        keep.append(trade_time is not None and trade_time > snapshot_time)
+    return trade_summary.loc[keep].copy()
+
+
+def _trade_execution_timestamp(row):
+    value = row.get("成交时间(日)")
+    if value is not None and not pd.isna(value):
+        try:
+            return pd.Timestamp(str(value))
+        except (TypeError, ValueError):
+            pass
+
+    date_value = row.get("日期")
+    time_value = row.get("成交时间")
+    if date_value is None or pd.isna(date_value) or time_value is None or pd.isna(time_value):
+        return None
+    date_text = str(date_value).strip()
+    time_text = str(time_value).strip()
+    if not date_text or not time_text:
+        return None
+    try:
+        return pd.Timestamp(f"{date_text} {time_text}")
+    except (TypeError, ValueError):
+        return None
 
 
 def _apply_missing_straddle_closes(
@@ -1015,6 +1059,21 @@ def _matching_option_hedge(local, fill):
             continue
         return hedge
     return None
+
+
+def _option_hedge_overlaps_core_position(local, fill):
+    code = fill.get("order_book_id") or fill.get("call_code") or fill.get("put_code")
+    if code is None:
+        return False
+    display_code = str(code).split(".", 1)[0]
+    for position in (local.positions or {}).values():
+        if not position:
+            continue
+        for key in ("call_code", "put_code"):
+            position_code = position.get(key)
+            if position_code is not None and str(position_code).split(".", 1)[0] == display_code:
+                return True
+    return False
 
 
 def _local_contains_snapshot_rows(local, rows):

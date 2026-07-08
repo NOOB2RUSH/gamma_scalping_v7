@@ -16,7 +16,6 @@ def main():
     parser.add_argument("--account-id", default="default")
     parser.add_argument("--date", default=None)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     result = etf_importer.import_etf_files(
         args.product,

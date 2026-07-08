@@ -9,6 +9,24 @@ from core.live import account_report
 
 
 class AccountReportGreeksPnlTest(unittest.TestCase):
+    def test_transaction_greeks_columns_are_internal_only(self):
+        internal_columns = {
+            "\u4ea4\u6613DeltaPnL",
+            "\u4ea4\u6613GammaPnL",
+            "\u4ea4\u6613VegaPnL",
+            "\u4ea4\u6613ThetaPnL",
+            "\u4ea4\u6613GreeksPnL",
+            "\u6628\u4ed3GreeksPnL",
+        }
+
+        self.assertTrue(internal_columns.issubset(account_report.SUMMARY_COLUMNS))
+        self.assertTrue(
+            internal_columns.isdisjoint(account_report.DEFAULT_SUMMARY_REPORT_COLUMNS)
+        )
+        self.assertTrue(
+            internal_columns.isdisjoint(account_report.DIAGNOSE_SUMMARY_REPORT_COLUMNS)
+        )
+
     def test_live_report_uses_previous_close_for_all_greeks(self):
         history = pd.DataFrame(
             [
@@ -357,6 +375,342 @@ class AccountReportGreeksPnlTest(unittest.TestCase):
         self.assertAlmostEqual(row["单日VegaPnL"], 30.0)
         self.assertEqual(row["单日ThetaPnL"], 4.0)
         self.assertEqual(row["单日GreeksPnL"], 144.0)
+
+    def test_previous_position_trade_quantity_excludes_same_day_open(self):
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(0.0, -6.0),
+            0.0,
+        )
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(-5.0, -2.0),
+            0.0,
+        )
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(-5.0, 3.0),
+            3.0,
+        )
+        self.assertEqual(
+            account_report._previous_position_trade_quantity(-5.0, 8.0),
+            5.0,
+        )
+
+    def test_segmented_intraday_greeks_excludes_same_day_open_position(self):
+        date = "日期"
+        account = "账户ID"
+        code = "合约代码"
+        name = "合约名称"
+        direction = "方向"
+        qty = "总持仓"
+        latest_price = "最新价"
+        strike = "行权价"
+        expiry = "到期日"
+        dte = "剩余天数"
+        spot = "标的价格"
+        open_close = "开平"
+        buy_sell = "买卖"
+        trade_price = "成交价格"
+        trade_qty = "成交数量"
+        trade_time = "成交时间"
+        trade_type = "类型"
+
+        previous_positions = pd.DataFrame()
+        current_positions = pd.DataFrame(
+            [
+                {
+                    date: "2026-06-26",
+                    account: "default",
+                    direction: "short",
+                    code: "10000001",
+                    name: "test call",
+                    qty: 6,
+                    latest_price: 0.9,
+                    strike: 100.0,
+                    expiry: "2026-07-22",
+                    dte: 18,
+                    "IV": 0.20,
+                }
+            ]
+        )
+        trade_rows = [
+            {
+                code: "10000001",
+                open_close: "开仓",
+                buy_sell: "卖",
+                trade_price: 1.0,
+                trade_qty: 6,
+                trade_time: "14:50:00",
+                trade_type: "期权",
+            }
+        ]
+
+        with mock.patch.object(
+            account_report,
+            "_spot_from_intraday_minute",
+            return_value=101.0,
+        ):
+            parts = account_report._segmented_intraday_option_greeks(
+                "300etf",
+                "2026-06-25",
+                "2026-06-26",
+                pd.Series({spot: 100.0}),
+                pd.Series({spot: 102.0}),
+                previous_positions,
+                current_positions,
+                trade_rows,
+            )
+
+        self.assertEqual(parts["option_greeks_pnl"], 0.0)
+        self.assertEqual(parts["excluded_new_trade_count"], 1)
+
+    def test_hedge_daily_pnl_preserves_report_actual_pnl(self):
+        history = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-25",
+                    "账户ID": "default",
+                    "标的价格": 10.0,
+                    "对冲持仓": 100.0,
+                    "对冲最新价": 10.0,
+                    "ETF单日盈亏": 50.0,
+                },
+                {
+                    "日期": "2026-06-26",
+                    "账户ID": "default",
+                    "标的价格": 11.0,
+                    "对冲持仓": 180.0,
+                    "对冲最新价": 11.0,
+                    "ETF单日盈亏": 900.0,
+                },
+            ]
+        )
+
+        result = account_report._add_summary_greeks_pnl_for_account(history)
+        row = result.iloc[-1]
+
+        self.assertEqual(row["ETF单日盈亏"], 900.0)
+        self.assertEqual(row["对冲单日GreeksPnL"], 100.0)
+        self.assertEqual(row["总单日盈亏"], 900.0)
+
+    def test_intraday_etf_trade_contributes_to_transaction_greeks_pnl(self):
+        history = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-06-09",
+                    "账户ID": "default",
+                    "标的价格": 10.0,
+                    "对冲最新价": 10.0,
+                    "对冲持仓": 0.0,
+                    "Call IV": 0.20,
+                    "Put IV": 0.20,
+                    "Call Delta": 0.0,
+                    "Put Delta": 0.0,
+                    "Call Gamma": 0.0,
+                    "Put Gamma": 0.0,
+                    "Call Vega": 0.0,
+                    "Put Vega": 0.0,
+                    "Call Theta": 0.0,
+                    "Put Theta": 0.0,
+                },
+                {
+                    "日期": "2026-06-10",
+                    "账户ID": "default",
+                    "标的价格": 11.0,
+                    "对冲最新价": 11.0,
+                    "对冲持仓": 100.0,
+                    "Call IV": 0.20,
+                    "Put IV": 0.20,
+                    "Call Delta": 0.0,
+                    "Put Delta": 0.0,
+                    "Call Gamma": 0.0,
+                    "Put Gamma": 0.0,
+                    "Call Vega": 0.0,
+                    "Put Vega": 0.0,
+                    "Call Theta": 0.0,
+                    "Put Theta": 0.0,
+                },
+            ]
+        )
+        trade_rows = [
+            {
+                "日期": "2026-06-10",
+                "类型": "ETF对冲",
+                "买卖": "买",
+                "成交价格": 10.0,
+                "成交数量": 100,
+                "成交时间": "14:50:00",
+            }
+        ]
+
+        result = account_report._add_summary_greeks_pnl_for_account(
+            history,
+            product="300etf",
+            trade_rows=trade_rows,
+        )
+        row = result.iloc[-1]
+
+        self.assertEqual(row["交易DeltaPnL"], 100.0)
+        self.assertEqual(row["交易GreeksPnL"], 100.0)
+        self.assertEqual(row["单日DeltaPnL"], 100.0)
+        self.assertEqual(row["单日GreeksPnL"], 100.0)
+        self.assertEqual(row["GreeksPnL口径"], "previous_close_plus_transaction_to_close")
+
+    def test_intraday_option_trade_handles_current_position_series(self):
+        date = "\u65e5\u671f"
+        account = "\u8d26\u6237ID"
+        spot = "\u6807\u7684\u4ef7\u683c"
+        direction = "\u65b9\u5411"
+        code = "\u5408\u7ea6\u4ee3\u7801"
+        name = "\u5408\u7ea6\u540d\u79f0"
+        qty = "\u603b\u6301\u4ed3"
+        latest_price = "\u6700\u65b0\u4ef7"
+        strike = "\u884c\u6743\u4ef7"
+        expiry = "\u5230\u671f\u65e5"
+        dte = "\u5269\u4f59\u5929\u6570"
+        iv = "IV"
+
+        history = pd.DataFrame(
+            [
+                {
+                    date: "2026-06-09",
+                    account: "default",
+                    spot: 2.0,
+                    "Call IV": 0.20,
+                    "Put IV": 0.20,
+                    "Call Delta": 0.0,
+                    "Put Delta": 0.0,
+                    "Call Gamma": 0.0,
+                    "Put Gamma": 0.0,
+                    "Call Vega": 0.0,
+                    "Put Vega": 0.0,
+                    "Call Theta": 0.0,
+                    "Put Theta": 0.0,
+                },
+                {
+                    date: "2026-06-10",
+                    account: "default",
+                    spot: 2.1,
+                    "Call IV": 0.20,
+                    "Put IV": 0.20,
+                    "Call Delta": 0.0,
+                    "Put Delta": 0.0,
+                    "Call Gamma": 0.0,
+                    "Put Gamma": 0.0,
+                    "Call Vega": 0.0,
+                    "Put Vega": 0.0,
+                    "Call Theta": 0.0,
+                    "Put Theta": 0.0,
+                },
+            ]
+        )
+        position_history = pd.DataFrame(
+            [
+                {
+                    date: "2026-06-10",
+                    account: "default",
+                    direction: "short",
+                    code: "10000001",
+                    name: "test call",
+                    qty: 1,
+                    latest_price: 0.12,
+                    strike: 2.0,
+                    expiry: "2026-07-22",
+                    dte: 30,
+                    iv: 0.20,
+                }
+            ]
+        )
+        trade_rows = [
+            {
+                date: "2026-06-10",
+                code: "10000001",
+                name: "test call",
+                "\u4e70\u5356": "\u5356",
+                "\u6210\u4ea4\u4ef7\u683c": 0.10,
+                "\u6210\u4ea4\u6570\u91cf": 1,
+                "\u6210\u4ea4\u65f6\u95f4": "14:50:00",
+            }
+        ]
+
+        result = account_report._add_summary_greeks_pnl_for_account(
+            history,
+            product="kc50etf",
+            position_history=position_history,
+            trade_rows=trade_rows,
+        )
+        row = result.iloc[-1]
+
+        self.assertTrue(pd.notna(row["交易GreeksPnL"]))
+        self.assertEqual(row["GreeksPnL口径"], "previous_close_plus_transaction_to_close")
+
+    def test_option_daily_pnl_preserves_report_actual_pnl(self):
+        date = "\u65e5\u671f"
+        account = "\u8d26\u6237ID"
+        spot = "\u6807\u7684\u4ef7\u683c"
+        direction = "\u65b9\u5411"
+        code = "\u5408\u7ea6\u4ee3\u7801"
+        name = "\u5408\u7ea6\u540d\u79f0"
+        qty = "\u603b\u6301\u4ed3"
+        latest_price = "\u6700\u65b0\u4ef7"
+        option_daily = "\u671f\u6743\u5355\u65e5\u76c8\u4e8f"
+        total_daily = "\u603b\u5355\u65e5\u76c8\u4e8f"
+
+        history = pd.DataFrame(
+            [
+                {
+                    date: "2026-06-25",
+                    account: "default",
+                    spot: 100.0,
+                    option_daily: 0.0,
+                },
+                {
+                    date: "2026-06-26",
+                    account: "default",
+                    spot: 101.0,
+                    option_daily: 999.0,
+                },
+            ]
+        )
+        position_history = pd.DataFrame(
+            [
+                {
+                    date: "2026-06-25",
+                    account: "default",
+                    direction: "short",
+                    code: "10000001",
+                    name: "old call",
+                    qty: 10,
+                    latest_price: 1.0,
+                },
+                {
+                    date: "2026-06-26",
+                    account: "default",
+                    direction: "short",
+                    code: "10000001",
+                    name: "old call",
+                    qty: 5,
+                    latest_price: 1.2,
+                },
+                {
+                    date: "2026-06-26",
+                    account: "default",
+                    direction: "short",
+                    code: "10000002",
+                    name: "new call",
+                    qty: 4,
+                    latest_price: 2.0,
+                },
+            ]
+        )
+
+        result = account_report._add_summary_greeks_pnl_for_account(
+            history,
+            product="300etf",
+            position_history=position_history,
+        )
+        row = result.iloc[-1]
+
+        self.assertAlmostEqual(row[option_daily], 999.0)
+        self.assertAlmostEqual(row[total_daily], 999.0)
 
 
 if __name__ == "__main__":

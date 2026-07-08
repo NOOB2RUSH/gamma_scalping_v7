@@ -225,6 +225,11 @@ def _account_option_codes(product, account_id):
             value = position.get(key)
             if value:
                 codes.append(str(value))
+    for position in getattr(live_account, "option_hedges", []) or []:
+        for key in ["order_book_id", "call_code", "put_code"]:
+            value = position.get(key)
+            if value:
+                codes.append(str(value))
     return codes
 
 
@@ -330,6 +335,17 @@ def _option_minute_is_current(frame, captured_at):
             frame["日期"].astype(str) + " " + frame["时间"].astype(str),
             errors="coerce",
         )
+    elif {"日期", "时间"}.issubset(frame.columns):
+        frame["timestamp"] = pd.to_datetime(
+            frame["日期"].astype(str) + " " + frame["时间"].astype(str),
+            errors="coerce",
+        )
+        rename_map = {
+            "价格": "price",
+            "均价": "average_price",
+            "成交": "volume",
+            "持仓": "open_interest",
+        }
     else:
         return False
     latest = timestamp.max()
@@ -462,6 +478,85 @@ def _format_result(result):
         f"errors={len(result['errors'])} "
         f"error_detail={result['errors']}"
     )
+
+
+def _fetch_option_minute(ak, option_code, captured_at):
+    raw = ak.option_finance_minute_sina(symbol=str(option_code))
+    source = "option_finance_minute_sina"
+    if not _option_minute_is_current(raw, captured_at):
+        raw = ak.option_sse_minute_sina(symbol=str(option_code))
+        source = "option_sse_minute_sina"
+    if not _option_minute_is_current(raw, captured_at):
+        raise ValueError(f"no current-date option minute data: {option_code}")
+
+    frame = raw.copy()
+    parsed = _parse_option_minute_frame(frame)
+    if parsed is None:
+        raise ValueError(f"unsupported option minute columns: {list(frame.columns)}")
+    frame, rename_map = parsed
+    frame = frame.rename(columns=rename_map)
+    for column in ["price", "average_price", "volume", "open_interest"]:
+        if column not in frame.columns:
+            frame[column] = None
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    result = frame[
+        ["timestamp", "price", "average_price", "volume", "open_interest"]
+    ].copy()
+    result.insert(0, "symbol", str(option_code))
+    result["source"] = source
+    result["captured_at"] = captured_at.isoformat()
+    return result.dropna(subset=["timestamp"])
+
+
+def _parse_option_minute_frame(frame):
+    frame = frame.copy()
+    if {"date", "time"}.issubset(frame.columns):
+        frame["timestamp"] = pd.to_datetime(
+            frame["date"].astype(str) + " " + frame["time"].astype(str),
+            errors="coerce",
+        )
+        return frame, {
+            "price": "price",
+            "average_price": "average_price",
+            "volume": "volume",
+        }
+    if {"日期", "时间"}.issubset(frame.columns):
+        frame["timestamp"] = pd.to_datetime(
+            frame["日期"].astype(str) + " " + frame["时间"].astype(str),
+            errors="coerce",
+        )
+        return frame, {
+            "价格": "price",
+            "均价": "average_price",
+            "成交": "volume",
+            "持仓": "open_interest",
+        }
+    mojibake_date = "鏃ユ湡"
+    mojibake_time = "鏃堕棿"
+    if {mojibake_date, mojibake_time}.issubset(frame.columns):
+        frame["timestamp"] = pd.to_datetime(
+            frame[mojibake_date].astype(str) + " " + frame[mojibake_time].astype(str),
+            errors="coerce",
+        )
+        return frame, {
+            "浠锋牸": "price",
+            "鍧囦环": "average_price",
+            "鎴愪氦": "volume",
+            "鎸佷粨": "open_interest",
+        }
+    return None
+
+
+def _option_minute_is_current(frame, captured_at):
+    if frame is None or frame.empty:
+        return False
+    parsed = _parse_option_minute_frame(frame)
+    if parsed is None:
+        return False
+    parsed_frame, _ = parsed
+    latest = parsed_frame["timestamp"].max()
+    return pd.notna(latest) and latest.date() == pd.Timestamp(captured_at).date()
 
 
 if __name__ == "__main__":

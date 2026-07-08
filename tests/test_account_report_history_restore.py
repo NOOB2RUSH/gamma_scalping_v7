@@ -78,7 +78,8 @@ class AccountReportHistoryRestoreTest(unittest.TestCase):
             summary = pd.read_csv(summary_path, encoding="utf-8-sig")
             positions = pd.read_csv(position_path, encoding="utf-8-sig")
             self.assertEqual(summary.iloc[0]["标的价格"], 2.0)
-            self.assertEqual(summary.iloc[0]["对冲总盈亏"], 100.0)
+            self.assertEqual(summary.iloc[0]["ETF单日盈亏"], 100.0)
+            self.assertEqual(summary.iloc[0]["总单日盈亏"], 100.0)
             self.assertEqual(positions.iloc[0]["方向"], "hedge")
             self.assertEqual(positions.iloc[0]["浮动盈亏"], 100.0)
 

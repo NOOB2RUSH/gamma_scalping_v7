@@ -244,108 +244,6 @@ def liquidity_capacity(row, ratio=None):
     return max(0, int(math.floor(float(volume) * float(ratio))))
 
 
-def solve_liquid_call_delta_hedge(source, open_rows, residual_delta):
-    """Use liquid call capacity to minimize delta first, then gamma change."""
-    close_delta = float(_get_row_value(source["row"], "delta") or 0.0)
-    close_gamma = float(_get_row_value(source["row"], "gamma") or 0.0)
-    multiplier = float(_get_row_value(source["row"], "contract_multiplier") or 0.0)
-    if close_delta <= 0 or close_gamma <= 0 or multiplier <= 0:
-        return None
-
-    unique_rows = {}
-    for index, row in enumerate(open_rows):
-        code = str(_get_row_value(row, "order_book_id") or f"row:{index}")
-        current = unique_rows.get(code)
-        if current is None or liquidity_capacity(row) > liquidity_capacity(current):
-            unique_rows[code] = row
-
-    candidates = []
-    for row in unique_rows.values():
-        delta = float(_get_row_value(row, "delta") or 0.0)
-        gamma = float(_get_row_value(row, "gamma") or 0.0)
-        capacity = liquidity_capacity(row)
-        if delta <= 0 or gamma <= 0 or capacity <= 0:
-            continue
-        candidates.append(
-            {
-                "row": row,
-                "delta": delta,
-                "gamma": gamma,
-                "capacity": capacity,
-                "gamma_per_delta": gamma / delta,
-            }
-        )
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item["gamma_per_delta"], -item["capacity"]))
-
-    close_capacity = min(
-        int(source["max_qty"]) - 1,
-        liquidity_capacity(source["row"]),
-    )
-    best = None
-    for close_qty in range(max(0, close_capacity) + 1):
-        remaining_delta = float(residual_delta) / multiplier + close_qty * close_delta
-        open_legs = []
-        for candidate in candidates:
-            if remaining_delta <= 0:
-                break
-            qty = min(
-                candidate["capacity"],
-                max(1, int(math.ceil(remaining_delta / candidate["delta"]))),
-            )
-            open_legs.append(
-                {
-                    "row": candidate["row"],
-                    "qty": qty,
-                    "liquidity_capacity": candidate["capacity"],
-                }
-            )
-            remaining_delta -= qty * candidate["delta"]
-
-        opened_delta = sum(
-            leg["qty"] * float(_get_row_value(leg["row"], "delta"))
-            for leg in open_legs
-        )
-        opened_gamma = sum(
-            leg["qty"] * float(_get_row_value(leg["row"], "gamma"))
-            for leg in open_legs
-        )
-        delta_effect = multiplier * (close_qty * close_delta - opened_delta)
-        gamma_effect = multiplier * (close_qty * close_gamma - opened_gamma)
-        projected_delta = float(residual_delta) + delta_effect
-        etf_buy_qty = float(math.ceil(-projected_delta)) if projected_delta < 0 else 0.0
-        combined_delta = projected_delta + etf_buy_qty
-        score = (
-            abs(combined_delta),
-            abs(gamma_effect),
-            close_qty + sum(leg["qty"] for leg in open_legs),
-        )
-        if best is None or score < best["score"]:
-            best = {
-                "open_legs": open_legs,
-                "open_qty": sum(leg["qty"] for leg in open_legs),
-                "close_qty": close_qty,
-                "residual_delta_before": float(residual_delta),
-                "delta_effect": delta_effect,
-                "gamma_effect": gamma_effect,
-                "projected_delta": projected_delta,
-                "etf_buy_qty": etf_buy_qty,
-                "combined_delta": combined_delta,
-                "delta_neutral_achieved": abs(combined_delta) <= 1.0,
-                "liquidity_capacity_exhausted": (
-                    abs(combined_delta) > 1.0
-                    and all(
-                        leg["qty"] >= leg["liquidity_capacity"]
-                        for leg in open_legs
-                    )
-                ),
-                "close_liquidity_capacity": max(0, close_capacity),
-                "score": score,
-            }
-    return best
-
-
 def has_short_volume_spike(position, call_row, put_row):
     """卖方持仓成交量放大止损：当前持仓合约成交量较开仓时显著放大。"""
     if not CONFIG.strategy.short_volume_spike_exit_enabled:
@@ -464,7 +362,53 @@ def close_at_last_value(
     trades,
     exit_reason="missing_option_data_last_price",
 ):
-    close_value = abs(position["last_option_value"])
+    return close_at_value(
+        date,
+        cash,
+        position,
+        abs(position["last_option_value"]),
+        trades,
+        exit_reason=exit_reason,
+    )
+
+
+def intrinsic_value(position, spot):
+    strike = float(position["strike"])
+    multiplier = float(position["contract_multiplier"])
+    call_value = max(float(spot) - strike, 0.0)
+    put_value = max(strike - float(spot), 0.0)
+    return (
+        call_value * int(position.get("call_qty", 0) or 0) * multiplier
+        + put_value * int(position.get("put_qty", 0) or 0) * multiplier
+    )
+
+
+def close_at_intrinsic_value(
+    date,
+    cash,
+    position,
+    spot,
+    trades,
+    exit_reason="expired_missing_option_data_intrinsic",
+):
+    return close_at_value(
+        date,
+        cash,
+        position,
+        intrinsic_value(position, spot),
+        trades,
+        exit_reason=exit_reason,
+    )
+
+
+def close_at_value(
+    date,
+    cash,
+    position,
+    close_value,
+    trades,
+    exit_reason="missing_option_data_last_price",
+):
     fee = calc_option_fee(position["call_qty"], position["put_qty"])
     side = position.get("side", "long")
     margin_change = -position.get("option_margin", 0.0)

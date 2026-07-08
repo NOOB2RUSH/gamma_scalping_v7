@@ -62,7 +62,6 @@ class SignalEngineRollTest(unittest.TestCase):
         config = SimpleNamespace(
             strategy=SimpleNamespace(
                 roll_dte_threshold=7,
-                roll_strike_mismatch_days=2,
             ),
             backtest=SimpleNamespace(short_qty=80, long_qty=10),
         )
@@ -126,6 +125,87 @@ class SignalEngineRollTest(unittest.TestCase):
                 pd.DataFrame(),
                 pd.Timestamp("2026-06-17"),
                 None,
+                1.80,
+                10,
+                strategy_state,
+            )
+
+        self.assertIsNone(result)
+
+    def test_roll_treats_adjacent_uneven_strikes_as_one_step(self):
+        config = SimpleNamespace(
+            strategy=SimpleNamespace(
+                roll_dte_threshold=7,
+            ),
+            backtest=SimpleNamespace(short_qty=10, long_qty=10),
+        )
+        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
+        position = {"strike": 3.1}
+        feature_row = pd.Series({"atm_strike": 3.0})
+        chain_df = pd.DataFrame(
+            [
+                {"strike_price": 2.95},
+                {"strike_price": 3.00},
+                {"strike_price": 3.10},
+            ]
+        )
+
+        with mock.patch.object(
+            signal_engine.core.vol_engine,
+            "select_atm_from_chain",
+            side_effect=AssertionError("target atm should not be selected"),
+        ):
+            result = signal_engine._roll_payload(
+                config,
+                "50etf",
+                "short",
+                position,
+                chain_df,
+                feature_row,
+                pd.DataFrame(),
+                pd.Timestamp("2026-07-02"),
+                None,
+                3.025,
+                14,
+                strategy_state,
+            )
+
+        self.assertIsNone(result)
+
+    def test_roll_uses_current_atm_when_feature_atm_strike_is_missing(self):
+        config = SimpleNamespace(
+            strategy=SimpleNamespace(
+                roll_dte_threshold=7,
+            ),
+            backtest=SimpleNamespace(short_qty=10, long_qty=10),
+        )
+        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
+        position = {"strike": 1.75}
+        feature_row = pd.Series({"atm_strike": pd.NA})
+        chain_df = pd.DataFrame(
+            [
+                {"strike_price": 1.70},
+                {"strike_price": 1.75},
+                {"strike_price": 1.80},
+                {"strike_price": 1.85},
+            ]
+        )
+
+        with mock.patch.object(
+            signal_engine.core.vol_engine,
+            "select_atm_from_chain",
+            side_effect=AssertionError("target atm should not be selected"),
+        ):
+            result = signal_engine._roll_payload(
+                config,
+                "kc50etf",
+                "short",
+                position,
+                chain_df,
+                feature_row,
+                pd.DataFrame(),
+                pd.Timestamp("2026-06-17"),
+                {"strike": 1.80},
                 1.80,
                 10,
                 strategy_state,

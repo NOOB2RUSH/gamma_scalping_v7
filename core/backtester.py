@@ -734,6 +734,8 @@ class BacktestEngine:
             position = state.positions[side]
             if position is None:
                 continue
+            if self._close_expired_missing_position(day, state, side):
+                continue
             self._record_data_warning(day, state, side, "missing_option_chain")
             self._set_side_eod(
                 day,
@@ -758,6 +760,8 @@ class BacktestEngine:
         try:
             call_row, put_row = self._get_position_rows(day, state, side)
         except IndexError:
+            if self._close_expired_missing_position(day, state, side):
+                return
             self._record_data_warning(
                 day,
                 state,
@@ -911,6 +915,8 @@ class BacktestEngine:
             try:
                 call_row, put_row = self._get_position_rows(day, state, side)
             except IndexError:
+                if self._close_expired_missing_position(day, state, side):
+                    continue
                 self._record_data_warning(
                     day,
                     state,
@@ -953,6 +959,43 @@ class BacktestEngine:
                 int(call_row["dte"]),
             )
         self._update_day_aggregates(day, state)
+
+    def _close_expired_missing_position(self, day, state, side):
+        position = state.positions.get(side)
+        if position is None:
+            return False
+
+        expiry = pd.Timestamp(position.get("expiry"))
+        if pd.isna(expiry):
+            return False
+        expiry = expiry.normalize()
+        if pd.Timestamp(day["date"]).normalize() < expiry:
+            return False
+
+        trade_count = len(state.trades)
+        state.cash, close_value = opt_position.close_at_intrinsic_value(
+            day["date"],
+            state.cash,
+            position,
+            day["spot"],
+            state.trades,
+        )
+        self._add_new_option_fees(day, state, trade_count)
+        state.positions[side] = None
+        day["skip_new_entry_by_side"].add(side)
+        record = day["side_records"][side]
+        record["option_value"] = (
+            -close_value if position.get("side", "long") == "short" else close_value
+        )
+        record["greeks"] = empty_greeks()
+        record["eod_position_dte"] = 0
+        self._record_data_warning(
+            day,
+            state,
+            side,
+            "expired_missing_position_contracts_settled_intrinsic",
+        )
+        return True
 
     def _refresh_short_margin(self, day, state, side, call_row, put_row):
         position = state.positions.get(side)
@@ -2017,195 +2060,6 @@ class BacktestEngine:
             }
         )
 
-    def _gamma_neutral_solution(self, state, day, residual_delta):
-        short_position = state.positions.get("short")
-        if short_position is None or int(short_position.get("call_qty", 0) or 0) <= 1:
-            return None
-        try:
-            source_row = self._chain_row(day["chain_df"], short_position["call_code"])
-        except IndexError:
-            return None
-        source = {
-            "max_qty": int(short_position["call_qty"]),
-            "row": source_row,
-        }
-        candidates = day["chain_df"].copy()
-        candidates = candidates[
-            candidates["option_type"].astype(str).str.lower().eq("c")
-            & (pd.to_numeric(candidates["mid"], errors="coerce") > 0)
-            & (pd.to_numeric(candidates["delta"], errors="coerce") > 0)
-            & (pd.to_numeric(candidates["gamma"], errors="coerce") > 0)
-            & (
-                pd.to_numeric(candidates["contract_multiplier"], errors="coerce")
-                == float(source_row["contract_multiplier"])
-            )
-            & pd.to_datetime(candidates["maturity_date"]).dt.normalize().eq(
-                pd.Timestamp(source_row["maturity_date"]).normalize()
-            )
-            & ~candidates["order_book_id"].astype(str).eq(str(source_row["order_book_id"]))
-        ]
-        candidates = self._light_itm_call_candidates(candidates, day["spot"])
-        solution = opt_position.solve_liquid_call_delta_hedge(
-            source,
-            [row for _, row in candidates.iterrows()],
-            float(residual_delta),
-        )
-        if solution is None:
-            return None
-        return {
-            **solution,
-            "source_row": source_row,
-        }
-
-    def _light_itm_call_candidates(self, candidates, spot):
-        if candidates.empty:
-            return candidates
-        candidates = vol_engine.filter_standard_option_contracts(candidates).copy()
-        candidates["_strike"] = pd.to_numeric(
-            candidates["strike_price"],
-            errors="coerce",
-        )
-        candidates["_volume"] = pd.to_numeric(
-            candidates.get("volume"),
-            errors="coerce",
-        ).fillna(-1.0)
-        max_itm_ratio = float(
-            getattr(CONFIG.strategy, "option_delta_hedge_max_itm_ratio", 0.10)
-        )
-        candidates = candidates[
-            (candidates["_strike"] < float(spot))
-            & (candidates["_strike"] >= float(spot) * (1.0 - max_itm_ratio))
-        ]
-        candidates["_liquidity_capacity"] = candidates.apply(
-            opt_position.liquidity_capacity,
-            axis=1,
-        )
-        return candidates[candidates["_liquidity_capacity"] > 0].sort_values(
-            "_volume",
-            ascending=False,
-        )
-
-    def _open_gamma_neutral_option_hedge(self, date, state, day, solution):
-        source_row = solution["source_row"]
-        open_legs = solution["open_legs"]
-        primary_open_row = open_legs[0]["row"]
-        close_qty = int(solution["close_qty"])
-        source_multiplier = float(source_row["contract_multiplier"])
-        source_price = float(source_row["mid"])
-        source_fee = opt_position.calc_option_fee(close_qty, 0)
-        open_fee = opt_position.calc_option_fee(solution["open_qty"], 0)
-        open_value = 0.0
-        margin = 0.0
-        for leg in open_legs:
-            row = leg["row"]
-            qty = int(leg["qty"])
-            multiplier = float(row["contract_multiplier"])
-            price = float(row["mid"])
-            open_value += price * qty * multiplier
-            margin += opt_position.margin_call(
-                float(day["spot"]),
-                float(row["strike_price"]),
-                price,
-                multiplier,
-            ) * qty
-        projected_cash = (
-            state.cash
-            - source_price * close_qty * source_multiplier
-            - source_fee
-            + open_value
-            - open_fee
-            - margin
-        )
-        if not self._has_cash_reserve(projected_cash):
-            self._record_cash_reserve_skip(
-                date,
-                state,
-                "skip_option_delta_hedge_cash_reserve",
-                projected_cash,
-            )
-            return False
-        state.cash = projected_cash
-        state.option_hedges = []
-        if close_qty > 0:
-            state.option_hedges.append({
-                "order_book_id": source_row["order_book_id"],
-                "side": "long",
-                "qty": close_qty,
-                "entry_price": source_price,
-                "last_price": source_price,
-                "contract_multiplier": source_multiplier,
-                "option_margin": 0.0,
-            })
-        for leg in open_legs:
-            row = leg["row"]
-            state.option_hedges.append({
-                "order_book_id": row["order_book_id"],
-                "side": "short",
-                "qty": int(leg["qty"]),
-                "entry_price": float(row["mid"]),
-                "last_price": float(row["mid"]),
-                "contract_multiplier": float(row["contract_multiplier"]),
-                "option_margin": opt_position.margin_call(
-                    float(day["spot"]),
-                    float(row["strike_price"]),
-                    float(row["mid"]),
-                    float(row["contract_multiplier"]),
-                ) * int(leg["qty"]),
-            })
-        fee = source_fee + open_fee
-        day["daily_option_fee"] += fee
-        state.trades.append(
-            {
-                "date": date,
-                "type": "option_delta_hedge_combination",
-                "fee": fee,
-                "cash": state.cash,
-                "close_call_code": source_row["order_book_id"],
-                "close_call_qty": close_qty,
-                "close_call_price": source_price,
-                "open_call_code": primary_open_row["order_book_id"],
-                "open_call_qty": solution["open_qty"],
-                "open_call_price": float(primary_open_row["mid"]),
-                "open_call_strike": float(primary_open_row["strike_price"]),
-                "open_legs": [
-                    {
-                        "order_book_id": leg["row"]["order_book_id"],
-                        "qty": int(leg["qty"]),
-                        "price": float(leg["row"]["mid"]),
-                        "strike": float(leg["row"]["strike_price"]),
-                        "volume": float(leg["row"]["volume"]),
-                        "liquidity_capacity": int(leg["liquidity_capacity"]),
-                    }
-                    for leg in open_legs
-                ],
-                "open_liquidity_capacity": sum(
-                    int(leg["liquidity_capacity"]) for leg in open_legs
-                ),
-                "close_liquidity_capacity": solution["close_liquidity_capacity"],
-                "close_call_volume": source_row.get("volume"),
-                "solver_priority": "liquidity_then_delta_then_gamma",
-                "residual_delta_before_option_hedge": solution[
-                    "residual_delta_before"
-                ],
-                "delta_neutral_achieved": solution["delta_neutral_achieved"],
-                "liquidity_capacity_exhausted": solution[
-                    "liquidity_capacity_exhausted"
-                ],
-                "option_margin": margin,
-                "liquidity_warning_ratio": CONFIG.backtest.liquidity_warning_volume_ratio,
-                "liquidity_check_available": True,
-                "liquidity_warning": False,
-                "liquidity_warning_legs": "",
-                "liquidity_volume_missing_legs": "",
-                "delta_effect": solution["delta_effect"],
-                "gamma_effect": solution["gamma_effect"],
-                "projected_option_delta": solution["projected_delta"],
-                "etf_buy_qty": solution["etf_buy_qty"],
-                "projected_account_delta": solution["combined_delta"],
-            }
-        )
-        return True
-
     def _hedge_to(
         self,
         date,
@@ -2294,7 +2148,6 @@ class BacktestEngine:
 
         if not (
             self.config.get("enable_option_delta_hedge", False)
-            and self.config.get("option_delta_hedge_combination_enabled", False)
             and day is not None
         ):
             state.trades.append(
@@ -2323,30 +2176,16 @@ class BacktestEngine:
         residual_delta = float(core_greeks["delta"])
         if residual_delta <= tolerance:
             return
-        solution = self._gamma_neutral_solution(state, day, residual_delta)
-        if solution is None:
-            state.trades.append(
-                {
-                    "date": date,
-                    "type": "skip_option_delta_hedge_combination",
-                    "reason": "no_liquid_light_itm_option_delta_hedge_solution",
-                    "residual_delta": residual_delta,
-                    "tolerance": tolerance,
-                }
-            )
-            return
-        if not self._open_gamma_neutral_option_hedge(date, state, day, solution):
-            return
-        self._update_day_aggregates(day, state)
-        self._execute_etf_target(
-            date,
-            spot,
-            state,
-            day,
-            day["greeks"],
-            solution["etf_buy_qty"],
-            "option_delta_hedge_etf_correction",
+        state.trades.append(
+            {
+                "date": date,
+                "type": "skip_option_delta_hedge",
+                "reason": "live_atm_straddle_rebalance_not_available_in_backtest",
+                "residual_delta": residual_delta,
+                "tolerance": tolerance,
+            }
         )
+        return
 
     def _add_new_option_fees(self, day, state, trade_count):
         for trade in state.trades[trade_count:]:
@@ -2419,6 +2258,14 @@ class BacktestEngine:
             "gamma",
             0.0,
         )
+        record["option_hedge_vega"] = day.get("option_hedge_greeks", {}).get(
+            "vega",
+            0.0,
+        )
+        record["option_hedge_theta"] = day.get("option_hedge_greeks", {}).get(
+            "theta",
+            0.0,
+        )
         total_margin = option_margin + state.hedge_margin
         record["total_margin"] = total_margin
         record["margin_to_nav_ratio"] = total_margin / nav if nav > 0 else None
@@ -2479,9 +2326,6 @@ def _backtest_config(
         "delta_hedge_tolerance_ratio": CONFIG.strategy.delta_hedge_tolerance_ratio,
         "allow_etf_short_hedge": CONFIG.strategy.allow_etf_short_hedge,
         "enable_option_delta_hedge": CONFIG.strategy.enable_option_delta_hedge,
-        "option_delta_hedge_combination_enabled": (
-            CONFIG.strategy.option_delta_hedge_combination_enabled
-        ),
         "dynamic_position_control_enabled": (
             CONFIG.backtest.dynamic_position_control_enabled
         ),

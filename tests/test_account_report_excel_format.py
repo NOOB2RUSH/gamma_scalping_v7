@@ -17,7 +17,7 @@ class AccountReportExcelFormatTest(unittest.TestCase):
                     [
                         {
                             "日期": "2026-06-11",
-                            "估算权益": 10_003_595.33782,
+                            "总单日盈亏": 10_003_595.33782,
                             "账户Gamma": -4_375_159.3513,
                             "单日盈亏/AUM": 0.00125,
                             "备注": None,

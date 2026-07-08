@@ -37,6 +37,38 @@ def strike_step_from_chain(chain_df, reference_strike):
     return min(candidates) if candidates else None
 
 
+def strike_index_distance_from_chain(chain_df, left_strike, right_strike):
+    if chain_df is None or chain_df.empty or "strike_price" not in chain_df.columns:
+        return None
+    chain_df = filter_standard_option_contracts(chain_df)
+    try:
+        left = float(left_strike)
+        right = float(right_strike)
+    except (TypeError, ValueError):
+        return None
+    strikes = (
+        pd.to_numeric(chain_df["strike_price"], errors="coerce")
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .to_numpy(dtype=float)
+    )
+    if len(strikes) == 0:
+        return None
+    left_idx = int(np.argmin(np.abs(strikes - left)))
+    right_idx = int(np.argmin(np.abs(strikes - right)))
+    if not np.isclose(strikes[left_idx], left) or not np.isclose(strikes[right_idx], right):
+        return None
+    return abs(left_idx - right_idx)
+
+
+def strikes_within_chain_steps(chain_df, left_strike, right_strike, max_steps=1):
+    distance = strike_index_distance_from_chain(chain_df, left_strike, right_strike)
+    if distance is None:
+        return None
+    return distance <= int(max_steps)
+
+
 def spot_exceeds_one_strike_step(
     position_strike,
     spot,
@@ -248,6 +280,7 @@ def add_iv_for_day(
         on_error="ignore",
     )
     # vectorized_* 返回的 Series 索引从 0 开始；写回原 DataFrame 时必须按位置赋值。
+    chain_df.loc[valid, "iv"] = iv_values.to_numpy()
     chain_df.loc[valid, "iv"] = iv_values.to_numpy()
     chain_df.loc[valid, "iv"] = chain_df.loc[valid, "iv"].fillna(0.0)
 

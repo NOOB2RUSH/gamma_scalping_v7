@@ -1,4 +1,7 @@
 .cache/
+.benchmarks/
+.numba_cache/
+.pytest_cache/
 .venv/
 .venv-1/
 .vscode/
