@@ -69,6 +69,51 @@ class LiveSignalReportTest(unittest.TestCase):
         self.assertEqual(price, 4.938)
         self.assertEqual(notices, [])
 
+    def test_etf_delta_hedge_shows_expected_greek_target(self):
+        payload = {
+            "account": {
+                "hedge": {"underlying_order_book_id": "510300.XSHG", "qty": 16300},
+            },
+            "account_greeks": {
+                "delta": -32400.10191871413,
+                "gamma": -306320.48563286604,
+                "vega": -812.21880266753,
+                "theta": 680.582262387672,
+            },
+            "planned_account_greeks": {
+                "delta": -32400.10191871413,
+                "gamma": -306320.48563286604,
+                "vega": -812.21880266753,
+                "theta": 680.582262387672,
+            },
+            "account_delta_after_hedge": -16100.101918714128,
+            "advice": [
+                {
+                    "action": "DELTA_HEDGE",
+                    "priority": "action",
+                    "reason": "Account delta exceeds tolerance.",
+                    "option_delta": -32400.10191871413,
+                    "current_hedge_qty": 16300.0,
+                    "account_delta": -16100.101918714128,
+                    "target_hedge_qty": 32400.0,
+                    "trade_etf_qty": 16100.0,
+                    "projected_account_delta_after_hedge": -0.10191871412802767,
+                    "estimated_price": 4.893,
+                    "underlying_order_book_id": "510300.XSHG",
+                },
+            ],
+        }
+
+        rows = report._expected_greek_target_rows(payload)
+        lines = report.format_signal_summary(payload)
+
+        self.assertEqual([row["Greek"] for row in rows], ["Delta", "Gamma", "Vega", "Theta"])
+        self.assertAlmostEqual(rows[0]["调整前"], -16100.101918714128)
+        self.assertAlmostEqual(rows[0]["信号影响"], 16100.0)
+        self.assertAlmostEqual(rows[0]["调整目标"], -0.10191871412802767)
+        self.assertAlmostEqual(rows[1]["调整目标"], -306320.48563286604)
+        self.assertTrue(any(line.startswith("预期Greeks目标 | Delta") for line in lines))
+
     def test_atm_straddle_rebalance_execution_rows(self):
         payload = {
             "account": {

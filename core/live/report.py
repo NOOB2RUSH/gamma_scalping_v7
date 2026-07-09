@@ -10,28 +10,28 @@ def write_signal_report(product, signal_payload):
     path = storage.output_dir(product) / f"{stamp}_signal.md"
     rows, notices = _execution_rows(signal_payload)
     reasons = _advice_reason_lines(signal_payload)
-    greek_impact_rows = _option_hedge_greek_impact_rows(signal_payload)
+    greek_target_rows = _expected_greek_target_rows(signal_payload)
     lines = [
         f"# Live Signal: {product}",
     ]
     if reasons:
         lines.extend(["", "## Reasons", ""])
         lines.extend(f"- {reason}" for reason in reasons)
-    if greek_impact_rows:
+    if greek_target_rows:
         lines.extend(
             [
                 "",
-                "## Option Hedge Greek Impact",
+                "## Expected Greeks Target",
                 "",
-                "| Greek | 对冲前 | 期权影响 | 影响/原值 | 对冲后 |",
+                "| Greek | 调整前 | 信号影响 | 影响/原值 | 调整目标 |",
                 "| --- | ---: | ---: | ---: | ---: |",
             ]
         )
-        for row in greek_impact_rows:
+        for row in greek_target_rows:
             lines.append(
-                f"| {row['Greek']} | {_fmt(row['对冲前'])} | "
-                f"{_fmt(row['期权影响'])} | {_fmt_pct(row['影响/原值'])} | "
-                f"{_fmt(row['对冲后'])} |"
+                f"| {row['Greek']} | {_fmt(row['调整前'])} | "
+                f"{_fmt(row['信号影响'])} | {_fmt_pct(row['影响/原值'])} | "
+                f"{_fmt(row['调整目标'])} |"
             )
     lines.extend(
         [
@@ -63,14 +63,14 @@ def format_signal_summary(signal_payload):
     """Return terminal-friendly live advice lines for manual execution."""
     rows, notices = _execution_rows(signal_payload)
     lines = _advice_reason_lines(signal_payload)
-    greek_impact_rows = _option_hedge_greek_impact_rows(signal_payload)
-    if greek_impact_rows:
-        lines.append("期权对冲Greeks影响 | Greek | 对冲前 | 期权影响 | 影响/原值 | 对冲后")
-        for row in greek_impact_rows:
+    greek_target_rows = _expected_greek_target_rows(signal_payload)
+    if greek_target_rows:
+        lines.append("预期Greeks目标 | Greek | 调整前 | 信号影响 | 影响/原值 | 调整目标")
+        for row in greek_target_rows:
             lines.append(
-                f"期权对冲Greeks影响 | {row['Greek']} | {_fmt(row['对冲前'])} | "
-                f"{_fmt(row['期权影响'])} | {_fmt_pct(row['影响/原值'])} | "
-                f"{_fmt(row['对冲后'])}"
+                f"预期Greeks目标 | {row['Greek']} | {_fmt(row['调整前'])} | "
+                f"{_fmt(row['信号影响'])} | {_fmt_pct(row['影响/原值'])} | "
+                f"{_fmt(row['调整目标'])}"
             )
     lines.append("执行顺序 | 合约代码 | 方向 | 数量 | 执行后预计数量 | 执行价格")
     if not rows:
@@ -93,75 +93,111 @@ def _advice_reason_lines(signal_payload):
     ]
 
 
-OPTION_HEDGE_GREEK_IMPACT_ACTIONS = {
-    "ATM_STRADDLE_DELTA_REBALANCE",
-    "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
-}
-
-
-def _option_hedge_greek_impact_rows(signal_payload):
+def _expected_greek_target_rows(signal_payload):
     advice = signal_payload.get("advice", []) or []
-    items = [
-        item
-        for item in advice
-        if item.get("action") in OPTION_HEDGE_GREEK_IMPACT_ACTIONS
-    ]
-    if not items:
+    if not advice:
         return []
 
-    greeks = signal_payload.get("planned_account_greeks") or signal_payload.get(
-        "account_greeks"
-    ) or {}
-    delta_before = _first_number(
-        items,
-        "residual_delta_before_option_hedge",
-        "planned_account_delta",
-        "account_delta",
-    )
+    account_greeks = signal_payload.get("account_greeks") or {}
+    planned_greeks = signal_payload.get("planned_account_greeks") or account_greeks
+    base_greeks = account_greeks or planned_greeks
+    current_hedge_qty = _current_hedge_qty(signal_payload)
+
+    delta_before = _number(signal_payload.get("account_delta_after_hedge"))
     if delta_before is None:
-        delta_before = _number(greeks.get("delta"))
-    delta_effect = sum(
-        _number(item.get("estimated_delta_effect"))
-        if _number(item.get("estimated_delta_effect")) is not None
-        else _number(item.get("estimated_hedge_delta")) or 0.0
-        for item in items
+        delta_before = _first_number(
+            advice,
+            "residual_delta_before_option_hedge",
+            "planned_account_delta",
+            "account_delta",
+        )
+    if delta_before is None:
+        option_delta = _number(base_greeks.get("delta"))
+        delta_before = (
+            None
+            if option_delta is None
+            else option_delta + current_hedge_qty
+        )
+    delta_after = _target_delta_after_signal(
+        advice,
+        planned_greeks,
+        current_hedge_qty,
     )
-    etf_correction = sum(_number(item.get("etf_delta_correction")) or 0.0 for item in items)
-    delta_after = _last_number(
-        items,
-        "projected_account_delta_after_combined_hedge",
-        "projected_account_delta_after_option_hedge",
-    )
-    if delta_after is None and delta_before is not None:
-        delta_after = delta_before + delta_effect + etf_correction
+    delta_effect = _difference(delta_after, delta_before)
 
     rows = [
-        _greek_impact_row("Delta", delta_before, delta_effect, delta_after),
+        _greek_target_row("Delta", delta_before, delta_effect, delta_after),
     ]
     for label, key in [("Gamma", "gamma"), ("Vega", "vega"), ("Theta", "theta")]:
-        before = _first_number(items, f"planned_account_{key}", f"account_{key}")
-        if before is None:
-            before = _number(greeks.get(key))
-        effect = sum(
-            _number(item.get(f"estimated_{key}_effect")) or 0.0 for item in items
+        before = _number(base_greeks.get(key))
+        target = _number(planned_greeks.get(key))
+        extra_effect = sum(
+            _number(item.get(f"estimated_{key}_effect")) or 0.0 for item in advice
         )
-        after = None if before is None else before + effect
-        rows.append(_greek_impact_row(label, before, effect, after))
+        if target is None and before is not None:
+            target = before
+        if target is not None:
+            target += extra_effect
+        effect = _difference(target, before)
+        rows.append(_greek_target_row(label, before, effect, target))
 
     return [
         row
         for row in rows
-        if row["对冲前"] is not None or abs(float(row["期权影响"] or 0.0)) > 1e-12
+        if row["调整前"] is not None or row["调整目标"] is not None
     ]
 
 
-def _greek_impact_row(label, before, effect, after):
+def _option_hedge_greek_impact_rows(signal_payload):
+    return _expected_greek_target_rows(signal_payload)
+
+
+def _target_delta_after_signal(
+    advice,
+    planned_greeks,
+    current_hedge_qty,
+):
+    delta_after = _last_number(
+        advice,
+        "projected_account_delta_after_hedge",
+        "projected_account_delta_after_combined_hedge",
+        "projected_account_delta_after_option_hedge",
+    )
+    if delta_after is not None:
+        return delta_after
+
+    option_delta = _last_number(advice, "planned_option_delta", "option_delta")
+    if option_delta is None:
+        option_delta = _number(planned_greeks.get("delta"))
+    target_hedge_qty = _last_number(advice, "target_hedge_qty")
+    if target_hedge_qty is None:
+        target_hedge_qty = current_hedge_qty
+    if option_delta is None:
+        return None
+    return option_delta + target_hedge_qty
+
+
+def _current_hedge_qty(signal_payload):
+    account = signal_payload.get("account") or {}
+    hedge = account.get("hedge") or {}
+    return _number(hedge.get("qty")) or 0.0
+
+
+def _difference(after, before):
+    after = _number(after)
+    before = _number(before)
+    if after is None or before is None:
+        return None
+    return after - before
+
+
+def _greek_target_row(label, before, effect, target):
     return {
         "Greek": label,
-        "对冲前": before,
-        "期权影响": effect,
+        "调整前": before,
+        "信号影响": effect,
         "影响/原值": _safe_ratio(effect, before),
-        "对冲后": after,
+        "调整目标": target,
     }
 
 
@@ -410,10 +446,18 @@ def _advice_execution_rows(item, include_etf=True):
     if action in {
         "ATM_STRADDLE_DELTA_REBALANCE",
         "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
+        "ATM_STRADDLE_SHAPE_REBALANCE",
+        "FINAL_ATM_STRADDLE_SHAPE_REBALANCE",
     }:
         return [
             row
             for row in [
+            _execution_row(
+                item.get("close_call_code"),
+                "买入平仓",
+                item.get("close_call_qty"),
+                item.get("estimated_close_call_price"),
+            ),
             _execution_row(
                 item.get("close_put_code"),
                 "买入平仓",
@@ -425,6 +469,12 @@ def _advice_execution_rows(item, include_etf=True):
                 "卖出开仓",
                 item.get("open_call_qty"),
                 item.get("estimated_open_call_price"),
+            ),
+            _execution_row(
+                item.get("open_put_code"),
+                "卖出开仓",
+                item.get("open_put_qty"),
+                item.get("estimated_open_put_price"),
             ),
         ]
             if (_number(row.get("数量")) or 0.0) > 0

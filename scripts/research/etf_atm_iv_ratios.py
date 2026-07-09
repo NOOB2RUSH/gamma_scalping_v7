@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +57,18 @@ def parse_args():
         type=int,
         default=20,
         help="Rolling mean window for each ratio chart.",
+    )
+    parser.add_argument(
+        "--boll-window",
+        type=int,
+        default=20,
+        help="Bollinger band rolling window for the ratio subplot.",
+    )
+    parser.add_argument(
+        "--boll-std",
+        type=float,
+        default=2.0,
+        help="Bollinger band standard-deviation multiplier for the ratio subplot.",
     )
     return parser.parse_args()
 
@@ -141,73 +154,18 @@ def build_ratio_frame(numerator, denominator, features_by_product, rolling_windo
     return joined.reset_index(drop=True)
 
 
-def write_ratio_outputs(frame, numerator, denominator, output_dir, rolling_window):
+def write_combined_chart_output(
+    frame,
+    numerator,
+    denominator,
+    output_dir,
+    rolling_window,
+    boll_window,
+    boll_std,
+    timestamp,
+):
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{numerator}_over_{denominator}_atm_iv_ratio"
-    csv_path = output_dir / f"{stem}.csv"
-    png_path = output_dir / f"{stem}.png"
-    ratio_col = f"iv_ratio_{numerator}_over_{denominator}"
-    ma_col = f"{ratio_col}_ma"
-    frame.to_csv(csv_path, index=False, encoding="utf-8-sig")
-
-    import matplotlib.pyplot as plt
-
-    dates = pd.to_datetime(frame["date"])
-    ratio = pd.to_numeric(frame[ratio_col], errors="coerce")
-    ma = pd.to_numeric(frame[ma_col], errors="coerce")
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(
-        dates,
-        ratio,
-        label=f"{numerator.upper()} ATM IV / {denominator.upper()} ATM IV",
-        linewidth=1.2,
-    )
-    ax.plot(dates, ma, label=f"{rolling_window}D rolling mean", linewidth=1.6)
-    ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
-    ax.set_title(f"{numerator.upper()} vs {denominator.upper()} ATM IV Ratio")
-    ax.set_ylabel("IV ratio")
-    ax.set_xlabel("Date")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=160)
-    plt.close(fig)
-    return csv_path, png_path
-
-
-def write_pair_iv_curve_output(frame, numerator, denominator, output_dir):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{numerator}_vs_{denominator}_atm_iv_curves"
-    png_path = output_dir / f"{stem}.png"
-
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import PercentFormatter
-
-    numerator_label = PRODUCT_LABELS.get(numerator, numerator.upper())
-    denominator_label = PRODUCT_LABELS.get(denominator, denominator.upper())
-    dates = pd.to_datetime(frame["date"])
-    numerator_iv = pd.to_numeric(frame[f"atm_iv_{numerator}"], errors="coerce")
-    denominator_iv = pd.to_numeric(frame[f"atm_iv_{denominator}"], errors="coerce")
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    ax.plot(dates, numerator_iv, label=f"{numerator_label} ATM IV", linewidth=1.3)
-    ax.plot(dates, denominator_iv, label=f"{denominator_label} ATM IV", linewidth=1.3)
-    ax.set_title(f"{numerator_label} vs {denominator_label} ATM IV")
-    ax.set_ylabel("ATM IV")
-    ax.set_xlabel("Date")
-    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=160)
-    plt.close(fig)
-    return png_path
-
-
-def write_pair_iv_diff_overlay_output(frame, numerator, denominator, output_dir):
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{numerator}_vs_{denominator}_atm_iv_diff_overlay"
+    stem = f"{timestamp}_{numerator}_vs_{denominator}_atm_iv_combined"
     png_path = output_dir / f"{stem}.png"
 
     import matplotlib.pyplot as plt
@@ -220,8 +178,28 @@ def write_pair_iv_diff_overlay_output(frame, numerator, denominator, output_dir)
     denominator_iv = pd.to_numeric(frame[f"atm_iv_{denominator}"], errors="coerce")
     diff_col = f"iv_diff_{numerator}_minus_{denominator}"
     iv_diff = pd.to_numeric(frame[diff_col], errors="coerce")
+    ratio_col = f"iv_ratio_{numerator}_over_{denominator}"
+    ma_col = f"{ratio_col}_ma"
+    ratio = pd.to_numeric(frame[ratio_col], errors="coerce")
+    ma = pd.to_numeric(frame[ma_col], errors="coerce")
+    band_min_periods = max(2, boll_window // 4)
+    boll_mid = ratio.rolling(boll_window, min_periods=band_min_periods).mean()
+    boll_sd = ratio.rolling(boll_window, min_periods=band_min_periods).std()
+    boll_upper = boll_mid + boll_std * boll_sd
+    boll_lower = boll_mid - boll_std * boll_sd
 
-    fig, ax_iv = plt.subplots(figsize=(12, 5))
+    fig, (ax_iv, ax_ratio) = plt.subplots(
+        2,
+        1,
+        figsize=(12, 9),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.2, 1.0]},
+    )
+    fig.suptitle(
+        f"{numerator_label} vs {denominator_label} ATM IV Research",
+        fontsize=14,
+    )
+
     numerator_line = ax_iv.plot(
         dates,
         numerator_iv,
@@ -234,11 +212,8 @@ def write_pair_iv_diff_overlay_output(frame, numerator, denominator, output_dir)
         label=f"{denominator_label} ATM IV",
         linewidth=1.3,
     )[0]
-    ax_iv.set_title(
-        f"{numerator_label} vs {denominator_label} ATM IV and Difference"
-    )
+    ax_iv.set_title("ATM IV and Difference")
     ax_iv.set_ylabel("ATM IV")
-    ax_iv.set_xlabel("Date")
     ax_iv.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
     ax_iv.grid(True, alpha=0.25)
 
@@ -256,8 +231,47 @@ def write_pair_iv_diff_overlay_output(frame, numerator, denominator, output_dir)
     ax_diff.set_ylabel("ATM IV difference")
     ax_diff.yaxis.set_major_formatter(PercentFormatter(xmax=1.0))
 
-    lines = [numerator_line, denominator_line, diff_line]
-    ax_iv.legend(lines, [line.get_label() for line in lines], loc="best")
+    iv_lines = [numerator_line, denominator_line, diff_line]
+    ax_iv.legend(iv_lines, [line.get_label() for line in iv_lines], loc="best")
+
+    ax_ratio.plot(
+        dates,
+        ratio,
+        label=f"{numerator_label} ATM IV / {denominator_label} ATM IV",
+        linewidth=1.2,
+    )
+    ax_ratio.plot(dates, ma, label=f"{rolling_window}D rolling mean", linewidth=1.6)
+    ax_ratio.plot(
+        dates,
+        boll_upper,
+        label=f"Bollinger upper ({boll_window}D, {boll_std:g}σ)",
+        color="tab:green",
+        linewidth=0.9,
+        alpha=0.85,
+    )
+    ax_ratio.plot(
+        dates,
+        boll_lower,
+        label=f"Bollinger lower ({boll_window}D, {boll_std:g}σ)",
+        color="tab:green",
+        linewidth=0.9,
+        alpha=0.85,
+    )
+    ax_ratio.fill_between(
+        dates,
+        boll_lower,
+        boll_upper,
+        color="tab:green",
+        alpha=0.10,
+        linewidth=0,
+    )
+    ax_ratio.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.6)
+    ax_ratio.set_title("ATM IV Ratio")
+    ax_ratio.set_ylabel("IV ratio")
+    ax_ratio.set_xlabel("Date")
+    ax_ratio.grid(True, alpha=0.25)
+    ax_ratio.legend(loc="best")
+
     fig.tight_layout()
     fig.savefig(png_path, dpi=160)
     plt.close(fig)
@@ -290,10 +304,17 @@ def _pair_summary(frame, numerator, denominator):
 
 def main():
     args = parse_args()
+    if args.rolling_window <= 0:
+        raise ValueError("--rolling-window must be positive.")
+    if args.boll_window <= 0:
+        raise ValueError("--boll-window must be positive.")
+    if args.boll_std <= 0:
+        raise ValueError("--boll-std must be positive.")
+
     pairs = _parse_pairs(args.pair)
     features_by_product = _features_for_pairs(pairs, start=args.start, end=args.end)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    summaries = []
     for numerator, denominator in pairs:
         frame = build_ratio_frame(
             numerator,
@@ -301,45 +322,26 @@ def main():
             features_by_product,
             rolling_window=args.rolling_window,
         )
-        csv_path, png_path = write_ratio_outputs(
+        combined_chart_path = write_combined_chart_output(
             frame,
             numerator,
             denominator,
             args.output_dir,
             args.rolling_window,
-        )
-        iv_curve_path = write_pair_iv_curve_output(
-            frame,
-            numerator,
-            denominator,
-            args.output_dir,
-        )
-        iv_diff_overlay_path = write_pair_iv_diff_overlay_output(
-            frame,
-            numerator,
-            denominator,
-            args.output_dir,
+            args.boll_window,
+            args.boll_std,
+            timestamp,
         )
         summary = _pair_summary(frame, numerator, denominator)
-        summary["csv"] = str(csv_path)
-        summary["chart"] = str(png_path)
-        summary["ratio_chart"] = str(png_path)
-        summary["iv_curve_chart"] = str(iv_curve_path)
-        summary["iv_diff_overlay_chart"] = str(iv_diff_overlay_path)
-        summaries.append(summary)
+        summary["chart"] = str(combined_chart_path)
+        summary["combined_chart"] = str(combined_chart_path)
         print(
             f"{summary['pair']}: rows={summary.get('rows')} valid={summary.get('valid')} "
             f"first_valid={summary.get('first_valid')} last_valid={summary.get('last_valid')} "
             f"mean={summary.get('mean', float('nan')):.4f} "
             f"latest={summary.get('latest', float('nan')):.4f} "
-            f"iv_curve={iv_curve_path} "
-            f"iv_diff_overlay={iv_diff_overlay_path}"
+            f"combined_chart={combined_chart_path}"
         )
-
-    summary_frame = pd.DataFrame(summaries)
-    summary_path = args.output_dir / "atm_iv_ratio_summary.csv"
-    summary_frame.to_csv(summary_path, index=False, encoding="utf-8-sig")
-    print(f"summary={summary_path}")
 
 
 if __name__ == "__main__":

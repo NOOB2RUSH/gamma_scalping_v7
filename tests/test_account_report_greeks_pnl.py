@@ -394,6 +394,34 @@ class AccountReportGreeksPnlTest(unittest.TestCase):
             5.0,
         )
 
+    def test_segmented_node_dte_can_use_timestamp_progress(self):
+        rows = {
+            "previous": pd.Series({"\u5269\u4f59\u5929\u6570": 31.0, "IV": 0.30}),
+            "current": pd.Series({"\u5269\u4f59\u5929\u6570": 30.0, "IV": 0.20}),
+        }
+        progress = account_report._timestamp_progress(
+            pd.Timestamp("2026-06-26 14:51:00"),
+            pd.Timestamp("2026-06-25 15:00:00"),
+            pd.Timestamp("2026-06-26 15:00:00"),
+        )
+
+        dte = account_report._segmented_node_dte(
+            rows,
+            node_index=1,
+            node_count=3,
+            node_progress=progress,
+        )
+        iv = account_report._segmented_node_reference_iv(
+            rows,
+            node_index=1,
+            node_count=3,
+            node_progress=progress,
+        )
+
+        self.assertGreater(progress, 0.99)
+        self.assertLess(dte, 30.01)
+        self.assertLess(iv, 0.201)
+
     def test_segmented_intraday_greeks_excludes_same_day_open_position(self):
         date = "日期"
         account = "账户ID"
@@ -642,6 +670,122 @@ class AccountReportGreeksPnlTest(unittest.TestCase):
         self.assertTrue(pd.notna(row["交易GreeksPnL"]))
         self.assertEqual(row["GreeksPnL口径"], "previous_close_plus_transaction_to_close")
 
+    def test_transaction_option_greeks_uses_two_endpoints_with_intraday_dte(self):
+        code = "\u5408\u7ea6\u4ee3\u7801"
+        name = "\u5408\u7ea6\u540d\u79f0"
+        buy_sell = "\u4e70\u5356"
+        trade_price = "\u6210\u4ea4\u4ef7\u683c"
+        trade_qty = "\u6210\u4ea4\u6570\u91cf"
+        trade_time = "\u6210\u4ea4\u65f6\u95f4"
+        strike = "\u884c\u6743\u4ef7"
+        dte = "\u5269\u4f59\u5929\u6570"
+
+        rows_by_code = {
+            "10000001": {
+                "current": pd.Series(
+                    {
+                        code: "10000001",
+                        name: "test call",
+                        strike: 2.0,
+                        dte: 30.0,
+                        "IV": 0.20,
+                    }
+                )
+            }
+        }
+        trade = {
+            code: "10000001",
+            name: "test call",
+            buy_sell: "\u5356",
+            trade_price: 0.10,
+            trade_qty: 1,
+            trade_time: "14:50:00",
+        }
+        calls = []
+
+        def fake_greeks(product, row, price, spot, flag, signed_qty, node_dte, fallback_iv=None):
+            calls.append(node_dte)
+            iv = 0.20 if len(calls) == 1 else 0.21
+            return {"iv": iv, "delta": 1.0, "gamma": 2.0, "vega": 3.0, "theta": 4.0}
+
+        with (
+            mock.patch.object(account_report, "_spot_from_intraday_minute", return_value=2.0),
+            mock.patch.object(account_report, "_transaction_option_close_price", return_value=0.12),
+            mock.patch.object(account_report, "_option_greeks_for_dte", side_effect=fake_greeks),
+        ):
+            parts = account_report._transaction_option_greeks_pnl(
+                "kc50etf",
+                "2026-06-10",
+                trade,
+                rows_by_code,
+                2.1,
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertAlmostEqual(calls[0], 30.0 + 10.0 / 240.0)
+        self.assertAlmostEqual(calls[1], 30.0)
+        self.assertAlmostEqual(parts["vega_pnl"], 3.0)
+
+    def test_remaining_trading_day_fraction_excludes_lunch_break(self):
+        report_date = "2026-06-10"
+
+        self.assertAlmostEqual(
+            account_report._remaining_trading_day_fraction(
+                "2026-06-10 10:30:00",
+                report_date,
+            ),
+            0.75,
+        )
+        self.assertAlmostEqual(
+            account_report._remaining_trading_day_fraction(
+                "2026-06-10 12:00:00",
+                report_date,
+            ),
+            0.50,
+        )
+        self.assertAlmostEqual(
+            account_report._remaining_trading_day_fraction(
+                "2026-06-10 14:50:00",
+                report_date,
+            ),
+            10.0 / 240.0,
+        )
+
+    def test_option_close_dte_recomputes_from_expiry_for_previous_only_row(self):
+        previous = pd.Series(
+            {
+                "日期": "2026-06-09",
+                "到期日": "2026-06-17",
+                "剩余天数": 6.0,
+            }
+        )
+
+        with mock.patch.object(
+            account_report.market_data,
+            "load_live_trading_calendar",
+            return_value=pd.DatetimeIndex(
+                pd.to_datetime(
+                    [
+                        "2026-06-09",
+                        "2026-06-10",
+                        "2026-06-11",
+                        "2026-06-12",
+                        "2026-06-15",
+                        "2026-06-16",
+                        "2026-06-17",
+                    ]
+                )
+            ),
+        ):
+            dte = account_report._option_close_dte(
+                "500etf",
+                "2026-06-10",
+                {"previous": previous},
+                previous,
+            )
+
+        self.assertEqual(dte, 5.0)
+
     def test_option_daily_pnl_preserves_report_actual_pnl(self):
         date = "\u65e5\u671f"
         account = "\u8d26\u6237ID"
@@ -711,6 +855,30 @@ class AccountReportGreeksPnlTest(unittest.TestCase):
 
         self.assertAlmostEqual(row[option_daily], 999.0)
         self.assertAlmostEqual(row[total_daily], 999.0)
+
+    def test_stale_intraday_minute_is_not_used_for_transaction_spot(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            minute_dir = root / "data" / "live" / "500etf" / "intraday" / "20260707"
+            minute_dir.mkdir(parents=True)
+            (minute_dir / "etf_510500_1m.csv").write_text(
+                "\n".join(
+                    [
+                        "symbol,timestamp,close",
+                        "510500,2026-07-07 10:43:00,8.758",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(account_report.storage, "PROJECT_ROOT", root):
+                spot = account_report._spot_from_intraday_minute(
+                    "500etf",
+                    "2026-07-07",
+                    pd.Timestamp("2026-07-07 14:51:00"),
+                )
+
+        self.assertIsNone(spot)
 
 
 if __name__ == "__main__":

@@ -56,6 +56,14 @@ def parse_args():
         help="Do not auto-add option codes from the local live account.",
     )
     parser.add_argument("--once", action="store_true", help="Run one capture and exit.")
+    parser.add_argument(
+        "--save-option-greeks-snapshot",
+        action="store_true",
+        help=(
+            "Also save AKShare option Greeks snapshots. Disabled by default "
+            "because strategy Greeks are calculated locally."
+        ),
+    )
     parser.add_argument("--max-runs", type=int, default=None)
     parser.add_argument(
         "--output-dir",
@@ -157,6 +165,7 @@ def capture_once(args):
             output_dir / f"etf_{spec.etf_symbol}_1m.csv",
             etf_frame,
             ["symbol", "timestamp"],
+            timestamp_date=captured_at.date(),
         )
     except Exception as exc:
         result["errors"].append(f"etf:{type(exc).__name__}:{exc}")
@@ -168,6 +177,7 @@ def capture_once(args):
                 output_dir / f"option_{code}_1m.csv",
                 minute_frame,
                 ["symbol", "timestamp"],
+                timestamp_date=captured_at.date(),
             )
         except Exception as exc:
             result["errors"].append(f"option_minute:{code}:{type(exc).__name__}:{exc}")
@@ -187,20 +197,23 @@ def capture_once(args):
         except Exception as exc:
             result["errors"].append(f"option_spot:{code}:{type(exc).__name__}:{exc}")
 
-        try:
-            greeks_frame = _fetch_option_snapshot(
-                ak.option_sse_greeks_sina,
-                code,
-                captured_at,
-                source="option_sse_greeks_sina",
-            )
-            result["option_greeks_rows"][code] = _append_dedup_csv(
-                output_dir / f"option_{code}_greeks_snapshots.csv",
-                greeks_frame,
-                ["symbol", "captured_at"],
-            )
-        except Exception as exc:
-            result["errors"].append(f"option_greeks:{code}:{type(exc).__name__}:{exc}")
+        if args.save_option_greeks_snapshot:
+            try:
+                greeks_frame = _fetch_option_snapshot(
+                    ak.option_sse_greeks_sina,
+                    code,
+                    captured_at,
+                    source="option_sse_greeks_sina",
+                )
+                result["option_greeks_rows"][code] = _append_dedup_csv(
+                    output_dir / f"option_{code}_greeks_snapshots.csv",
+                    greeks_frame,
+                    ["symbol", "captured_at"],
+                )
+            except Exception as exc:
+                result["errors"].append(
+                    f"option_greeks:{code}:{type(exc).__name__}:{exc}"
+                )
 
     return result
 
@@ -273,7 +286,12 @@ def _fetch_etf_minute(ak, etf_symbol, captured_at):
     result.insert(0, "symbol", etf_symbol)
     result["source"] = source
     result["captured_at"] = captured_at.isoformat()
-    return result.dropna(subset=["timestamp"])
+    result = result.dropna(subset=["timestamp"])
+    timestamp = pd.to_datetime(result["timestamp"], errors="coerce")
+    result = result.loc[timestamp.dt.date == pd.Timestamp(captured_at).date()].copy()
+    if result.empty:
+        raise ValueError(f"no current-date ETF minute data: {etf_symbol}")
+    return result
 
 
 def _fetch_option_minute(ak, option_code, captured_at):
@@ -375,7 +393,7 @@ def _field_value_frame_to_row(frame):
     return pd.DataFrame([payload])
 
 
-def _append_dedup_csv(path, frame, subset):
+def _append_dedup_csv(path, frame, subset, timestamp_date=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     frame = _normalize_quote_frame_for_storage(frame)
@@ -383,6 +401,9 @@ def _append_dedup_csv(path, frame, subset):
         existing = pd.read_csv(path, encoding="utf-8-sig")
         existing = _normalize_quote_frame_for_storage(existing)
         frame = pd.concat([existing, frame], ignore_index=True)
+    if timestamp_date is not None and "timestamp" in frame.columns:
+        timestamp = pd.to_datetime(frame["timestamp"], errors="coerce")
+        frame = frame.loc[timestamp.dt.date == timestamp_date].copy()
     frame = frame.drop_duplicates(subset=subset, keep="last")
     sort_columns = [column for column in ["timestamp", "captured_at", "symbol"] if column in frame.columns]
     if sort_columns:

@@ -24,6 +24,7 @@ def calculate_intraday_pnl(product, account_id="default", date=None):
     current_spot = _snapshot_spot(etf_snapshot)
     if current_spot is None:
         raise ValueError(f"ETF snapshot has no usable close price: {snapshot['etf_snapshot']}")
+    snapshot_timestamp = _snapshot_timestamp(snapshot, quote_date)
 
     positions = _load_position_history(product, account_id)
     summaries = _load_summary_history(product, account_id)
@@ -48,6 +49,7 @@ def calculate_intraday_pnl(product, account_id="default", date=None):
             previous_spot,
             current_spot,
             quote_date,
+            snapshot_timestamp,
         )
         if detail is not None:
             option_rows.append(detail)
@@ -220,6 +222,7 @@ def _option_intraday_row(
     previous_spot,
     current_spot,
     quote_date,
+    snapshot_timestamp,
 ):
     code = account_report._security_code(position_row.get("合约代码"))
     if code is None:
@@ -246,7 +249,15 @@ def _option_intraday_row(
     ):
         return None
 
-    current_greeks = _current_greeks(product, position_row, current_price, current_spot, signed_qty)
+    current_greeks = _current_greeks(
+        product,
+        position_row,
+        current_price,
+        current_spot,
+        signed_qty,
+        quote_date,
+        snapshot_timestamp,
+    )
     if current_greeks is None:
         return None
     current_iv = current_greeks["iv"]
@@ -281,22 +292,51 @@ def _option_intraday_row(
     }
 
 
-def _current_greeks(product, position_row, current_price, current_spot, signed_qty):
+def _current_greeks(
+    product,
+    position_row,
+    current_price,
+    current_spot,
+    signed_qty,
+    quote_date,
+    snapshot_timestamp,
+):
     leg = account_report._position_row_leg(position_row)
     flag = "c" if leg == "Call" else "p" if leg == "Put" else None
     if flag is None:
         return None
-    return account_report._single_node_option_greeks(
+    close_dte = account_report._option_close_dte(
         product,
+        quote_date,
         {"previous": position_row},
+        position_row,
+    )
+    if close_dte is None or close_dte <= 0:
+        return None
+    dte = close_dte + account_report._remaining_trading_day_fraction(
+        snapshot_timestamp,
+        quote_date,
+    )
+    return account_report._option_greeks_for_dte(
+        product,
         position_row,
         current_price,
         current_spot,
         flag,
         signed_qty,
-        1,
-        2,
+        dte,
+        fallback_iv=account_report._number(position_row.get("IV")),
     )
+
+
+def _snapshot_timestamp(snapshot, quote_date):
+    stamp = snapshot.get("snapshot_stamp")
+    if stamp:
+        try:
+            return pd.to_datetime(str(stamp), format="%Y%m%d_%H%M%S")
+        except (TypeError, ValueError):
+            pass
+    return pd.Timestamp(f"{pd.Timestamp(quote_date).date()} 15:00:00")
 
 
 def _snapshot_option_price(option_snapshot, code):

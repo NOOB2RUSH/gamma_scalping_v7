@@ -1883,6 +1883,27 @@ def _delta_hedge_plan(
     if underlying_order_book_id is None:
         underlying_order_book_id = _underlying_id_from_atm(atm)
 
+    shape_rebalance_item = None
+    if (
+        getattr(config.strategy, "enable_option_delta_hedge", False)
+        and _can_plan_option_delta_hedge_after(after_actions)
+    ):
+        shape_rebalance_item = _atm_straddle_shape_rebalance_item(
+            config,
+            live_account,
+            chain_df,
+            spot,
+            atm,
+            underlying_order_book_id,
+            option_delta=option_delta,
+            account_delta=account_delta,
+            after_actions=after_actions,
+            final=action.startswith("FINAL_"),
+        )
+    if shape_rebalance_item is not None:
+        if shape_rebalance_item.get("delta_tolerance_met"):
+            return [shape_rebalance_item]
+
     if getattr(config.strategy, "allow_etf_short_hedge", True) or target_qty >= 0:
         reduction_item = _delta_hedge_capacity_reduction_item(
             config,
@@ -2037,6 +2058,384 @@ def _can_plan_option_delta_hedge_after(after_actions):
     )
 
 
+def _atm_rebalance_target_pair_qty(config, side="short"):
+    explicit = getattr(config.strategy, "atm_rebalance_target_pair_qty", None)
+    if explicit is not None:
+        return int(explicit)
+    if side == "short":
+        configured_qty = getattr(config.backtest, "short_qty", None)
+    else:
+        configured_qty = getattr(config.backtest, "long_qty", None)
+    if configured_qty is not None:
+        return int(configured_qty)
+    return LIVE_ENTRY_QTY_PER_LEG
+
+
+def _atm_straddle_shape_rebalance_item(
+    config,
+    live_account,
+    chain_df,
+    spot,
+    atm,
+    underlying_order_book_id,
+    option_delta=0.0,
+    account_delta=0.0,
+    after_actions=None,
+    final=False,
+):
+    short_position = (live_account.positions or {}).get("short")
+    if short_position is None:
+        return None
+    if not _position_is_atm_tolerated_main_straddle(
+        short_position,
+        chain_df,
+        spot,
+        atm,
+    ):
+        return None
+    try:
+        call_row, put_row = core.vol_engine.resolve_position_pair(
+            short_position,
+            chain_df,
+        )
+    except IndexError:
+        return None
+
+    current_call_qty = int(short_position.get("call_qty", 0) or 0)
+    current_put_qty = int(short_position.get("put_qty", 0) or 0)
+    if current_call_qty <= 0 or current_put_qty <= 0:
+        return None
+    if current_call_qty == current_put_qty:
+        return None
+
+    call_price = _positive_float(call_row.get("mid"))
+    put_price = _positive_float(put_row.get("mid"))
+    multiplier = float(
+        call_row.get("contract_multiplier", config.vol.contract_multiplier)
+        or config.vol.contract_multiplier
+    )
+    if call_price is None or put_price is None or multiplier <= 0:
+        return None
+
+    target_pair_qty = _atm_rebalance_target_pair_qty(config, side="short")
+    if target_pair_qty <= 0:
+        return None
+
+    close_call_max = max(current_call_qty - target_pair_qty, 0)
+    close_put_max = max(current_put_qty - target_pair_qty, 0)
+    open_call_max = max(target_pair_qty - current_call_qty, 0)
+    open_put_max = max(target_pair_qty - current_put_qty, 0)
+    call_capacity = core.position.liquidity_capacity(call_row)
+    put_capacity = core.position.liquidity_capacity(put_row)
+    if call_capacity > 0:
+        open_call_max = min(open_call_max, call_capacity)
+    if put_capacity > 0:
+        open_put_max = min(open_put_max, put_capacity)
+    if close_call_max + close_put_max + open_call_max + open_put_max <= 0:
+        return None
+
+    current_shape_error = abs(current_call_qty - current_put_qty)
+    current_pair_qty_deviation = (
+        abs(current_call_qty - target_pair_qty)
+        + abs(current_put_qty - target_pair_qty)
+    )
+    current_hedge_qty = float(live_account.hedge.qty or 0.0)
+    allow_etf_short_hedge = getattr(config.strategy, "allow_etf_short_hedge", True)
+    normalized_delta_tolerance = max(
+        0.0, float(config.strategy.delta_hedge_tolerance_ratio)
+    )
+    target_pair_value = (
+        target_pair_qty * call_price + target_pair_qty * put_price
+    ) * multiplier
+
+    best = None
+    fallback_best = None
+    for close_call_qty in range(0, close_call_max + 1):
+        for open_call_qty in range(0, open_call_max + 1):
+            for close_put_qty in range(0, close_put_max + 1):
+                for open_put_qty in range(0, open_put_max + 1):
+                    option_trade_qty = (
+                        close_call_qty
+                        + open_call_qty
+                        + close_put_qty
+                        + open_put_qty
+                    )
+                    if option_trade_qty <= 0:
+                        continue
+                    target_call_qty = current_call_qty - close_call_qty + open_call_qty
+                    target_put_qty = current_put_qty - close_put_qty + open_put_qty
+                    if target_call_qty <= 0 or target_put_qty <= 0:
+                        continue
+
+                    shape_error = abs(target_call_qty - target_put_qty)
+                    target_pair_qty_deviation = (
+                        abs(target_call_qty - target_pair_qty)
+                        + abs(target_put_qty - target_pair_qty)
+                    )
+                    if (
+                        shape_error >= current_shape_error
+                        and target_pair_qty_deviation >= current_pair_qty_deviation
+                    ):
+                        continue
+
+                    delta_effect = _atm_shape_rebalance_greek_effect(
+                        call_row,
+                        put_row,
+                        open_call_qty,
+                        close_call_qty,
+                        open_put_qty,
+                        close_put_qty,
+                        multiplier,
+                        "delta",
+                    )
+                    projected_option_delta = float(option_delta) + delta_effect
+                    raw_target_hedge_qty = core.strategy.round_etf_hedge_target(
+                        -projected_option_delta
+                    )
+                    if not allow_etf_short_hedge and raw_target_hedge_qty < 0:
+                        target_hedge_qty = 0.0
+                    else:
+                        target_hedge_qty = raw_target_hedge_qty
+                    trade_etf_qty = target_hedge_qty - current_hedge_qty
+                    combined_delta = projected_option_delta + target_hedge_qty
+                    projected_capacity = max(target_call_qty, target_put_qty) * multiplier
+                    normalized_combined_delta = (
+                        abs(combined_delta) / projected_capacity
+                        if projected_capacity > 0
+                        else float("inf")
+                    )
+                    delta_not_worse = abs(combined_delta) <= abs(account_delta) + 1e-9
+                    delta_tolerance_met = (
+                        normalized_combined_delta <= normalized_delta_tolerance
+                        and delta_not_worse
+                    )
+
+                    premium_effect = (
+                        open_call_qty * call_price
+                        + open_put_qty * put_price
+                        - close_call_qty * call_price
+                        - close_put_qty * put_price
+                    ) * multiplier
+                    target_straddle_value = (
+                        target_call_qty * call_price + target_put_qty * put_price
+                    ) * multiplier
+                    target_pair_value_error = target_straddle_value - target_pair_value
+                    ratio_error = (
+                        shape_error / float(max(target_call_qty, target_put_qty))
+                        if max(target_call_qty, target_put_qty) > 0
+                        else float("inf")
+                    )
+                    call_qty_deviation = abs(target_call_qty - target_pair_qty)
+                    put_qty_deviation = abs(target_put_qty - target_pair_qty)
+                    target_pair_qty_deviation_balance = abs(
+                        call_qty_deviation - put_qty_deviation
+                    )
+                    crosses_to_short_etf = (
+                        current_hedge_qty >= 0 and target_hedge_qty < 0
+                    )
+                    score = (
+                        0 if delta_tolerance_met else 1,
+                        1 if crosses_to_short_etf else 0,
+                        target_pair_qty_deviation,
+                        shape_error,
+                        target_pair_qty_deviation_balance,
+                        abs(target_hedge_qty),
+                        option_trade_qty,
+                        abs(target_pair_value_error),
+                    )
+                    fallback_score = (
+                        1 if crosses_to_short_etf else 0,
+                        abs(combined_delta),
+                        normalized_combined_delta,
+                        target_pair_qty_deviation,
+                        shape_error,
+                        option_trade_qty,
+                    )
+                    candidate = {
+                        "close_call_qty": close_call_qty,
+                        "open_call_qty": open_call_qty,
+                        "close_put_qty": close_put_qty,
+                        "open_put_qty": open_put_qty,
+                        "target_call_qty": target_call_qty,
+                        "target_put_qty": target_put_qty,
+                        "delta_effect": delta_effect,
+                        "projected_option_delta": projected_option_delta,
+                        "target_hedge_qty": target_hedge_qty,
+                        "trade_etf_qty": trade_etf_qty,
+                        "combined_delta": combined_delta,
+                        "normalized_combined_delta": normalized_combined_delta,
+                        "premium_effect": premium_effect,
+                        "ratio_error": ratio_error,
+                        "shape_error": shape_error,
+                        "target_pair_qty_deviation": target_pair_qty_deviation,
+                        "target_pair_qty_deviation_balance": (
+                            target_pair_qty_deviation_balance
+                        ),
+                        "target_pair_value": target_pair_value,
+                        "target_straddle_value": target_straddle_value,
+                        "target_pair_value_error": target_pair_value_error,
+                        "delta_not_worse": delta_not_worse,
+                        "delta_tolerance_met": delta_tolerance_met,
+                        "score": score,
+                        "fallback_score": fallback_score,
+                    }
+                    if best is None or score < best["score"]:
+                        best = candidate
+                    if (
+                        fallback_best is None
+                        or fallback_score < fallback_best["fallback_score"]
+                    ):
+                        fallback_best = candidate
+
+    if best is None:
+        best = fallback_best
+    if best is None:
+        return None
+
+    current_margin = _current_short_margin(
+        config,
+        short_position,
+        call_row,
+        put_row,
+        spot,
+    )
+    target_margin = core.position.calc_short_margin(
+        call_row,
+        put_row,
+        best["target_call_qty"],
+        best["target_put_qty"],
+        spot,
+    )
+    fee = core.position.calc_option_fee(
+        best["open_call_qty"] + best["close_call_qty"],
+        best["open_put_qty"] + best["close_put_qty"],
+        config.backtest.option_fee_per_contract,
+    )
+    cash_delta = best["premium_effect"] - fee
+    etf_correction_cost = float(best["trade_etf_qty"]) * float(spot) * (
+        1.0 + float(config.backtest.etf_fee_rate)
+    )
+    projected_cash = float(live_account.cash) + cash_delta - etf_correction_cost
+    min_cash = float(config.backtest.min_cash_reserve)
+    if projected_cash < min_cash:
+        return None
+
+    gamma_effect = _atm_shape_rebalance_greek_effect(
+        call_row,
+        put_row,
+        best["open_call_qty"],
+        best["close_call_qty"],
+        best["open_put_qty"],
+        best["close_put_qty"],
+        multiplier,
+        "gamma",
+    )
+    vega_effect = _atm_shape_rebalance_greek_effect(
+        call_row,
+        put_row,
+        best["open_call_qty"],
+        best["close_call_qty"],
+        best["open_put_qty"],
+        best["close_put_qty"],
+        multiplier,
+        "vega",
+    )
+    theta_effect = _atm_shape_rebalance_greek_effect(
+        call_row,
+        put_row,
+        best["open_call_qty"],
+        best["close_call_qty"],
+        best["open_put_qty"],
+        best["close_put_qty"],
+        multiplier,
+        "theta",
+    )
+
+    item = {
+        "action": (
+            "FINAL_ATM_STRADDLE_SHAPE_REBALANCE"
+            if final
+            else "ATM_STRADDLE_SHAPE_REBALANCE"
+        ),
+        "priority": "action",
+        "side": "short",
+        "reason": (
+            "Current ATM short straddle legs are imbalanced; rebalance option legs "
+            "toward the target straddle shape first, then use ETF only for the "
+            "remaining delta gap."
+        ),
+        "close_source": "core_short_straddle",
+        "close_call_code": call_row.get("order_book_id"),
+        "close_call_qty": best["close_call_qty"],
+        "estimated_close_call_price": call_price,
+        "open_call_code": call_row.get("order_book_id"),
+        "open_call_qty": best["open_call_qty"],
+        "estimated_open_call_price": call_price,
+        "close_put_code": put_row.get("order_book_id"),
+        "close_put_qty": best["close_put_qty"],
+        "estimated_close_put_price": put_price,
+        "open_put_code": put_row.get("order_book_id"),
+        "open_put_qty": best["open_put_qty"],
+        "estimated_open_put_price": put_price,
+        "current_call_code": call_row.get("order_book_id"),
+        "current_put_code": put_row.get("order_book_id"),
+        "current_call_qty": current_call_qty,
+        "current_put_qty": current_put_qty,
+        "target_call_code": call_row.get("order_book_id"),
+        "target_put_code": put_row.get("order_book_id"),
+        "target_call_qty": best["target_call_qty"],
+        "target_put_qty": best["target_put_qty"],
+        "strike": float(short_position.get("strike", call_row.get("strike_price"))),
+        "expiry": short_position.get("expiry")
+        or str(pd.Timestamp(call_row.get("maturity_date")).date()),
+        "estimated_delta_effect": best["delta_effect"],
+        "estimated_gamma_effect": gamma_effect,
+        "estimated_vega_effect": vega_effect,
+        "estimated_theta_effect": theta_effect,
+        "account_delta_before_shape_rebalance": account_delta,
+        "projected_account_delta_after_option_hedge": (
+            best["projected_option_delta"] + current_hedge_qty
+        ),
+        "projected_option_delta_after_shape_rebalance": best["projected_option_delta"],
+        "etf_delta_correction": best["trade_etf_qty"],
+        "projected_account_delta_after_combined_hedge": best["combined_delta"],
+        "option_delta": option_delta,
+        "current_hedge_qty": current_hedge_qty,
+        "target_hedge_qty": best["target_hedge_qty"],
+        "trade_etf_qty": best["trade_etf_qty"],
+        "estimated_price": float(spot),
+        "estimated_fee": fee,
+        "estimated_cash_effect": cash_delta,
+        "estimated_etf_correction_cost": etf_correction_cost,
+        "estimated_option_margin": target_margin,
+        "estimated_margin_change": target_margin - current_margin,
+        "estimated_market_value_effect": best["premium_effect"],
+        "market_value_preservation_error": abs(best["premium_effect"]),
+        "target_call_put_ratio_error": best["ratio_error"],
+        "target_pair_qty": target_pair_qty,
+        "target_pair_qty_deviation": best["target_pair_qty_deviation"],
+        "target_pair_qty_deviation_balance": (
+            best["target_pair_qty_deviation_balance"]
+        ),
+        "target_pair_market_value": best["target_pair_value"],
+        "target_straddle_market_value": best["target_straddle_value"],
+        "target_pair_market_value_error": best["target_pair_value_error"],
+        "normalized_combined_delta": best["normalized_combined_delta"],
+        "normalized_delta_tolerance": normalized_delta_tolerance,
+        "delta_not_worse": best["delta_not_worse"],
+        "delta_tolerance_met": best["delta_tolerance_met"],
+        "projected_cash_after": projected_cash,
+        "min_cash_reserve": min_cash,
+        "solver_priority": (
+            "configured_delta_tolerance_then_target_pair_qty_deviation_then_ratio_then_etf"
+        ),
+        "underlying_order_book_id": underlying_order_book_id,
+    }
+    if after_actions is not None:
+        item["after_actions"] = after_actions
+    return item
+
+
 def _atm_straddle_delta_rebalance_item(
     config,
     live_account,
@@ -2092,13 +2491,13 @@ def _atm_straddle_delta_rebalance_item(
 
     best = None
     fallback_best = None
-    target_pair_qty = int(
-        getattr(config.strategy, "atm_rebalance_target_pair_qty", 10) or 10
-    )
+    target_pair_qty = _atm_rebalance_target_pair_qty(config, side="short")
     target_pair_value = (
         target_pair_qty * call_price + target_pair_qty * put_price
     ) * multiplier
-    normalized_delta_tolerance = 0.05
+    normalized_delta_tolerance = max(
+        0.0, float(config.strategy.delta_hedge_tolerance_ratio)
+    )
     for close_put_qty in range(0, current_put_qty + 1):
         for open_call_qty in range(0, max_open_call + 1):
             if close_put_qty <= 0 and open_call_qty <= 0:
@@ -2150,10 +2549,11 @@ def _atm_straddle_delta_rebalance_item(
             target_pair_qty_deviation_balance = abs(
                 call_qty_deviation - put_qty_deviation
             )
-            delta_tolerance_met = normalized_combined_delta < normalized_delta_tolerance
+            delta_tolerance_met = (
+                normalized_combined_delta <= normalized_delta_tolerance
+            )
             score = (
                 0 if delta_tolerance_met else 1,
-                0.0 if delta_tolerance_met else abs(combined_delta),
                 target_pair_qty_deviation_balance,
                 target_pair_qty_deviation,
                 abs(target_pair_value_error),
@@ -2187,7 +2587,7 @@ def _atm_straddle_delta_rebalance_item(
                 "score": score,
                 "fallback_score": fallback_score,
             }
-            if best is None or score < best["score"]:
+            if delta_tolerance_met and (best is None or score < best["score"]):
                 best = candidate
             if fallback_best is None or fallback_score < fallback_best["fallback_score"]:
                 fallback_best = candidate
@@ -2322,7 +2722,7 @@ def _atm_straddle_delta_rebalance_item(
         "projected_cash_after": projected_cash,
         "min_cash_reserve": min_cash,
         "solver_priority": (
-            "normalized_delta_lt_0.05_then_target_pair_qty_deviation_balance_then_deviation_then_market_value"
+            "configured_delta_tolerance_then_target_pair_qty_deviation_balance_then_deviation_then_market_value"
         ),
         "underlying_order_book_id": underlying_order_book_id,
         "open_legs": [
@@ -2410,6 +2810,26 @@ def _atm_rebalance_greek_effect(
     ) * float(multiplier)
 
 
+def _atm_shape_rebalance_greek_effect(
+    call_row,
+    put_row,
+    open_call_qty,
+    close_call_qty,
+    open_put_qty,
+    close_put_qty,
+    multiplier,
+    greek_key,
+):
+    call_value = float(call_row.get(greek_key, 0.0) or 0.0)
+    put_value = float(put_row.get(greek_key, 0.0) or 0.0)
+    return (
+        -float(open_call_qty) * call_value
+        + float(close_call_qty) * call_value
+        - float(open_put_qty) * put_value
+        + float(close_put_qty) * put_value
+    ) * float(multiplier)
+
+
 def _close_existing_option_hedge_plan(live_account, chain_df, account_greeks):
     close_items = []
     core_greeks = deepcopy(account_greeks)
@@ -2464,6 +2884,8 @@ def _etf_hedge_item(
         "account_delta": account_delta,
         "target_hedge_qty": target_qty,
         "trade_etf_qty": trade_qty,
+        "estimated_delta_effect": trade_qty,
+        "projected_account_delta_after_hedge": option_delta + target_qty,
         "estimated_price": spot,
         "underlying_order_book_id": underlying_order_book_id,
     }
