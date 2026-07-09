@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from types import SimpleNamespace
 
 import _bootstrap  # noqa: F401
 import core
 from core.live import account_report
+import capture_intraday_quotes
 
 
 def parse_args():
@@ -48,6 +50,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    intraday_capture = _capture_intraday_for_report(
+        args.product,
+        args.account_id,
+    )
     payload = account_report.build_live_account_report(
         args.product,
         account_id=args.account_id,
@@ -77,8 +83,35 @@ def main():
             print(f"account_report_total_excel={paths['total_excel']}")
         print(f"account_report_json={paths['json']}")
 
+    if not args.json:
+        for line in account_report.format_intraday_data_usage(
+            payload,
+            capture_result=intraday_capture,
+        ):
+            print(line)
+
     for line in account_report.format_terminal_summary(payload, mode=args.mode):
         print(line)
+
+
+def _capture_intraday_for_report(product, account_id):
+    capture_args = SimpleNamespace(
+        product=product,
+        account_id=account_id,
+        output_dir=None,
+        option_code=[],
+        no_account_positions=False,
+        save_option_greeks_snapshot=False,
+    )
+    try:
+        return capture_intraday_quotes.capture_once(capture_args)
+    except Exception as exc:
+        return {
+            "captured_at": None,
+            "etf_rows": 0,
+            "option_minute_rows": {},
+            "errors": [f"{type(exc).__name__}:{exc}"],
+        }
 
 
 if __name__ == "__main__":

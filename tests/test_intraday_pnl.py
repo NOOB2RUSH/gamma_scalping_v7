@@ -100,7 +100,7 @@ def test_intraday_pnl_uses_previous_close_positions_and_latest_snapshot(tmp_path
     monkeypatch.setattr(
         intraday_pnl,
         "_current_greeks",
-        lambda product, row, price, spot, signed_qty: {"iv": 0.22},
+        lambda product, row, price, spot, signed_qty, quote_date, snapshot_timestamp: {"iv": 0.22},
     )
 
     payload = intraday_pnl.calculate_intraday_pnl("300etf")

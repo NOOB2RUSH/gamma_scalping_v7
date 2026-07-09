@@ -282,6 +282,8 @@ def _compile_advice_item(
     if action in {
         "ATM_STRADDLE_DELTA_REBALANCE",
         "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
+        "ATM_STRADDLE_SHAPE_REBALANCE",
+        "FINAL_ATM_STRADDLE_SHAPE_REBALANCE",
     }:
         return _atm_straddle_delta_rebalance_orders(
             item,
@@ -353,6 +355,8 @@ def _fills_from_advice(
     if action in {
         "ATM_STRADDLE_DELTA_REBALANCE",
         "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
+        "ATM_STRADDLE_SHAPE_REBALANCE",
+        "FINAL_ATM_STRADDLE_SHAPE_REBALANCE",
     }:
         fill = _atm_straddle_delta_rebalance_fill(
             item,
@@ -626,30 +630,69 @@ def _atm_straddle_delta_rebalance_fill(
     position = ((signal.get("account") or {}).get("positions") or {}).get("short")
     if not position:
         return None
+    close_call_qty = _int_qty(item.get("close_call_qty"))
     close_put_qty = _int_qty(item.get("close_put_qty"))
+    open_put_qty = _int_qty(item.get("open_put_qty"))
     open_call_qty = _int_qty(item.get("open_call_qty"))
-    if close_put_qty <= 0 and open_call_qty <= 0:
+    if close_call_qty <= 0 and close_put_qty <= 0 and open_call_qty <= 0 and open_put_qty <= 0:
         return None
+    close_call_price = float(item.get("estimated_close_call_price", 0.0) or 0.0)
     close_put_price = float(item.get("estimated_close_put_price", 0.0) or 0.0)
     open_call_price = float(item.get("estimated_open_call_price", 0.0) or 0.0)
+    open_put_price = float(item.get("estimated_open_put_price", 0.0) or 0.0)
     target_call_qty = _int_qty(
         item.get(
             "target_call_qty",
-            int(position.get("call_qty", 0) or 0) + open_call_qty,
+            int(position.get("call_qty", 0) or 0) - close_call_qty + open_call_qty,
         )
     )
     target_put_qty = _int_qty(
         item.get(
             "target_put_qty",
-            int(position.get("put_qty", 0) or 0) - close_put_qty,
+            int(position.get("put_qty", 0) or 0) - close_put_qty + open_put_qty,
         )
     )
-    fee = (close_put_qty + open_call_qty) * float(option_fee_per_contract)
+    fee = (
+        close_call_qty + close_put_qty + open_call_qty + open_put_qty
+    ) * float(option_fee_per_contract)
     cash_delta = (
         open_call_qty * open_call_price * multiplier
+        + open_put_qty * open_put_price * multiplier
+        - close_call_qty * close_call_price * multiplier
         - close_put_qty * close_put_price * multiplier
         - fee
     )
+    leg_adjustments = [
+        {
+            "leg": "call",
+            "qty_change": -close_call_qty,
+            "price": close_call_price,
+            "order_book_id": position.get("call_code"),
+        },
+        {
+            "leg": "put",
+            "qty_change": -close_put_qty,
+            "price": close_put_price,
+            "order_book_id": position.get("put_code"),
+        },
+        {
+            "leg": "call",
+            "qty_change": open_call_qty,
+            "price": open_call_price,
+            "order_book_id": position.get("call_code"),
+        },
+        {
+            "leg": "put",
+            "qty_change": open_put_qty,
+            "price": open_put_price,
+            "order_book_id": position.get("put_code"),
+        },
+    ]
+    leg_adjustments = [
+        adjustment
+        for adjustment in leg_adjustments
+        if _int_qty(abs(adjustment["qty_change"])) > 0
+    ]
     return {
         "action": "rebalance_straddle_legs",
         "date": date,
@@ -671,20 +714,7 @@ def _atm_straddle_delta_rebalance_fill(
         "underlying_order_book_id": position.get("underlying_order_book_id")
         or item.get("underlying_order_book_id"),
         "cash_delta": cash_delta,
-        "leg_adjustments": [
-            {
-                "leg": "put",
-                "qty_change": -close_put_qty,
-                "price": close_put_price,
-                "order_book_id": position.get("put_code"),
-            },
-            {
-                "leg": "call",
-                "qty_change": open_call_qty,
-                "price": open_call_price,
-                "order_book_id": position.get("call_code"),
-            },
-        ],
+        "leg_adjustments": leg_adjustments,
         "source_file": source_file,
         "import_source": "infinitrader_command",
     }
@@ -704,11 +734,25 @@ def _atm_straddle_delta_rebalance_orders(
     action: str,
 ) -> list[InfiniOrder]:
     orders: list[InfiniOrder] = []
+    close_call_qty = _int_qty(item.get("close_call_qty"))
+    if close_call_qty > 0:
+        orders.append(
+            _option_order(
+                start_sequence,
+                action,
+                "atm_rebalance_close_call",
+                item.get("close_call_code"),
+                BUY,
+                OFFSET_CLOSE,
+                close_call_qty,
+                item.get("estimated_close_call_price"),
+            )
+        )
     close_put_qty = _int_qty(item.get("close_put_qty"))
     if close_put_qty > 0:
         orders.append(
             _option_order(
-                start_sequence,
+                start_sequence + len(orders),
                 action,
                 "atm_rebalance_close_put",
                 item.get("close_put_code"),
@@ -730,6 +774,20 @@ def _atm_straddle_delta_rebalance_orders(
                 OFFSET_OPEN,
                 open_call_qty,
                 item.get("estimated_open_call_price"),
+            )
+        )
+    open_put_qty = _int_qty(item.get("open_put_qty"))
+    if open_put_qty > 0:
+        orders.append(
+            _option_order(
+                start_sequence + len(orders),
+                action,
+                "atm_rebalance_open_put",
+                item.get("open_put_code"),
+                SELL,
+                OFFSET_OPEN,
+                open_put_qty,
+                item.get("estimated_open_put_price"),
             )
         )
     return orders

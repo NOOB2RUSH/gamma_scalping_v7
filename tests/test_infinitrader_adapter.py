@@ -69,6 +69,78 @@ def test_compile_atm_straddle_delta_rebalance_orders_and_fill():
     assert fill["cash_delta"] == 96.0
 
 
+def test_compile_atm_straddle_shape_rebalance_orders_and_fill():
+    payload = {
+        "product": "50etf",
+        "account_id": "default",
+        "date": "2026-07-06",
+        "account": {
+            "positions": {
+                "short": {
+                    "call_code": "100CALL",
+                    "put_code": "100PUT",
+                    "call_qty": 14,
+                    "put_qty": 6,
+                    "strike": 3.1,
+                    "expiry": "2026-07-22",
+                    "entry_call_price": 0.03,
+                    "entry_put_price": 0.08,
+                    "entry_option_value": 9_000.0,
+                    "option_margin": 80_000.0,
+                    "contract_multiplier": 10000,
+                }
+            }
+        },
+        "advice": [
+            {
+                "action": "ATM_STRADDLE_SHAPE_REBALANCE",
+                "priority": "action",
+                "side": "short",
+                "close_call_code": "100CALL",
+                "close_call_qty": 4,
+                "estimated_close_call_price": 0.028,
+                "target_call_qty": 10,
+                "target_put_qty": 6,
+                "trade_etf_qty": -3900,
+                "target_hedge_qty": 0,
+                "estimated_option_margin": 70_000.0,
+                "estimated_price": 3.051,
+                "underlying_order_book_id": "510050.XSHG",
+            }
+        ],
+    }
+
+    orders = infinitrader.compile_signal_orders(payload)
+
+    assert [
+        (
+            order["instrument_id"],
+            order["order_direction"],
+            order["offset"],
+            order["volume"],
+        )
+        for order in orders
+    ] == [
+        ("100CALL", "buy", "1", 4),
+        ("510050", "sell", None, 3900),
+    ]
+
+    fills = infinitrader.build_fills_from_command(
+        {"product": "50etf", "date": "2026-07-06", "signal": payload}
+    )
+
+    assert [fill["action"] for fill in fills] == [
+        "rebalance_straddle_legs",
+        "delta_hedge",
+    ]
+    assert fills[0]["call_qty"] == 10
+    assert fills[0]["put_qty"] == 6
+    assert fills[0]["option_margin"] == 70_000.0
+    assert fills[0]["cash_delta"] == -1128.0
+    assert fills[1]["trade_etf_qty"] == -3900
+    assert fills[1]["target_hedge_qty"] == 0
+
+
 def test_compile_roll_short_straddle_orders_close_then_open():
     payload = {
         "advice": [

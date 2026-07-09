@@ -1204,6 +1204,156 @@ def format_terminal_summary(payload, mode="default"):
     return lines
 
 
+def format_intraday_data_usage(payload, capture_result=None):
+    product = payload.get("product")
+    report_date = payload.get("date")
+    lines = [
+        (
+            f"intraday_usage product={product} report_date={report_date} "
+            f"valuation_source=quote_snapshot "
+            f"snapshot_time={_snapshot_time_text(payload.get('quote_snapshot'))} "
+            f"spot={_fmt(payload.get('spot'))}"
+        )
+    ]
+    if capture_result is not None:
+        errors = capture_result.get("errors") or []
+        if errors:
+            lines.append(
+                f"WARNING intraday_capture product={product} errors={errors}"
+            )
+        else:
+            lines.append(
+                f"intraday_capture product={product} captured_at="
+                f"{capture_result.get('captured_at')} etf_rows="
+                f"{capture_result.get('etf_rows')} option_minute_rows="
+                f"{capture_result.get('option_minute_rows')}"
+            )
+
+    lines.extend(_intraday_coverage_lines(product, report_date, payload))
+    lines.extend(_transaction_price_source_lines(product, report_date, payload))
+    return lines
+
+
+def _intraday_coverage_lines(product, report_date, payload):
+    if not product or not report_date:
+        return []
+    spec = market_data.SSE_ETF_OPTION_SPECS.get(product)
+    if spec is None:
+        return [f"intraday_coverage product={product} unsupported_product=true"]
+    day = pd.Timestamp(report_date).strftime("%Y%m%d")
+    root = storage.PROJECT_ROOT / "data" / "live" / product / "intraday" / day
+    lines = []
+    etf_path = root / f"etf_{spec.etf_symbol}_1m.csv"
+    lines.append(
+        _format_intraday_file_coverage(
+            product,
+            f"etf={spec.etf_symbol}",
+            etf_path,
+        )
+    )
+    for code in _intraday_option_codes_from_payload(payload):
+        lines.append(
+            _format_intraday_file_coverage(
+                product,
+                f"option={code}",
+                root / f"option_{code}_1m.csv",
+            )
+        )
+    return lines
+
+
+def _intraday_option_codes_from_payload(payload):
+    codes = []
+    for row in payload.get("position_rows") or []:
+        code = _security_code(row.get("合约代码"))
+        if code and code.startswith("100"):
+            codes.append(code)
+    for row in payload.get("trade_rows") or []:
+        code = _security_code(row.get("合约代码"))
+        if code and code.startswith("100"):
+            codes.append(code)
+    return sorted(dict.fromkeys(codes))
+
+
+def _format_intraday_file_coverage(product, label, path):
+    summary = _intraday_file_coverage(path)
+    if summary is None:
+        return f"intraday_coverage product={product} {label} status=missing path={path}"
+    return (
+        f"intraday_coverage product={product} {label} rows={summary['rows']} "
+        f"first={_fmt_timestamp(summary['first'])} "
+        f"last={_fmt_timestamp(summary['last'])} path={path}"
+    )
+
+
+def _intraday_file_coverage(path):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        frame = pd.read_csv(path, encoding="utf-8-sig")
+    except Exception:
+        return None
+    if frame.empty or "timestamp" not in frame.columns:
+        return None
+    timestamp = pd.to_datetime(frame["timestamp"], errors="coerce").dropna()
+    if timestamp.empty:
+        return None
+    return {
+        "rows": int(len(frame)),
+        "first": timestamp.min(),
+        "last": timestamp.max(),
+    }
+
+
+def _transaction_price_source_lines(product, report_date, payload):
+    lines = []
+    if not product or not report_date:
+        return lines
+    for row in payload.get("trade_rows") or []:
+        if str(row.get("类型") or "") == "ETF对冲":
+            continue
+        code = _security_code(row.get("合约代码"))
+        if not code or not code.startswith("100"):
+            continue
+        timestamp = _trade_row_timestamp(row, report_date)
+        if timestamp is None:
+            lines.append(
+                f"transaction_price_source product={product} code={code} "
+                "trade_time=missing spot_source=report_close "
+                f"spot={_fmt(payload.get('spot'))}"
+            )
+            continue
+        detail = _spot_from_intraday_minute_detail(product, report_date, timestamp)
+        if detail is None:
+            detail = _spot_from_quote_snapshot_detail(product, report_date, timestamp)
+        if detail is None:
+            lines.append(
+                f"transaction_price_source product={product} code={code} "
+                f"trade_time={_fmt_timestamp(timestamp)} "
+                f"spot_source=report_close spot_time={report_date} "
+                f"spot={_fmt(payload.get('spot'))}"
+            )
+            continue
+        lines.append(
+            f"transaction_price_source product={product} code={code} "
+            f"trade_time={_fmt_timestamp(timestamp)} "
+            f"spot_source={detail['source']} "
+            f"spot_time={_fmt_timestamp(detail['timestamp'])} "
+            f"spot={_fmt(detail['price'])}"
+        )
+    return lines
+
+
+def _fmt_timestamp(value):
+    if value is None:
+        return "None"
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        return "None"
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _snapshot_time_text(snapshot):
     if not snapshot:
         return "不可用"
@@ -2663,7 +2813,12 @@ def _segmented_intraday_option_greeks(
     if len(timestamps) < 2:
         return None
 
-    rows_by_code = _option_position_rows_by_code(previous_positions, current_positions)
+    rows_by_code = _option_position_rows_by_code(
+        previous_positions,
+        current_positions,
+        previous_date=previous_date,
+        current_date=current_date,
+    )
     start_qty = _signed_option_quantities(previous_positions)
     qty_by_code = dict(start_qty)
     codes = set(rows_by_code) | set(start_qty)
@@ -2679,6 +2834,7 @@ def _segmented_intraday_option_greeks(
     node_count_hint = len(timestamps) + len(events_by_ts)
     excluded_new_trade_count = 0
     for raw_index, timestamp in enumerate(timestamps):
+        node_progress = _timestamp_progress(timestamp, start_ts, end_ts)
         if node_index == 0:
             spot = float(start_spot)
         elif raw_index == len(timestamps) - 1:
@@ -2718,6 +2874,7 @@ def _segmented_intraday_option_greeks(
             prices,
             rows_by_code,
             qty_by_code,
+            node_progress=node_progress,
         )
         if state is None:
             return None
@@ -2748,6 +2905,7 @@ def _segmented_intraday_option_greeks(
                 prices,
                 rows_by_code,
                 qty_by_code,
+                node_progress=node_progress,
             )
             if post_state is None:
                 return None
@@ -2764,7 +2922,23 @@ def _segmented_intraday_option_greeks(
     return parts
 
 
-def _option_position_rows_by_code(previous_positions, current_positions):
+def _timestamp_progress(timestamp, start_ts, end_ts):
+    start_ts = pd.Timestamp(start_ts)
+    end_ts = pd.Timestamp(end_ts)
+    timestamp = pd.Timestamp(timestamp)
+    total_seconds = (end_ts - start_ts).total_seconds()
+    if total_seconds <= 0:
+        return 1.0
+    progress = (timestamp - start_ts).total_seconds() / total_seconds
+    return min(max(float(progress), 0.0), 1.0)
+
+
+def _option_position_rows_by_code(
+    previous_positions,
+    current_positions,
+    previous_date=None,
+    current_date=None,
+):
     rows = {}
     for label, frame in [("previous", previous_positions), ("current", current_positions)]:
         if frame is None or frame.empty:
@@ -2774,6 +2948,9 @@ def _option_position_rows_by_code(previous_positions, current_positions):
             if code is None:
                 continue
             rows.setdefault(code, {})[label] = row
+    for values in rows.values():
+        values["_previous_date"] = previous_date
+        values["_current_date"] = current_date
     return rows
 
 
@@ -2903,6 +3080,7 @@ def _segmented_node_greeks(
     prices,
     rows_by_code,
     qty_by_code,
+    node_progress=None,
 ):
     totals = {
         "timestamp": timestamp,
@@ -2940,6 +3118,7 @@ def _segmented_node_greeks(
             float(qty),
             node_index,
             node_count,
+            node_progress=node_progress,
         )
         if greeks is None:
             return None
@@ -2960,11 +3139,50 @@ def _single_node_option_greeks(
     signed_qty,
     node_index,
     node_count,
+    node_progress=None,
 ):
     strike = _number(row.get("行权价"))
     if strike is None or strike <= 0:
         return None
-    dte = _segmented_node_dte(rows, node_index, node_count)
+    dte = _segmented_node_dte(
+        rows,
+        node_index,
+        node_count,
+        node_progress=node_progress,
+    )
+    if dte is None or dte <= 0:
+        return None
+    fallback_iv = _segmented_node_reference_iv(
+        rows,
+        node_index,
+        node_count,
+        node_progress=node_progress,
+    )
+    return _option_greeks_for_dte(
+        product,
+        row,
+        price,
+        spot,
+        flag,
+        signed_qty,
+        dte,
+        fallback_iv=fallback_iv,
+    )
+
+
+def _option_greeks_for_dte(
+    product,
+    row,
+    price,
+    spot,
+    flag,
+    signed_qty,
+    dte,
+    fallback_iv=None,
+):
+    strike = _number(row.get("行权价"))
+    if strike is None or strike <= 0:
+        return None
     if dte is None or dte <= 0:
         return None
     config = load_product_config(product)
@@ -2988,7 +3206,7 @@ def _single_node_option_greeks(
     if iv is None or iv < 0:
         iv = 0.0
     if iv <= 0:
-        iv = _segmented_node_reference_iv(rows, node_index, node_count)
+        iv = fallback_iv
     if iv is None or iv <= 0:
         return None
     kwargs = {
@@ -3019,24 +3237,48 @@ def _single_node_option_greeks(
     }
 
 
-def _segmented_node_dte(rows, node_index, node_count):
+def _segmented_node_dte(rows, node_index, node_count, node_progress=None):
     previous = rows.get("previous")
     current = rows.get("current")
     previous_dte = _number(previous.get("剩余天数")) if previous is not None else None
     current_dte = _number(current.get("剩余天数")) if current is not None else None
+    maturity = None
+    for row in [current, previous]:
+        if row is not None and row.get("到期日") is not None:
+            maturity = row.get("到期日")
+            break
+    if maturity is not None:
+        calendar = market_data.load_live_trading_calendar()
+        if previous_dte is None and rows.get("_previous_date") is not None:
+            previous_dte = core.vol_engine._count_trading_dte(
+                rows["_previous_date"],
+                maturity,
+                trading_calendar=calendar,
+            )
+        if current_dte is None and rows.get("_current_date") is not None:
+            current_dte = core.vol_engine._count_trading_dte(
+                rows["_current_date"],
+                maturity,
+                trading_calendar=calendar,
+            )
     if previous_dte is None and current_dte is None:
         return None
     if node_count <= 1:
         return current_dte if current_dte is not None else previous_dte
+    progress = (
+        float(node_progress)
+        if node_progress is not None
+        else float(node_index) / float(node_count - 1)
+    )
+    progress = min(max(progress, 0.0), 1.0)
     if previous_dte is None:
-        previous_dte = float(current_dte) + 1.0
+        return float(current_dte) if progress >= 1.0 else None
     if current_dte is None:
-        current_dte = max(float(previous_dte) - 1.0, 0.0)
-    progress = float(node_index) / float(node_count - 1)
+        return float(previous_dte) if progress <= 0.0 else None
     return float(previous_dte) + progress * (float(current_dte) - float(previous_dte))
 
 
-def _segmented_node_reference_iv(rows, node_index, node_count):
+def _segmented_node_reference_iv(rows, node_index, node_count, node_progress=None):
     previous = rows.get("previous")
     current = rows.get("current")
     previous_iv = _number(previous.get("IV")) if previous is not None else None
@@ -3051,7 +3293,11 @@ def _segmented_node_reference_iv(rows, node_index, node_count):
         return float(previous_iv)
     if node_count <= 1:
         return float(current_iv)
-    progress = float(node_index) / float(node_count - 1)
+    progress = (
+        float(node_progress)
+        if node_progress is not None
+        else float(node_index) / float(node_count - 1)
+    )
     progress = min(max(progress, 0.0), 1.0)
     return float(previous_iv) + progress * (float(current_iv) - float(previous_iv))
 
@@ -3288,6 +3534,13 @@ def _trade_row_timestamp(row, report_date):
 
 
 def _spot_from_intraday_minute(product, report_date, timestamp):
+    detail = _spot_from_intraday_minute_detail(product, report_date, timestamp)
+    if detail is None:
+        return None
+    return detail["price"]
+
+
+def _spot_from_intraday_minute_detail(product, report_date, timestamp):
     spec = market_data.SSE_ETF_OPTION_SPECS.get(product)
     if spec is None:
         return None
@@ -3314,10 +3567,26 @@ def _spot_from_intraday_minute(product, report_date, timestamp):
     frame = frame.loc[frame["timestamp"].le(timestamp)].sort_values("timestamp")
     if frame.empty:
         return None
-    return float(frame.iloc[-1]["close"])
+    latest = frame.iloc[-1]
+    latest_timestamp = pd.Timestamp(latest["timestamp"])
+    if pd.Timestamp(timestamp) - latest_timestamp > pd.Timedelta(minutes=5):
+        return None
+    return {
+        "source": "intraday_minute",
+        "timestamp": latest_timestamp,
+        "price": float(latest["close"]),
+        "path": str(path),
+    }
 
 
 def _spot_from_quote_snapshot(product, report_date, timestamp):
+    detail = _spot_from_quote_snapshot_detail(product, report_date, timestamp)
+    if detail is None:
+        return None
+    return detail["price"]
+
+
+def _spot_from_quote_snapshot_detail(product, report_date, timestamp):
     root = (
         storage.PROJECT_ROOT
         / "data"
@@ -3341,7 +3610,7 @@ def _spot_from_quote_snapshot(product, report_date, timestamp):
             candidates.append((snapshot_ts, path))
     if not candidates:
         return None
-    _, path = sorted(candidates, key=lambda item: item[0])[-1]
+    snapshot_ts, path = sorted(candidates, key=lambda item: item[0])[-1]
     try:
         frame = pd.read_parquet(path)
     except Exception:
@@ -3349,7 +3618,14 @@ def _spot_from_quote_snapshot(product, report_date, timestamp):
     if frame.empty or "close" not in frame.columns:
         return None
     close = _number(frame.iloc[-1].get("close"))
-    return close
+    if close is None:
+        return None
+    return {
+        "source": "quote_snapshot",
+        "timestamp": snapshot_ts,
+        "price": close,
+        "path": str(path),
+    }
 
 
 def _add_summary_greeks_pnl_for_account(
@@ -3677,27 +3953,33 @@ def _transaction_option_greeks_pnl(product, report_date, trade, rows_by_code, cl
     close_price = _transaction_option_close_price(product, report_date, code, rows)
     if close_price is None:
         return None
-    start_greeks = _single_node_option_greeks(
+    close_dte = _option_close_dte(product, report_date, rows, reference)
+    if close_dte is None or close_dte <= 0:
+        return None
+    start_dte = float(close_dte) + _remaining_trading_day_fraction(
+        timestamp,
+        report_date,
+    )
+    fallback_iv = _transaction_reference_iv(rows, reference)
+    start_greeks = _option_greeks_for_dte(
         product,
-        rows,
         reference,
         float(trade_price),
         float(start_spot),
         flag,
         float(signed_qty),
-        0,
-        2,
+        start_dte,
+        fallback_iv=fallback_iv,
     )
-    end_greeks = _single_node_option_greeks(
+    end_greeks = _option_greeks_for_dte(
         product,
-        rows,
         reference,
         float(close_price),
         float(close_spot),
         flag,
         float(signed_qty),
-        1,
-        2,
+        float(close_dte),
+        fallback_iv=fallback_iv,
     )
     if start_greeks is None or end_greeks is None:
         return None
@@ -3709,6 +3991,65 @@ def _transaction_option_greeks_pnl(product, report_date, trade, rows_by_code, cl
         "vega_pnl": start_greeks["vega"] * (end_greeks["iv"] - start_greeks["iv"]) * 100.0,
         "theta_pnl": start_greeks["theta"] * theta_fraction,
     }
+
+
+def _option_close_dte(product, report_date, rows, reference):
+    calendar = market_data.load_live_trading_calendar()
+    for row in [
+        rows.get("current") if rows else None,
+        reference,
+        rows.get("previous") if rows else None,
+    ]:
+        if row is None:
+            continue
+        maturity = row.get("到期日")
+        if maturity is None or pd.isna(maturity):
+            continue
+        try:
+            return float(
+                core.vol_engine._count_trading_dte(
+                    report_date,
+                    maturity,
+                    trading_calendar=calendar,
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+
+    current = rows.get("current") if rows else None
+    current_dte = _number(current.get("剩余天数")) if current is not None else None
+    if current_dte is not None and current_dte > 0:
+        return float(current_dte)
+
+    previous = rows.get("previous") if rows else None
+    previous_dte = _number(previous.get("剩余天数")) if previous is not None else None
+    if previous_dte is not None and previous_dte > 0:
+        previous_date = previous.get("日期")
+        try:
+            elapsed = core.vol_engine._count_trading_dte(
+                previous_date,
+                report_date,
+                trading_calendar=calendar,
+            )
+        except (TypeError, ValueError):
+            elapsed = 1
+        return max(float(previous_dte) - float(elapsed), 0.0)
+
+    return None
+
+
+def _transaction_reference_iv(rows, reference):
+    for row in [
+        rows.get("current") if rows else None,
+        reference,
+        rows.get("previous") if rows else None,
+    ]:
+        if row is None:
+            continue
+        iv = _number(row.get("IV"))
+        if iv is not None and iv > 0:
+            return float(iv)
+    return None
 
 
 def _transaction_option_close_price(product, report_date, code, rows):
@@ -3729,17 +4070,32 @@ def _transaction_option_close_price(product, report_date, code, rows):
 
 
 def _trade_to_close_fraction(timestamp, report_date):
+    return _remaining_trading_day_fraction(timestamp, report_date)
+
+
+def _remaining_trading_day_fraction(timestamp, report_date):
     try:
         timestamp = pd.Timestamp(timestamp)
     except Exception:
         return 0.0
-    close_ts = pd.Timestamp(f"{pd.Timestamp(report_date).date()} 15:00:00")
-    open_ts = pd.Timestamp(f"{pd.Timestamp(report_date).date()} 09:30:00")
+    day = pd.Timestamp(report_date).date()
+    morning_open = pd.Timestamp(f"{day} 09:30:00")
+    morning_close = pd.Timestamp(f"{day} 11:30:00")
+    afternoon_open = pd.Timestamp(f"{day} 13:00:00")
+    close_ts = pd.Timestamp(f"{day} 15:00:00")
     if timestamp >= close_ts:
         return 0.0
-    if timestamp <= open_ts:
+    if timestamp <= morning_open:
         return 1.0
-    minutes = (close_ts - timestamp).total_seconds() / 60.0
+    if timestamp < morning_close:
+        minutes = (
+            (morning_close - timestamp).total_seconds() / 60.0
+            + 120.0
+        )
+    elif timestamp < afternoon_open:
+        minutes = 120.0
+    else:
+        minutes = (close_ts - timestamp).total_seconds() / 60.0
     return min(max(minutes / 240.0, 0.0), 1.0)
 
 
@@ -3962,16 +4318,23 @@ def _current_option_iv_for_previous_position(
     if qty <= 0:
         return None
     direction = -1.0 if str(previous_position.get("方向") or "").lower() == "short" else 1.0
-    greeks = _single_node_option_greeks(
+    close_dte = _option_close_dte(
         product,
+        report_date,
         {"previous": previous_position},
+        previous_position,
+    )
+    if close_dte is None or close_dte <= 0:
+        return None
+    greeks = _option_greeks_for_dte(
+        product,
         previous_position,
         price,
         spot,
         flag,
         direction * qty,
-        1,
-        2,
+        close_dte,
+        fallback_iv=_number(previous_position.get("IV")),
     )
     if greeks is None:
         return None

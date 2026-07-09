@@ -41,6 +41,16 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
         self.assertEqual(strategy.round_etf_hedge_target(-259249.99), -259200)
         self.assertEqual(strategy.round_etf_hedge_target(0), 0)
 
+    def test_atm_rebalance_target_qty_priority(self):
+        config = _config()
+        self.assertEqual(signal_engine._atm_rebalance_target_pair_qty(config), 10)
+
+        config.backtest.short_qty = 12
+        self.assertEqual(signal_engine._atm_rebalance_target_pair_qty(config), 12)
+
+        config.strategy.atm_rebalance_target_pair_qty = 8
+        self.assertEqual(signal_engine._atm_rebalance_target_pair_qty(config), 8)
+
     def test_normalizes_straddle_by_pair_qty_not_both_legs(self):
         normalized, capacity = strategy.normalized_account_delta(
             49222.10725218244,
@@ -199,29 +209,199 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
         self.assertEqual(plan[0]["trade_etf_qty"], -5000.0)
         rebalance = plan[1]
         self.assertEqual(rebalance["close_put_code"], "PUT")
-        self.assertEqual(rebalance["close_put_qty"], 1)
+        self.assertEqual(rebalance["close_put_qty"], 2)
         self.assertEqual(rebalance["open_call_code"], "CALL")
-        self.assertEqual(rebalance["open_call_qty"], 1)
-        self.assertEqual(rebalance["target_call_qty"], 11)
-        self.assertEqual(rebalance["target_put_qty"], 9)
-        self.assertAlmostEqual(rebalance["estimated_delta_effect"], -10000.0)
-        self.assertAlmostEqual(rebalance["estimated_gamma_effect"], -100.0)
-        self.assertAlmostEqual(rebalance["estimated_vega_effect"], -20.0)
-        self.assertAlmostEqual(rebalance["estimated_theta_effect"], 10.0)
+        self.assertEqual(rebalance["open_call_qty"], 2)
+        self.assertEqual(rebalance["target_call_qty"], 12)
+        self.assertEqual(rebalance["target_put_qty"], 8)
+        self.assertAlmostEqual(rebalance["estimated_delta_effect"], -20000.0)
+        self.assertAlmostEqual(rebalance["estimated_gamma_effect"], -200.0)
+        self.assertAlmostEqual(rebalance["estimated_vega_effect"], -40.0)
+        self.assertAlmostEqual(rebalance["estimated_theta_effect"], 20.0)
         self.assertAlmostEqual(
             rebalance["projected_account_delta_after_option_hedge"],
-            2000.0,
+            -8000.0,
         )
-        self.assertAlmostEqual(rebalance["etf_delta_correction"], 0.0)
+        self.assertAlmostEqual(rebalance["etf_delta_correction"], 8000.0)
         self.assertAlmostEqual(
             rebalance["projected_account_delta_after_combined_hedge"],
-            2000.0,
+            0.0,
         )
-        self.assertAlmostEqual(rebalance["normalized_combined_delta"], 1 / 55)
-        self.assertAlmostEqual(rebalance["target_call_put_ratio_error"], 2 / 11)
-        self.assertEqual(rebalance["target_pair_qty_deviation"], 2)
+        self.assertAlmostEqual(rebalance["normalized_combined_delta"], 0.0)
+        self.assertAlmostEqual(rebalance["target_call_put_ratio_error"], 4 / 12)
+        self.assertEqual(rebalance["target_pair_qty_deviation"], 4)
         self.assertEqual(rebalance["target_pair_qty_deviation_balance"], 0)
-        self.assertAlmostEqual(rebalance["estimated_market_value_effect"], 100.0)
+        self.assertAlmostEqual(rebalance["estimated_market_value_effect"], 200.0)
+
+    def test_imbalanced_atm_straddle_rebalances_shape_before_etf(self):
+        config = _config()
+        config.strategy.allow_etf_short_hedge = False
+        config.strategy.enable_option_delta_hedge = True
+        config.strategy.delta_hedge_tolerance_ratio = 0.0
+        live_account = account.AccountState(
+            product="50etf",
+            cash=10_000_000,
+            positions={
+                "long": None,
+                "short": {
+                    "call_code": "CALL",
+                    "put_code": "PUT",
+                    "call_qty": 14,
+                    "put_qty": 6,
+                    "contract_multiplier": 10000,
+                    "strike": 3.1,
+                    "expiry": "2026-07-22",
+                    "option_margin": 80_000.0,
+                },
+            },
+            hedge=account.HedgeState(qty=3_900),
+        )
+        expiry = pd.Timestamp("2026-07-22")
+        chain = pd.DataFrame(
+            [
+                {
+                    "order_book_id": "CALL",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 3.1,
+                    "mid": 0.0283,
+                    "delta": 0.352,
+                    "gamma": 0.05,
+                    "vega": 0.010,
+                    "theta": -0.006,
+                    "volume": 100000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "PUT",
+                    "option_type": "p",
+                    "maturity_date": expiry,
+                    "strike_price": 3.1,
+                    "mid": 0.0850,
+                    "delta": -0.625,
+                    "gamma": 0.06,
+                    "vega": 0.012,
+                    "theta": -0.007,
+                    "volume": 50000,
+                    "contract_multiplier": 10000,
+                },
+            ]
+        )
+        atm = {
+            "call": chain.iloc[0],
+            "put": chain.iloc[1],
+            "strike": 3.1,
+            "expiry": expiry,
+            "underlying_order_book_id": "510050.XSHG",
+        }
+
+        plan = signal_engine._delta_hedge_plan(
+            config,
+            live_account,
+            {"delta": -11_780.0},
+            3.051,
+            chain,
+            atm,
+            action="DELTA_HEDGE",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
+            reason="test",
+        )
+
+        self.assertEqual([item["action"] for item in plan], ["DELTA_HEDGE"])
+        rebalance = plan[0]
+        self.assertEqual(rebalance["target_hedge_qty"], 11800.0)
+        self.assertEqual(rebalance["trade_etf_qty"], 7900.0)
+        self.assertAlmostEqual(rebalance["projected_account_delta_after_hedge"], 20.0)
+
+    def test_imbalanced_shape_rebalance_does_not_override_delta_control(self):
+        config = _config()
+        config.strategy.allow_etf_short_hedge = False
+        config.strategy.enable_option_delta_hedge = True
+        config.strategy.delta_hedge_tolerance_ratio = 0.10
+        live_account = account.AccountState(
+            product="50etf",
+            cash=10_000_000,
+            positions={
+                "long": None,
+                "short": {
+                    "call_code": "CALL",
+                    "put_code": "PUT",
+                    "call_qty": 14,
+                    "put_qty": 6,
+                    "contract_multiplier": 10000,
+                    "strike": 3.1,
+                    "expiry": "2026-07-22",
+                    "option_margin": 80_000.0,
+                },
+            },
+            hedge=account.HedgeState(qty=11_800),
+        )
+        expiry = pd.Timestamp("2026-07-22")
+        chain = pd.DataFrame(
+            [
+                {
+                    "order_book_id": "CALL",
+                    "option_type": "c",
+                    "maturity_date": expiry,
+                    "strike_price": 3.1,
+                    "mid": 0.0185,
+                    "delta": 0.90,
+                    "gamma": 0.05,
+                    "vega": 0.010,
+                    "theta": -0.006,
+                    "volume": 100000,
+                    "contract_multiplier": 10000,
+                },
+                {
+                    "order_book_id": "PUT",
+                    "option_type": "p",
+                    "maturity_date": expiry,
+                    "strike_price": 3.1,
+                    "mid": 0.1080,
+                    "delta": -0.07,
+                    "gamma": 0.06,
+                    "vega": 0.012,
+                    "theta": -0.007,
+                    "volume": 50000,
+                    "contract_multiplier": 10000,
+                },
+            ]
+        )
+        atm = {
+            "call": chain.iloc[0],
+            "put": chain.iloc[1],
+            "strike": 3.1,
+            "expiry": expiry,
+            "underlying_order_book_id": "510050.XSHG",
+        }
+
+        plan = signal_engine._delta_hedge_plan(
+            config,
+            live_account,
+            {"delta": 6_638.0},
+            3.017,
+            chain,
+            atm,
+            action="DELTA_HEDGE",
+            option_action="ATM_STRADDLE_DELTA_REBALANCE",
+            reason="test",
+        )
+
+        self.assertEqual([item["action"] for item in plan], [
+            "ATM_STRADDLE_SHAPE_REBALANCE",
+        ])
+        rebalance = plan[0]
+        self.assertEqual(rebalance["target_hedge_qty"], 0.0)
+        self.assertEqual(rebalance["trade_etf_qty"], -11_800.0)
+        self.assertEqual(rebalance["open_put_qty"], 4)
+        self.assertEqual(rebalance["target_call_qty"], 14)
+        self.assertEqual(rebalance["target_put_qty"], 10)
+        self.assertAlmostEqual(
+            rebalance["projected_account_delta_after_combined_hedge"],
+            9438.0,
+        )
+        self.assertTrue(rebalance["delta_not_worse"])
+        self.assertTrue(rebalance["delta_tolerance_met"])
 
     def test_one_strike_from_atm_main_straddle_can_rebalance_delta(self):
         config = _config()
