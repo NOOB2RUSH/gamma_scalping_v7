@@ -65,20 +65,6 @@ def combine_greeks(greeks_list):
     return combined
 
 
-def single_call_greeks(row, qty, side):
-    """按单腿 Call 的方向、张数和合约乘数计算 Greeks。"""
-    direction = -1 if side == "short" else 1
-    scale = float(qty) * float(row["contract_multiplier"])
-    result = empty_greeks()
-    for greek in ["delta", "gamma", "vega", "theta"]:
-        value = direction * float(row[greek]) * scale
-        result[greek] = value
-        result[f"call_{greek}"] = value
-    result["call_iv"] = row.get("iv")
-    result["position_iv"] = row.get("iv")
-    return result
-
-
 def empty_side_record():
     return {
         "option_value": 0.0,
@@ -102,7 +88,6 @@ class BacktestState:
             "short": None,
         }
     )
-    option_hedges: list[dict] = field(default_factory=list)
     hedge_etf_qty: float = 0.0
     hedge_entry_price: float = 0.0
     hedge_margin: float = 0.0
@@ -113,12 +98,7 @@ class BacktestState:
             "short": 0,
         }
     )
-    roll_cooldown_left: dict = field(
-        default_factory=lambda: {
-            "long": 0,
-            "short": 0,
-        }
-    )
+    short_entry_cooldown_left: int = 0
     trades: list[dict] = field(default_factory=list)
     daily_records: list[dict] = field(default_factory=list)
 
@@ -674,11 +654,14 @@ class BacktestEngine:
                     and state.positions[side] is None
                     and feature_row.get(signal_col, False)
                     and side not in day["skip_new_entry_by_side"]
-                    and state.roll_cooldown_left[side] <= 0
+                    and (
+                        side != "short"
+                        or state.short_entry_cooldown_left <= 0
+                    )
                 ):
                     self._open_new_position(day, state, trade_type=trade_type, side=side)
 
-            self._tick_flat_cooldowns(day, state)
+            self._tick_short_entry_cooldown(day, state)
             self._update_day_aggregates(day, state)
             if not day["defer_delta_hedge"]:
                 self._hedge_to(date, spot, state, day, day["greeks"])
@@ -700,9 +683,6 @@ class BacktestEngine:
             "side_records": {side: empty_side_record() for side in POSITION_SIDES},
             "option_value": 0.0,
             "core_option_value": 0.0,
-            "option_hedge_value": 0.0,
-            "option_hedge_margin": 0.0,
-            "option_hedge_greeks": empty_greeks(),
             "greeks": empty_greeks(),
             "pnl_position_iv": None,
             "pnl_call_iv": None,
@@ -712,7 +692,7 @@ class BacktestEngine:
             "daily_etf_fee": 0.0,
             "daily_option_fee": 0.0,
             "skip_new_entry_by_side": set(),
-            "cooldown_started_by_side": set(),
+            "short_entry_cooldown_started": False,
             "defer_delta_hedge": False,
             "data_warnings": [],
         }
@@ -827,7 +807,6 @@ class BacktestEngine:
             )
             self._add_new_option_fees(day, state, trade_count)
             state.positions[side] = None
-            self._start_cooldown(day, state, side)
             day["skip_new_entry_by_side"].add(side)
             return
 
@@ -875,16 +854,14 @@ class BacktestEngine:
             )
             self._add_new_option_fees(day, state, trade_count)
             state.positions[side] = None
-            self._start_cooldown(day, state, side)
             day["skip_new_entry_by_side"].add(side)
             if side == "long" and close_reason == "iv_high":
                 short_cooldown_days = (
                     CONFIG.strategy.short_cooldown_after_long_iv_high_exit_days
                 )
-                self._start_cooldown_for_days(
+                self._start_short_entry_cooldown(
                     day,
                     state,
-                    "short",
                     short_cooldown_days,
                 )
                 if short_cooldown_days > 0:
@@ -905,7 +882,6 @@ class BacktestEngine:
             position_dte,
         )
         position["last_option_value"] = day["side_records"][side]["option_value"]
-        self._tick_roll_cooldown(state, side)
 
     def _mark_current_positions_for_capacity(self, day, state):
         for side in POSITION_SIDES:
@@ -1049,10 +1025,6 @@ class BacktestEngine:
             for candidate_side, position in state.positions.items()
             if position is not None and candidate_side != replacing_side
         )
-        other_occupation += sum(
-            self._option_hedge_capital_occupation(position)
-            for position in state.option_hedges
-        )
         other_greeks = combine_greeks(
             [
                 day["side_records"][candidate_side]["greeks"]
@@ -1093,7 +1065,7 @@ class BacktestEngine:
         return 0
 
     def _should_roll_position(self, day, state, side, position_dte):
-        if state.roll_cooldown_left[side] > 0 or pd.isna(day["feature_row"]["atm_strike"]):
+        if pd.isna(day["feature_row"]["atm_strike"]):
             return False
 
         position = state.positions[side]
@@ -1134,7 +1106,6 @@ class BacktestEngine:
                 pnl_greeks,
                 int(call_row["dte"]),
             )
-            self._start_cooldown(day, state, side)
             return
 
         call_qty = self._entry_target_qty(
@@ -1165,7 +1136,6 @@ class BacktestEngine:
                 pnl_greeks,
                 int(call_row["dte"]),
             )
-            self._start_cooldown(day, state, side)
             return
 
         projected_cash = self._project_cash_after_option_close(
@@ -1207,7 +1177,6 @@ class BacktestEngine:
                 pnl_greeks,
                 int(call_row["dte"]),
             )
-            self._start_cooldown(day, state, side)
             return
 
         trade_count = len(state.trades)
@@ -1239,7 +1208,6 @@ class BacktestEngine:
         state.positions[side] = new_position
         self._add_new_option_fees(day, state, trade_count)
         self._set_side_eod(day, state, side, option_value, projected_greeks, atm["dte"])
-        self._start_cooldown(day, state, side)
 
     def _open_new_position(self, day, state, trade_type, side="long"):
         date = day["date"]
@@ -1342,62 +1310,8 @@ class BacktestEngine:
             dte,
         )
 
-    def _chain_row(self, chain_df, order_book_id):
-        if chain_df is None:
-            raise IndexError(order_book_id)
-        rows = chain_df[chain_df["order_book_id"].astype(str) == str(order_book_id)]
-        if rows.empty:
-            raise IndexError(order_book_id)
-        return rows.iloc[0]
-
-    def _single_option_signed_value(self, hedge_position, row):
-        direction = -1.0 if hedge_position.get("side") == "short" else 1.0
-        return (
-            direction
-            * float(row["mid"])
-            * int(hedge_position.get("qty", 0) or 0)
-            * float(row["contract_multiplier"])
-        )
-
-    def _update_option_hedge_marks(self, day, state):
-        option_value = 0.0
-        margin = 0.0
-        greeks_list = []
-        for hedge_position in state.option_hedges:
-            try:
-                row = self._chain_row(day["chain_df"], hedge_position["order_book_id"])
-            except (IndexError, TypeError):
-                option_value += hedge_position.get("last_option_value", 0.0)
-                margin += hedge_position.get("option_margin", 0.0)
-                continue
-            qty = int(hedge_position.get("qty", 0) or 0)
-            side = hedge_position.get("side", "long")
-            signed_value = self._single_option_signed_value(hedge_position, row)
-            option_value += signed_value
-            if side == "short":
-                old_margin = float(hedge_position.get("option_margin", 0.0) or 0.0)
-                underlying_price = row.get("underlying_close")
-                if pd.isna(underlying_price):
-                    underlying_price = day["spot"]
-                new_margin = opt_position.margin_call(
-                    float(underlying_price),
-                    float(row["strike_price"]),
-                    float(row["mid"]),
-                    float(row["contract_multiplier"]),
-                ) * qty
-                state.cash -= new_margin - old_margin
-                hedge_position["option_margin"] = new_margin
-                margin += new_margin
-            hedge_position["last_price"] = float(row["mid"])
-            hedge_position["last_option_value"] = signed_value
-            greeks_list.append(single_call_greeks(row, qty, side))
-        day["option_hedge_value"] = option_value
-        day["option_hedge_margin"] = margin
-        day["option_hedge_greeks"] = combine_greeks(greeks_list)
-
     def _update_day_aggregates(self, day, state=None):
         if state is not None:
-            self._update_option_hedge_marks(day, state)
             for side in POSITION_SIDES:
                 if state.positions.get(side) is None:
                     record = day["side_records"][side]
@@ -1408,15 +1322,9 @@ class BacktestEngine:
         day["core_option_value"] = sum(
             side_records[side]["option_value"] for side in POSITION_SIDES
         )
-        day["option_value"] = day["core_option_value"] + day.get(
-            "option_hedge_value",
-            0.0,
-        )
+        day["option_value"] = day["core_option_value"]
         day["greeks"] = combine_greeks(
-            [
-                *[side_records[side]["greeks"] for side in POSITION_SIDES],
-                day.get("option_hedge_greeks"),
-            ]
+            [side_records[side]["greeks"] for side in POSITION_SIDES]
         )
         day["pnl_greeks"] = combine_greeks(
             [side_records[side]["pnl_greeks"] for side in POSITION_SIDES]
@@ -1605,38 +1513,30 @@ class BacktestEngine:
 
         state.strike_mismatch_days[side] = 0
 
-    def _tick_roll_cooldown(self, state, side):
-        if state.roll_cooldown_left[side] > 0:
-            state.roll_cooldown_left[side] -= 1
+    def _tick_short_entry_cooldown(self, day, state):
+        if state.positions.get("short") is not None:
+            return
+        if day["short_entry_cooldown_started"]:
+            return
+        if state.short_entry_cooldown_left > 0:
+            state.short_entry_cooldown_left -= 1
 
-    def _tick_flat_cooldowns(self, day, state):
-        for side in POSITION_SIDES:
-            if state.positions.get(side) is not None:
-                continue
-            if side in day["cooldown_started_by_side"]:
-                continue
-            self._tick_roll_cooldown(state, side)
-
-    def _start_cooldown_for_days(self, day, state, side, days):
+    def _start_short_entry_cooldown(self, day, state, days):
         if days <= 0:
             return
-        state.strike_mismatch_days[side] = 0
-        state.roll_cooldown_left[side] = max(state.roll_cooldown_left[side], days)
-        day["cooldown_started_by_side"].add(side)
-
-    def _start_cooldown(self, day, state, side):
-        self._start_cooldown_for_days(
-            day,
-            state,
-            side,
-            CONFIG.strategy.roll_cooldown_days,
+        state.strike_mismatch_days["short"] = 0
+        state.short_entry_cooldown_left = max(
+            state.short_entry_cooldown_left,
+            days,
         )
+        day["short_entry_cooldown_started"] = True
 
     def _reset_roll_state(self, state, side=None):
         sides = POSITION_SIDES if side is None else (side,)
         for item in sides:
             state.strike_mismatch_days[item] = 0
-            state.roll_cooldown_left[item] = 0
+        if side in {None, "short"}:
+            state.short_entry_cooldown_left = 0
 
     def _execute_etf_target(self, date, spot, state, day, greeks, target_qty, trade_type):
         target_qty = float(target_qty)
@@ -1715,7 +1615,7 @@ class BacktestEngine:
             opt_position.margin_value(position)
             for position in state.positions.values()
             if position is not None
-        ) + day.get("option_hedge_margin", 0.0)
+        )
         total_margin = option_margin + state.hedge_margin
         nav = (
             state.cash
@@ -1733,21 +1633,12 @@ class BacktestEngine:
             return float(position.get("option_margin", 0.0) or 0.0)
         return max(0.0, float(position.get("last_option_value", 0.0) or 0.0))
 
-    def _option_hedge_capital_occupation(self, position):
-        if position.get("side", "long") == "short":
-            return float(position.get("option_margin", 0.0) or 0.0)
-        return max(0.0, float(position.get("last_option_value", 0.0) or 0.0))
-
     def _current_nav_and_occupation(self, day, state):
         nav = self._current_nav_and_margin(day, state)[0]
         occupation = sum(
             self._position_capital_occupation(position)
             for position in state.positions.values()
             if position is not None
-        )
-        occupation += sum(
-            self._option_hedge_capital_occupation(position)
-            for position in state.option_hedges
         )
         hedge_price = self._get_hedge_price(
             day["date"],
@@ -1910,25 +1801,6 @@ class BacktestEngine:
             if nav > 0 and occupation <= occupation_limit + 1e-6:
                 return changed
 
-            if state.option_hedges:
-                self._close_option_delta_hedges(day["date"], state, day)
-                self._update_day_aggregates(day, state)
-                nav, occupation = self._current_nav_and_occupation(day, state)
-                occupation_limit = max(0.0, nav * ratio_limit)
-                if nav > 0 and occupation <= occupation_limit + 1e-6:
-                    self._hedge_to(
-                        day["date"],
-                        day["spot"],
-                        state,
-                        day,
-                        day["greeks"],
-                        target_qty=strategy.round_etf_hedge_target(
-                            -float(day["greeks"]["delta"])
-                        ),
-                    )
-                    changed = True
-                    continue
-
             candidates = [
                 (self._position_capital_occupation(position), side, position)
                 for side, position in state.positions.items()
@@ -1991,11 +1863,6 @@ class BacktestEngine:
             for candidate_side, candidate in state.positions.items()
             if candidate is not None and candidate_side != side
         )
-        other_occupation += sum(
-            self._option_hedge_capital_occupation(candidate)
-            for candidate in state.option_hedges
-        )
-
         position_delta = float(
             day["side_records"].get(side, {}).get("greeks", {}).get("delta", 0.0)
             or 0.0
@@ -2016,50 +1883,6 @@ class BacktestEngine:
                 return target_qty
         return 0
 
-    def _close_option_delta_hedges(self, date, state, day):
-        if not state.option_hedges:
-            return
-        fee = 0.0
-        legs = []
-        for hedge_position in state.option_hedges:
-            try:
-                row = self._chain_row(day["chain_df"], hedge_position["order_book_id"])
-                price = float(row["mid"])
-            except (IndexError, TypeError):
-                price = float(hedge_position.get("last_price", 0.0) or 0.0)
-            qty = int(hedge_position.get("qty", 0) or 0)
-            multiplier = float(hedge_position.get("contract_multiplier", 10000) or 10000)
-            leg_fee = opt_position.calc_option_fee(qty, 0)
-            value = price * qty * multiplier
-            if hedge_position.get("side") == "short":
-                state.cash += (
-                    float(hedge_position.get("option_margin", 0.0) or 0.0)
-                    - value
-                    - leg_fee
-                )
-            else:
-                state.cash += value - leg_fee
-            fee += leg_fee
-            legs.append(
-                {
-                    "order_book_id": hedge_position["order_book_id"],
-                    "side": hedge_position["side"],
-                    "qty": qty,
-                    "price": price,
-                }
-            )
-        state.option_hedges = []
-        day["daily_option_fee"] += fee
-        state.trades.append(
-            {
-                "date": date,
-                "type": "close_option_delta_hedge",
-                "fee": fee,
-                "cash": state.cash,
-                "legs": legs,
-            }
-        )
-
     def _hedge_to(
         self,
         date,
@@ -2076,10 +1899,6 @@ class BacktestEngine:
         if greeks is None:
             greeks = empty_greeks()
         if not self._has_any_position(state):
-            if state.option_hedges and day is not None:
-                self._close_option_delta_hedges(date, state, day)
-                self._update_day_aggregates(day, state)
-                greeks = day["greeks"]
             self._execute_etf_target(
                 date,
                 spot,
@@ -2095,7 +1914,6 @@ class BacktestEngine:
         normalized_delta, delta_capacity = strategy.normalized_account_delta(
             account_delta,
             state.positions,
-            option_hedges=state.option_hedges,
             default_multiplier=CONFIG.vol.contract_multiplier,
         )
         tolerance_ratio = float(
@@ -2109,22 +1927,6 @@ class BacktestEngine:
         ):
             return
 
-        if target_qty is None and state.option_hedges and day is not None:
-            self._close_option_delta_hedges(date, state, day)
-            self._update_day_aggregates(day, state)
-            greeks = day["greeks"]
-            option_delta = float(greeks["delta"])
-            account_delta = option_delta + float(state.hedge_etf_qty)
-            normalized_delta, delta_capacity = strategy.normalized_account_delta(
-                account_delta,
-                state.positions,
-                option_hedges=state.option_hedges,
-                default_multiplier=CONFIG.vol.contract_multiplier,
-            )
-            tolerance = delta_capacity * tolerance_ratio
-            if delta_capacity > 0 and abs(normalized_delta) <= tolerance_ratio:
-                return
-
         projected_target_qty = strategy.round_etf_hedge_target(
             -option_delta if target_qty is None else float(target_qty)
         )
@@ -2133,8 +1935,6 @@ class BacktestEngine:
             or projected_target_qty >= 0
             or target_qty is not None
         ):
-            if target_qty is not None and target_qty == 0:
-                self._close_option_delta_hedges(date, state, day)
             self._execute_etf_target(
                 date,
                 spot,
@@ -2146,42 +1946,11 @@ class BacktestEngine:
             )
             return
 
-        if not (
-            self.config.get("enable_option_delta_hedge", False)
-            and day is not None
-        ):
-            state.trades.append(
-                {
-                    "date": date,
-                    "type": "skip_delta_hedge_etf_short_disabled",
-                    "account_delta": account_delta,
-                    "tolerance": tolerance,
-                }
-            )
-            return
-
-        self._close_option_delta_hedges(date, state, day)
-        self._execute_etf_target(
-            date,
-            spot,
-            state,
-            day,
-            greeks,
-            0.0,
-            "reduce_etf_before_option_delta_hedge",
-        )
-        core_greeks = combine_greeks(
-            [day["side_records"][side]["greeks"] for side in POSITION_SIDES]
-        )
-        residual_delta = float(core_greeks["delta"])
-        if residual_delta <= tolerance:
-            return
         state.trades.append(
             {
                 "date": date,
-                "type": "skip_option_delta_hedge",
-                "reason": "live_atm_straddle_rebalance_not_available_in_backtest",
-                "residual_delta": residual_delta,
+                "type": "skip_delta_hedge_etf_short_disabled",
+                "account_delta": account_delta,
                 "tolerance": tolerance,
             }
         )
@@ -2214,7 +1983,7 @@ class BacktestEngine:
             opt_position.margin_value(state.positions[side])
             for side in POSITION_SIDES
             if state.positions.get(side) is not None
-        ) + day.get("option_hedge_margin", 0.0)
+        )
         nav = (
             state.cash
             + day["option_value"]
@@ -2247,25 +2016,6 @@ class BacktestEngine:
                 day["eod_position_dte"],
         )
         record["option_margin"] = option_margin
-        record["option_hedge_value"] = day.get("option_hedge_value", 0.0)
-        record["option_hedge_margin"] = day.get("option_hedge_margin", 0.0)
-        record["option_hedge_count"] = len(state.option_hedges)
-        record["option_hedge_delta"] = day.get("option_hedge_greeks", {}).get(
-            "delta",
-            0.0,
-        )
-        record["option_hedge_gamma"] = day.get("option_hedge_greeks", {}).get(
-            "gamma",
-            0.0,
-        )
-        record["option_hedge_vega"] = day.get("option_hedge_greeks", {}).get(
-            "vega",
-            0.0,
-        )
-        record["option_hedge_theta"] = day.get("option_hedge_greeks", {}).get(
-            "theta",
-            0.0,
-        )
         total_margin = option_margin + state.hedge_margin
         record["total_margin"] = total_margin
         record["margin_to_nav_ratio"] = total_margin / nav if nav > 0 else None
@@ -2325,7 +2075,6 @@ def _backtest_config(
         ),
         "delta_hedge_tolerance_ratio": CONFIG.strategy.delta_hedge_tolerance_ratio,
         "allow_etf_short_hedge": CONFIG.strategy.allow_etf_short_hedge,
-        "enable_option_delta_hedge": CONFIG.strategy.enable_option_delta_hedge,
         "dynamic_position_control_enabled": (
             CONFIG.backtest.dynamic_position_control_enabled
         ),

@@ -1816,11 +1816,6 @@ def _expected_account_quantities(product, account_id):
             qty = _number(position.get(qty_key)) or 0.0
             if code:
                 expected[code] = expected.get(code, 0.0) + abs(qty)
-    for hedge in state.option_hedges:
-        code = _position_code_key(hedge.get("order_book_id"))
-        qty = _number(hedge.get("qty")) or 0.0
-        if code:
-            expected[code] = expected.get(code, 0.0) + abs(qty)
     hedge_code = _position_code_key(state.hedge.underlying_order_book_id)
     if hedge_code and abs(state.hedge.qty) > 1e-9:
         expected[hedge_code] = expected.get(hedge_code, 0.0) + abs(state.hedge.qty)

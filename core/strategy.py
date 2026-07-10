@@ -23,7 +23,7 @@ def round_etf_hedge_target(qty, lot_size=ETF_HEDGE_LOT_SIZE):
     return float(math.copysign(lots * lot_size, qty))
 
 
-def option_delta_capacity(positions, option_hedges=None, default_multiplier=10000):
+def option_delta_capacity(positions, default_multiplier=10000):
     """Return the underlying-unit capacity used to normalize account delta."""
     capacity = 0.0
     for position in (positions or {}).values():
@@ -39,33 +39,16 @@ def option_delta_capacity(positions, option_hedges=None, default_multiplier=1000
         )
         capacity += qty * multiplier
 
-    for position in option_hedges or []:
-        qty = abs(
-            float(
-                position.get(
-                    "qty",
-                    position.get("call_qty", position.get("put_qty", 0)),
-                )
-                or 0
-            )
-        )
-        multiplier = float(
-            position.get("contract_multiplier", default_multiplier)
-            or default_multiplier
-        )
-        capacity += qty * multiplier
     return capacity
 
 
 def normalized_account_delta(
     account_delta,
     positions,
-    option_hedges=None,
     default_multiplier=10000,
 ):
     capacity = option_delta_capacity(
         positions,
-        option_hedges=option_hedges,
         default_multiplier=default_multiplier,
     )
     if capacity <= 0:

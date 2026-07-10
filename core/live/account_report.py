@@ -2114,19 +2114,6 @@ def _position_rows_from_account(live_account, chain_df, report_date, account_id)
                 ),
             ]
         )
-    for hedge_position in getattr(live_account, "option_hedges", []) or []:
-        hedge_rows, hedge_greeks, hedge_value, hedge_margin, hedge_pnl = _option_hedge_rows_from_account(
-            hedge_position,
-            chain_df,
-            report_date,
-            account_id,
-        )
-        rows.extend(hedge_rows)
-        if hedge_greeks is not None:
-            greeks_list.append(hedge_greeks)
-        signed_values.append(hedge_value)
-        margins.append(hedge_margin)
-        option_pnl += hedge_pnl
     return (
         rows,
         core.backtester.combine_greeks(greeks_list),
@@ -2135,66 +2122,6 @@ def _position_rows_from_account(live_account, chain_df, report_date, account_id)
         option_pnl,
     )
 
-
-def _option_hedge_rows_from_account(position, chain_df, report_date, account_id):
-    code = position.get("order_book_id") or position.get("call_code") or position.get("put_code")
-    if code is None:
-        return [], None, 0.0, 0.0, 0.0
-    matches = chain_df[chain_df["order_book_id"].astype(str).eq(str(code))]
-    if matches.empty:
-        return [], None, 0.0, 0.0, 0.0
-    row = matches.iloc[0].copy()
-
-    side = position.get("side", "short")
-    qty = int(position.get("qty", 0) or 0)
-    multiplier = float(position.get("contract_multiplier", row.get("contract_multiplier", 10000)) or 10000)
-    direction = -1.0 if str(side).lower() == "short" else 1.0
-    scale = direction * qty * multiplier
-    mark_price = _option_mark_from_chain_row(row)
-    market_value = float(mark_price or 0.0) * qty * multiplier
-    signed_value = direction * market_value
-    entry_value = float(position.get("entry_price", 0.0) or 0.0) * qty * multiplier
-    pnl = entry_value - market_value if side == "short" else market_value - entry_value
-    option_type = str(position.get("option_type") or row.get("option_type") or "").lower()
-    leg = "call" if option_type == "c" else "put"
-    greeks = {
-        "delta": float(row.get("delta", 0.0) or 0.0) * scale,
-        "gamma": float(row.get("gamma", 0.0) or 0.0) * scale,
-        "vega": float(row.get("vega", 0.0) or 0.0) * scale,
-        "theta": float(row.get("theta", 0.0) or 0.0) * scale,
-    }
-    leg_greeks = {
-        "call_iv": row.get("iv") if leg == "call" else None,
-        "put_iv": row.get("iv") if leg == "put" else None,
-        "call_delta": greeks["delta"] if leg == "call" else 0.0,
-        "put_delta": greeks["delta"] if leg == "put" else 0.0,
-        "call_gamma": greeks["gamma"] if leg == "call" else 0.0,
-        "put_gamma": greeks["gamma"] if leg == "put" else 0.0,
-        "call_vega": greeks["vega"] if leg == "call" else 0.0,
-        "put_vega": greeks["vega"] if leg == "put" else 0.0,
-        "call_theta": greeks["theta"] if leg == "call" else 0.0,
-        "put_theta": greeks["theta"] if leg == "put" else 0.0,
-    }
-    fake_position = {
-        "call_qty": qty if leg == "call" else 0,
-        "put_qty": qty if leg == "put" else 0,
-        "entry_call_price": position.get("entry_price") if leg == "call" else None,
-        "entry_put_price": position.get("entry_price") if leg == "put" else None,
-        "contract_multiplier": multiplier,
-        "option_margin": position.get("option_margin"),
-    }
-    rows = [
-        _account_leg_row(
-            report_date,
-            account_id,
-            side,
-            fake_position,
-            row,
-            leg,
-            leg_greeks,
-        )
-    ]
-    return rows, greeks, signed_value, float(position.get("option_margin", 0.0) or 0.0), pnl
 
 def _account_leg_row(report_date, account_id, side, position, row, leg, greeks):
     qty_key = "call_qty" if leg == "call" else "put_qty"
@@ -2283,7 +2210,9 @@ def _hedge_for_report_date(live_account, product, account_id, report_date):
     has_hedge_fill = False
     saw_hedge_fill = False
     for row in fills:
-        payload = account_store.normalize_fill(row["payload"])
+        payload = _supported_fill(row["payload"])
+        if payload is None:
+            continue
         action = payload.get("action")
         if action not in {
             "delta_hedge",
@@ -2769,170 +2698,6 @@ def _closed_signed_quantity(remaining_previous_qty, signed_trade_qty):
     return math.copysign(magnitude, remaining_previous_qty)
 
 
-def _segmented_intraday_option_greeks(
-    product,
-    previous_date,
-    current_date,
-    previous_summary,
-    current_summary,
-    previous_positions,
-    current_positions,
-    trade_rows,
-):
-    if previous_positions.empty and current_positions.empty:
-        return None
-    if not trade_rows:
-        return None
-
-    option_trades = [
-        row
-        for row in trade_rows
-        if _security_code(row.get("合约代码")) is not None
-        and str(_security_code(row.get("合约代码"))).startswith("100")
-        and str(row.get("类型") or "").upper().find("ETF") < 0
-    ]
-    if not option_trades:
-        return None
-
-    start_spot = _number(previous_summary.get("标的价格"))
-    end_spot = _number(current_summary.get("标的价格"))
-    if start_spot is None or end_spot is None:
-        return None
-
-    start_ts = pd.Timestamp(f"{previous_date} 15:00:00")
-    end_ts = pd.Timestamp(f"{current_date} 15:00:00")
-    events_by_ts = {}
-    for row in option_trades:
-        timestamp = _trade_row_timestamp(row, current_date)
-        if timestamp is None:
-            return None
-        events_by_ts.setdefault(timestamp.floor("min"), []).append(row)
-
-    timestamps = [start_ts, *sorted(events_by_ts), end_ts]
-    timestamps = sorted(dict.fromkeys(timestamps))
-    if len(timestamps) < 2:
-        return None
-
-    rows_by_code = _option_position_rows_by_code(
-        previous_positions,
-        current_positions,
-        previous_date=previous_date,
-        current_date=current_date,
-    )
-    start_qty = _signed_option_quantities(previous_positions)
-    qty_by_code = dict(start_qty)
-    codes = set(rows_by_code) | set(start_qty)
-    for row in option_trades:
-        code = _security_code(row.get("合约代码"))
-        if code is not None:
-            codes.add(code)
-    if not codes:
-        return None
-
-    node_states = []
-    node_index = 0
-    node_count_hint = len(timestamps) + len(events_by_ts)
-    excluded_new_trade_count = 0
-    for raw_index, timestamp in enumerate(timestamps):
-        node_progress = _timestamp_progress(timestamp, start_ts, end_ts)
-        if node_index == 0:
-            spot = float(start_spot)
-        elif raw_index == len(timestamps) - 1:
-            spot = float(end_spot)
-        else:
-            spot = _spot_from_intraday_minute(product, current_date, timestamp)
-            if spot is None:
-                spot = _spot_from_quote_snapshot(product, current_date, timestamp)
-            if spot is None:
-                return None
-
-        prices = {}
-        if raw_index == 0:
-            for code, rows in rows_by_code.items():
-                prices[code] = _number(rows.get("previous", {}).get("最新价"))
-        elif raw_index == len(timestamps) - 1:
-            for code, rows in rows_by_code.items():
-                prices[code] = _number(rows.get("current", {}).get("最新价"))
-                if prices[code] is None:
-                    prices[code] = _number(rows.get("previous", {}).get("最新价"))
-        else:
-            for code in codes:
-                prices[code] = _option_price_at_node(
-                    product,
-                    current_date,
-                    code,
-                    timestamp,
-                    events_by_ts.get(timestamp, []),
-                )
-
-        state = _segmented_node_greeks(
-            product,
-            timestamp,
-            node_index,
-            node_count_hint,
-            spot,
-            prices,
-            rows_by_code,
-            qty_by_code,
-            node_progress=node_progress,
-        )
-        if state is None:
-            return None
-        node_states.append(state)
-        node_index += 1
-
-        events = events_by_ts.get(timestamp, [])
-        for trade in events:
-            code = _security_code(trade.get("合约代码"))
-            if code is None:
-                continue
-            signed_trade_qty = _signed_trade_quantity(trade)
-            applied_qty = _previous_position_trade_quantity(
-                qty_by_code.get(code, 0.0),
-                signed_trade_qty,
-            )
-            if abs(applied_qty) > 1e-9:
-                qty_by_code[code] = qty_by_code.get(code, 0.0) + applied_qty
-            if abs(applied_qty - signed_trade_qty) > 1e-9:
-                excluded_new_trade_count += 1
-        if events:
-            post_state = _segmented_node_greeks(
-                product,
-                timestamp,
-                node_index,
-                node_count_hint,
-                spot,
-                prices,
-                rows_by_code,
-                qty_by_code,
-                node_progress=node_progress,
-            )
-            if post_state is None:
-                return None
-            node_states.append(post_state)
-            node_index += 1
-
-    parts = _integrate_segmented_node_greeks(
-        node_states,
-        len(option_trades),
-        len([qty for qty in start_qty.values() if abs(qty) > 1e-9]),
-    )
-    if parts is not None:
-        parts["excluded_new_trade_count"] = excluded_new_trade_count
-    return parts
-
-
-def _timestamp_progress(timestamp, start_ts, end_ts):
-    start_ts = pd.Timestamp(start_ts)
-    end_ts = pd.Timestamp(end_ts)
-    timestamp = pd.Timestamp(timestamp)
-    total_seconds = (end_ts - start_ts).total_seconds()
-    if total_seconds <= 0:
-        return 1.0
-    progress = (timestamp - start_ts).total_seconds() / total_seconds
-    return min(max(float(progress), 0.0), 1.0)
-
-
 def _option_position_rows_by_code(
     previous_positions,
     current_positions,
@@ -2974,55 +2739,6 @@ def _signed_trade_quantity(trade):
         return 0.0
     direction = str(trade.get("买卖") or "")
     return -qty if "卖" in direction else qty
-
-
-def _previous_position_trade_quantity(current_qty, signed_trade_qty):
-    current_qty = float(current_qty or 0.0)
-    signed_trade_qty = float(signed_trade_qty or 0.0)
-    if abs(current_qty) <= 1e-9 or abs(signed_trade_qty) <= 1e-9:
-        return 0.0
-    if current_qty * signed_trade_qty >= 0:
-        return 0.0
-    magnitude = min(abs(current_qty), abs(signed_trade_qty))
-    return math.copysign(magnitude, signed_trade_qty)
-
-
-def _option_price_at_node(product, report_date, code, timestamp, events):
-    event_prices = [
-        _number(row.get("成交价格"))
-        for row in events
-        if _security_code(row.get("合约代码")) == code
-        and _number(row.get("成交价格")) is not None
-    ]
-    if event_prices:
-        return event_prices[-1]
-    snapshot_price = _option_price_from_quote_snapshot(product, report_date, code, timestamp)
-    if snapshot_price is not None:
-        return snapshot_price
-    path = (
-        storage.PROJECT_ROOT
-        / "data"
-        / "live"
-        / product
-        / "intraday"
-        / pd.Timestamp(report_date).strftime("%Y%m%d")
-        / f"option_{code}_1m.csv"
-    )
-    if not path.exists():
-        return None
-    try:
-        frame = pd.read_csv(path, encoding="utf-8-sig")
-    except Exception:
-        return None
-    if "timestamp" not in frame.columns or "price" not in frame.columns:
-        return None
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
-    frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
-    frame = frame.dropna(subset=["timestamp", "price"])
-    frame = frame.loc[frame["timestamp"].le(timestamp)].sort_values("timestamp")
-    if frame.empty:
-        return None
-    return float(frame.iloc[-1]["price"])
 
 
 def _option_price_from_quote_snapshot(product, report_date, code, timestamp):
@@ -3069,105 +2785,6 @@ def _option_price_from_quote_snapshot(product, report_date, code, timestamp):
     if bid is not None and ask is not None and bid > 0 and ask > 0:
         return (bid + ask) / 2.0
     return bid if bid is not None and bid > 0 else ask
-
-
-def _segmented_node_greeks(
-    product,
-    timestamp,
-    node_index,
-    node_count,
-    spot,
-    prices,
-    rows_by_code,
-    qty_by_code,
-    node_progress=None,
-):
-    totals = {
-        "timestamp": timestamp,
-        "spot": float(spot),
-        "delta": 0.0,
-        "gamma": 0.0,
-        "vega": 0.0,
-        "theta": 0.0,
-        "iv_by_code": {},
-        "vega_by_code": {},
-    }
-    for code, qty in qty_by_code.items():
-        if abs(qty) <= 1e-9:
-            continue
-        rows = rows_by_code.get(code) or {}
-        row = rows.get("previous")
-        if row is None:
-            row = rows.get("current")
-        if row is None:
-            return None
-        price = prices.get(code)
-        if price is None or price <= 0:
-            return None
-        leg = _position_row_leg(row)
-        flag = "c" if leg == "Call" else "p" if leg == "Put" else None
-        if flag is None:
-            return None
-        greeks = _single_node_option_greeks(
-            product,
-            rows,
-            row,
-            price,
-            float(spot),
-            flag,
-            float(qty),
-            node_index,
-            node_count,
-            node_progress=node_progress,
-        )
-        if greeks is None:
-            return None
-        totals["iv_by_code"][code] = greeks["iv"]
-        totals["vega_by_code"][code] = greeks["vega"]
-        for key in ["delta", "gamma", "vega", "theta"]:
-            totals[key] += greeks[key]
-    return totals
-
-
-def _single_node_option_greeks(
-    product,
-    rows,
-    row,
-    price,
-    spot,
-    flag,
-    signed_qty,
-    node_index,
-    node_count,
-    node_progress=None,
-):
-    strike = _number(row.get("行权价"))
-    if strike is None or strike <= 0:
-        return None
-    dte = _segmented_node_dte(
-        rows,
-        node_index,
-        node_count,
-        node_progress=node_progress,
-    )
-    if dte is None or dte <= 0:
-        return None
-    fallback_iv = _segmented_node_reference_iv(
-        rows,
-        node_index,
-        node_count,
-        node_progress=node_progress,
-    )
-    return _option_greeks_for_dte(
-        product,
-        row,
-        price,
-        spot,
-        flag,
-        signed_qty,
-        dte,
-        fallback_iv=fallback_iv,
-    )
 
 
 def _option_greeks_for_dte(
@@ -3235,276 +2852,6 @@ def _option_greeks_for_dte(
         "vega": vega * scale,
         "theta": theta * scale,
     }
-
-
-def _segmented_node_dte(rows, node_index, node_count, node_progress=None):
-    previous = rows.get("previous")
-    current = rows.get("current")
-    previous_dte = _number(previous.get("剩余天数")) if previous is not None else None
-    current_dte = _number(current.get("剩余天数")) if current is not None else None
-    maturity = None
-    for row in [current, previous]:
-        if row is not None and row.get("到期日") is not None:
-            maturity = row.get("到期日")
-            break
-    if maturity is not None:
-        calendar = market_data.load_live_trading_calendar()
-        if previous_dte is None and rows.get("_previous_date") is not None:
-            previous_dte = core.vol_engine._count_trading_dte(
-                rows["_previous_date"],
-                maturity,
-                trading_calendar=calendar,
-            )
-        if current_dte is None and rows.get("_current_date") is not None:
-            current_dte = core.vol_engine._count_trading_dte(
-                rows["_current_date"],
-                maturity,
-                trading_calendar=calendar,
-            )
-    if previous_dte is None and current_dte is None:
-        return None
-    if node_count <= 1:
-        return current_dte if current_dte is not None else previous_dte
-    progress = (
-        float(node_progress)
-        if node_progress is not None
-        else float(node_index) / float(node_count - 1)
-    )
-    progress = min(max(progress, 0.0), 1.0)
-    if previous_dte is None:
-        return float(current_dte) if progress >= 1.0 else None
-    if current_dte is None:
-        return float(previous_dte) if progress <= 0.0 else None
-    return float(previous_dte) + progress * (float(current_dte) - float(previous_dte))
-
-
-def _segmented_node_reference_iv(rows, node_index, node_count, node_progress=None):
-    previous = rows.get("previous")
-    current = rows.get("current")
-    previous_iv = _number(previous.get("IV")) if previous is not None else None
-    current_iv = _number(current.get("IV")) if current is not None else None
-    previous_iv = previous_iv if previous_iv is not None and previous_iv > 0 else None
-    current_iv = current_iv if current_iv is not None and current_iv > 0 else None
-    if previous_iv is None and current_iv is None:
-        return None
-    if previous_iv is None:
-        return float(current_iv)
-    if current_iv is None:
-        return float(previous_iv)
-    if node_count <= 1:
-        return float(current_iv)
-    progress = (
-        float(node_progress)
-        if node_progress is not None
-        else float(node_index) / float(node_count - 1)
-    )
-    progress = min(max(progress, 0.0), 1.0)
-    return float(previous_iv) + progress * (float(current_iv) - float(previous_iv))
-
-
-def _integrate_segmented_node_greeks(node_states, trade_count, code_count):
-    if len(node_states) < 2:
-        return None
-    intervals = len(node_states) - 1
-    delta_pnl = 0.0
-    gamma_pnl = 0.0
-    vega_pnl = 0.0
-    theta_pnl = 0.0
-    theta_intervals = sum(
-        1
-        for index in range(intervals)
-        if node_states[index + 1]["timestamp"] != node_states[index]["timestamp"]
-    )
-    for index in range(intervals):
-        start = node_states[index]
-        end = node_states[index + 1]
-        spot_change = end["spot"] - start["spot"]
-        delta_pnl += start["delta"] * spot_change
-        gamma_pnl += 0.5 * start["gamma"] * spot_change * spot_change
-        if end["timestamp"] != start["timestamp"] and theta_intervals > 0:
-            theta_pnl += start["theta"] * (1.0 / theta_intervals)
-
-    vega_pnl = _integrate_segmented_vega(node_states, intervals)
-    return {
-        "delta_pnl": float(delta_pnl),
-        "gamma_pnl": float(gamma_pnl),
-        "vega_pnl": float(vega_pnl),
-        "theta_pnl": float(theta_pnl),
-        "option_greeks_pnl": float(delta_pnl + gamma_pnl + vega_pnl + theta_pnl),
-        "nodes": len(node_states),
-        "trade_count": int(trade_count),
-        "code_count": int(code_count),
-    }
-
-
-def _integrate_segmented_vega(node_states, intervals):
-    total = 0.0
-    if intervals <= 0:
-        return total
-    for index in range(intervals):
-        start = node_states[index]
-        end = node_states[index + 1]
-        active_codes = list(start["iv_by_code"])
-        if not active_codes:
-            continue
-        for code in active_codes:
-            end_iv = end["iv_by_code"].get(code)
-            if end_iv is None:
-                continue
-            start_vega = start["vega_by_code"].get(code)
-            if start_vega is None:
-                continue
-            total += start_vega * (end_iv - start["iv_by_code"][code]) * 100.0
-    return total
-
-
-def _close_straddle_fills_for_date(product, account_id, report_date):
-    fills = []
-    for row in account_store.list_fills(
-        product,
-        account_id=account_id,
-        include_voided=False,
-    ):
-        fill = account_store.normalize_fill(row["payload"])
-        if str(fill.get("date")) != str(report_date):
-            continue
-        action = str(fill.get("action") or "").lower()
-        if action in {"close_straddle", "close_short_straddle", "close_long_straddle"}:
-            fills.append(fill)
-    return fills
-
-
-def _close_fills_cover_previous_positions(previous_positions, close_fills):
-    previous_codes = {
-        _security_code(row.get("合约代码"))
-        for _, row in previous_positions.iterrows()
-    }
-    previous_codes.discard(None)
-    closed_codes = set()
-    for fill in close_fills:
-        for key in ("call_code", "put_code"):
-            code = _security_code(fill.get(key))
-            if code is not None:
-                closed_codes.add(code)
-        for leg_close in fill.get("leg_closes") or []:
-            code = _security_code(leg_close.get("order_book_id"))
-            if code is not None:
-                closed_codes.add(code)
-    return bool(previous_codes) and previous_codes.issubset(closed_codes)
-
-
-def _previous_pair_for_close_fill(previous_positions, fill):
-    call_code = _security_code(fill.get("call_code"))
-    put_code = _security_code(fill.get("put_code"))
-    if call_code is None or put_code is None:
-        return None
-    calls = previous_positions[
-        previous_positions["合约代码"].apply(_security_code).eq(call_code)
-    ]
-    puts = previous_positions[
-        previous_positions["合约代码"].apply(_security_code).eq(put_code)
-    ]
-    if calls.empty or puts.empty:
-        return None
-    return calls.iloc[0], puts.iloc[0]
-
-
-def _close_fill_leg_iv(product, report_date, row, price, spot, flag):
-    strike = _number(row.get("行权价"))
-    maturity = row.get("到期日")
-    if strike is None or maturity is None:
-        return None
-    config = load_product_config(product)
-    chain = pd.DataFrame(
-        [
-            {
-                "date": report_date,
-                "order_book_id": row.get("合约代码"),
-                "maturity_date": maturity,
-                "strike_price": strike,
-                "option_type": flag,
-                "bid": price,
-                "ask": price,
-                "volume": 1,
-                "contract_multiplier": _contract_multiplier(product),
-                "underlying_close": spot,
-            }
-        ]
-    )
-    try:
-        chain = core.vol_engine.add_iv_for_day(
-            chain,
-            spot,
-            r=float(config.vol.risk_free_rate),
-            annual_days=float(config.vol.annual_days),
-        )
-    except Exception:
-        return 0.0
-    iv = _number(chain.iloc[0].get("iv"))
-    if iv is None or iv < 0:
-        return 0.0
-    return iv
-
-
-def _close_fill_spot(product, fill, report_date, default_spot):
-    explicit = _first_number(
-        fill.get("spot"),
-        fill.get("close_spot"),
-        fill.get("underlying_price"),
-        fill.get("underlying_close"),
-    )
-    if explicit is not None:
-        return explicit
-
-    timestamp = _close_fill_trade_timestamp(product, fill, report_date)
-    if timestamp is None:
-        try:
-            timestamp = pd.Timestamp(fill.get("source_timestamp"))
-        except Exception:
-            timestamp = None
-    if timestamp is not None:
-        spot = _spot_from_intraday_minute(product, report_date, timestamp)
-        if spot is not None:
-            return spot
-        spot = _spot_from_quote_snapshot(product, report_date, timestamp)
-        if spot is not None:
-            return spot
-    return default_spot
-
-
-def _close_fill_trade_timestamp(product, fill, report_date):
-    source_file = fill.get("source_file")
-    if not source_file:
-        return None
-    path = Path(source_file)
-    if not path.exists():
-        path = PROJECT_ROOT / source_file
-    if not path.exists():
-        return None
-    try:
-        rows = _trade_rows_from_file(path, product)
-    except Exception:
-        return None
-
-    codes = {
-        _security_code(fill.get("call_code")),
-        _security_code(fill.get("put_code")),
-    }
-    codes.discard(None)
-    timestamps = []
-    for row in rows:
-        code = _security_code(row.get("合约代码"))
-        if code not in codes:
-            continue
-        row_date = _date_or_none(row.get("日期"))
-        if row_date is None or str(row_date.date()) != str(report_date):
-            continue
-        timestamp = _trade_row_timestamp(row, report_date)
-        if timestamp is not None:
-            timestamps.append(timestamp)
-    if not timestamps:
-        return None
-    return max(timestamps)
 
 
 def _trade_row_timestamp(row, report_date):
@@ -4128,46 +3475,6 @@ def _option_position_rows_for_intraday(position_history, report_date, account_id
     return rows
 
 
-def _integrate_intraday_option_greeks(path):
-    intervals = len(path) - 1
-    previous = path.iloc[:-1]
-    spot_change = path["spot"].diff().iloc[1:].to_numpy()
-    call_iv_change = path["call_iv"].diff().iloc[1:].to_numpy()
-    put_iv_change = path["put_iv"].diff().iloc[1:].to_numpy()
-
-    delta_pnl = (
-        (previous["call_delta"].to_numpy() + previous["put_delta"].to_numpy())
-        * spot_change
-    ).sum()
-    gamma_pnl = (
-        0.5
-        * (
-            previous["call_gamma"].to_numpy()
-            + previous["put_gamma"].to_numpy()
-        )
-        * spot_change
-        * spot_change
-    ).sum()
-    vega_pnl = (
-        previous["call_vega"].to_numpy() * call_iv_change * 100.0
-        + previous["put_vega"].to_numpy() * put_iv_change * 100.0
-    ).sum()
-    theta_pnl = (
-        (
-            previous["call_theta"].to_numpy()
-            + previous["put_theta"].to_numpy()
-        )
-        * (1.0 / intervals)
-    ).sum()
-    return {
-        "delta_pnl": float(delta_pnl),
-        "gamma_pnl": float(gamma_pnl),
-        "vega_pnl": float(vega_pnl),
-        "theta_pnl": float(theta_pnl),
-        "option_greeks_pnl": float(delta_pnl + gamma_pnl + vega_pnl + theta_pnl),
-    }
-
-
 def _segmented_hedge_delta_pnl_series(product, group, spot, hedge_mark, hedge_qty):
     price = hedge_mark.where(hedge_mark.notna(), spot)
     return (hedge_qty.shift(1).fillna(0.0) * price.diff()).fillna(0.0)
@@ -4364,7 +3671,9 @@ def _security_trade_rows_by_date(product, account_id="default"):
         include_voided=False,
         order="asc",
     ):
-        fill = account_store.normalize_fill(row["payload"])
+        fill = _supported_fill(row["payload"])
+        if fill is None:
+            continue
         action = str(fill.get("action") or "").lower()
         if action not in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
             continue
@@ -4792,7 +4101,9 @@ def _configured_daily_report_fee(product, account_id, report_date, trade_rows):
         include_voided=False,
     )
     for row in fills:
-        fill = account_store.normalize_fill(row["payload"])
+        fill = _supported_fill(row["payload"])
+        if fill is None:
+            continue
         if str(fill.get("date")) != str(report_date):
             continue
         action = str(fill.get("action") or "").lower()
@@ -4803,8 +4114,6 @@ def _configured_daily_report_fee(product, account_id, report_date, trade_rows):
             "close_short_straddle",
             "roll_long_straddle",
             "roll_short_straddle",
-            "open_option_hedge",
-            "close_option_hedge",
         }:
             if not has_option_trade_rows and not _is_position_only_holding_import(fill):
                 fee += _configured_option_fill_fee(product, fill)
@@ -4843,7 +4152,9 @@ def _configured_cumulative_report_fee(product, account_id, report_date):
         include_voided=False,
     )
     for row in fills:
-        fill = account_store.normalize_fill(row["payload"])
+        fill = _supported_fill(row["payload"])
+        if fill is None:
+            continue
         fill_date = _date_or_none(fill.get("date"))
         if fill_date is None or fill_date > cutoff:
             continue
@@ -4856,8 +4167,6 @@ def _configured_cumulative_report_fee(product, account_id, report_date):
             "close_short_straddle",
             "roll_long_straddle",
             "roll_short_straddle",
-            "open_option_hedge",
-            "close_option_hedge",
         }:
             if date_key not in option_trade_dates and not _is_position_only_holding_import(fill):
                 fee += _configured_option_fill_fee(product, fill)
@@ -4879,7 +4188,9 @@ def _cumulative_option_realized_pnl_for_report(product, account_id, report_date)
         include_voided=False,
     )
     for row in fills:
-        fill = account_store.normalize_fill(row["payload"])
+        fill = _supported_fill(row["payload"])
+        if fill is None:
+            continue
         fill_date = _date_or_none(fill.get("date"))
         if fill_date is None or fill_date > cutoff:
             continue
@@ -4914,8 +4225,6 @@ def _cumulative_option_realized_pnl_for_report(product, account_id, report_date)
                 )
             positions[side] = fill
             continue
-        if action == "close_option_hedge":
-            realized += _number(fill.get("realized_pnl")) or 0.0
     return realized
 
 
@@ -5546,7 +4855,9 @@ def _cumulative_hedge_realized_pnl_for_report(product, account_id, report_date):
         include_voided=False,
     )
     for row in fills:
-        fill = account_store.normalize_fill(row["payload"])
+        fill = _supported_fill(row["payload"])
+        if fill is None:
+            continue
         if fill.get("action") not in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
             continue
         fill_date = _date_or_none(fill.get("date"))
@@ -5598,7 +4909,9 @@ def _hedge_open_cost_for_report(product, account_id, report_date):
         include_voided=False,
     )
     for row in fills:
-        fill = account_store.normalize_fill(row["payload"])
+        fill = _supported_fill(row["payload"])
+        if fill is None:
+            continue
         if fill.get("action") not in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
             continue
         fill_date = _date_or_none(fill.get("date"))
@@ -5927,6 +5240,13 @@ def _clean_text(value):
     if value is None or pd.isna(value):
         return None
     return str(value).strip()
+
+
+def _supported_fill(payload):
+    try:
+        return account_store.normalize_fill(payload)
+    except ValueError:
+        return None
 
 
 def _number(value):

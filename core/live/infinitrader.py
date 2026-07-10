@@ -55,7 +55,7 @@ def compile_signal_orders(signal_payload: dict[str, Any]) -> list[dict[str, Any]
         orders.extend(_compile_advice_item(item, len(orders) + 1, include_etf=False))
     for item in etf_netting.netted_etf_advice_items(advice):
         orders.extend(_compile_advice_item(item, len(orders) + 1, include_etf=True))
-    orders = _renumber_orders(_net_exact_option_hedge_orders(orders))
+    orders = _renumber_orders(orders)
     return [order.to_dict() for order in orders if order.volume > 0]
 
 
@@ -161,7 +161,7 @@ def build_fills_from_command(command: dict[str, Any]) -> list[dict[str, Any]]:
                 include_etf=True,
             )
         )
-    return _net_exact_option_hedge_fills(fills)
+    return fills
 
 
 def _compile_advice_item(
@@ -171,21 +171,6 @@ def _compile_advice_item(
 ) -> list[InfiniOrder]:
     action = str(item.get("action") or "")
     side = str(item.get("side") or "").lower()
-
-    if action == "CLOSE_OPTION_HEDGE":
-        close_direction = BUY if side == "short" else SELL
-        return [
-            _option_order(
-                start_sequence,
-                action,
-                "option_hedge_close",
-                item.get("order_book_id"),
-                close_direction,
-                OFFSET_CLOSE,
-                item.get("qty"),
-                item.get("estimated_price"),
-            )
-        ]
 
     if action == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
         return _option_pair_orders(
@@ -314,24 +299,6 @@ def _fills_from_advice(
             return []
         return [_delta_hedge_fill(item, date, source_file)]
 
-    if action == "CLOSE_OPTION_HEDGE":
-        qty = _int_qty(item.get("qty"))
-        price = float(item.get("estimated_price", 0.0) or 0.0)
-        direction = -1.0 if side == "short" else 1.0
-        return [
-            {
-                "action": "close_option_hedge",
-                "date": date,
-                "side": side or "short",
-                "order_book_id": item.get("order_book_id"),
-                "qty": qty,
-                "price": price,
-                "cash_delta": direction * qty * price * multiplier,
-                "source_file": source_file,
-                "import_source": "infinitrader_command",
-            }
-        ]
-
     if action.startswith("OPEN_"):
         return [_straddle_fill(item, action.lower(), date, source_file, multiplier)]
 
@@ -371,123 +338,11 @@ def _fills_from_advice(
     return []
 
 
-def _net_exact_option_hedge_orders(orders: list[InfiniOrder]) -> list[InfiniOrder]:
-    result: list[InfiniOrder] = []
-    for order in orders:
-        if not (_is_option_hedge_close_order(order) or _is_option_hedge_open_order(order)):
-            result.append(order)
-            continue
-
-        residual = order
-        residual_volume = int(order.volume or 0)
-        index = 0
-        while index < len(result) and residual_volume > 0:
-            other = result[index]
-            if not _opposite_option_hedge_orders(other, residual):
-                index += 1
-                continue
-            matched_volume = min(int(other.volume or 0), residual_volume)
-            other_volume = int(other.volume or 0) - matched_volume
-            residual_volume -= matched_volume
-            if other_volume <= 0:
-                result.pop(index)
-            else:
-                result[index] = replace(other, volume=other_volume)
-                index += 1
-        if residual_volume > 0:
-            result.append(replace(residual, volume=residual_volume))
-    return result
-
-
-def _is_option_hedge_close_order(order: InfiniOrder) -> bool:
-    return order.leg == "option_hedge_close"
-
-
-def _opposite_option_hedge_orders(left: InfiniOrder, right: InfiniOrder) -> bool:
-    if left.exchange != right.exchange or left.instrument_id != right.instrument_id:
-        return False
-    if _is_option_hedge_close_order(left) and _is_option_hedge_open_order(right):
-        close_order, open_order = left, right
-    elif _is_option_hedge_close_order(right) and _is_option_hedge_open_order(left):
-        close_order, open_order = right, left
-    else:
-        return False
-    return _opposite_close_open(close_order, open_order)
-
-
-def _is_option_hedge_open_order(order: InfiniOrder) -> bool:
-    return False
-
-
-def _opposite_close_open(close_order: InfiniOrder, open_order: InfiniOrder) -> bool:
-    return (
-        close_order.offset == OFFSET_CLOSE
-        and open_order.offset == OFFSET_OPEN
-        and (
-            (close_order.order_direction == BUY and open_order.order_direction == SELL)
-            or (close_order.order_direction == SELL and open_order.order_direction == BUY)
-        )
-    )
-
-
 def _renumber_orders(orders: list[InfiniOrder]) -> list[InfiniOrder]:
     return [
         replace(order, sequence=index, memo=f"{order.action}:{order.leg}:{index}")
         for index, order in enumerate(orders, start=1)
     ]
-
-
-def _net_exact_option_hedge_fills(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = []
-    for fill in fills:
-        if fill.get("action") not in {"close_option_hedge", "open_option_hedge"}:
-            result.append(fill)
-            continue
-
-        residual = dict(fill)
-        residual_qty = _int_qty(residual.get("qty"))
-        index = 0
-        while index < len(result) and residual_qty > 0:
-            other = result[index]
-            if not _opposite_option_hedge_fills(other, residual):
-                index += 1
-                continue
-            other_qty = _int_qty(other.get("qty"))
-            matched_qty = min(other_qty, residual_qty)
-            other_qty -= matched_qty
-            residual_qty -= matched_qty
-            if other_qty <= 0:
-                result.pop(index)
-            else:
-                result[index] = _scale_option_hedge_fill(other, other_qty)
-                index += 1
-        if residual_qty > 0:
-            result.append(_scale_option_hedge_fill(residual, residual_qty))
-    return result
-
-
-def _opposite_option_hedge_fills(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    actions = {left.get("action"), right.get("action")}
-    if actions != {"close_option_hedge", "open_option_hedge"}:
-        return False
-    return (
-        _same_code(left.get("order_book_id"), right.get("order_book_id"))
-        and str(left.get("side", "short")).lower()
-        == str(right.get("side", "short")).lower()
-    )
-
-
-def _scale_option_hedge_fill(fill: dict[str, Any], qty: int) -> dict[str, Any]:
-    original_qty = max(_int_qty(fill.get("qty")), 1)
-    if qty == original_qty:
-        return dict(fill)
-    scale = qty / original_qty
-    result = dict(fill)
-    result["qty"] = qty
-    for key in ("option_margin", "cash_delta"):
-        if key in result:
-            result[key] = float(result.get(key, 0.0) or 0.0) * scale
-    return result
 
 
 def _same_code(left, right) -> bool:

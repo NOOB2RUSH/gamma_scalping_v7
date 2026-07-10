@@ -238,11 +238,6 @@ def _account_option_codes(product, account_id):
             value = position.get(key)
             if value:
                 codes.append(str(value))
-    for position in getattr(live_account, "option_hedges", []) or []:
-        for key in ["order_book_id", "call_code", "put_code"]:
-            value = position.get(key)
-            if value:
-                codes.append(str(value))
     return codes
 
 

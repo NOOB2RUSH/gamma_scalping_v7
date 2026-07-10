@@ -104,9 +104,9 @@ holding/trade imports and explicit account rebuild/amend tools.
 
 ## Roll State
 
-Roll cooldown still lives in the shadow account because it is created by
-confirmed close/roll fills. Signal generation reads that cooldown but does not
-advance or persist it.
+Rolls have no cooldown. A held position can roll whenever its DTE reaches the
+configured threshold or spot moves more than one strike interval away from the
+held strike.
 
 ATM-strike mismatch is not stored in strategy state. For each signal run the
 engine reconstructs consecutive mismatch days from broker option holding

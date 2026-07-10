@@ -197,7 +197,6 @@ def test_reconcile_builds_account_closure_checks(tmp_path):
             },
             "long": None,
         },
-        option_hedges=[],
         hedge=SimpleNamespace(underlying_order_book_id="510300", qty=2),
     )
 

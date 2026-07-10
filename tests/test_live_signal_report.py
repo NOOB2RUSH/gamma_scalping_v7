@@ -125,7 +125,6 @@ class LiveSignalReportTest(unittest.TestCase):
                         "put_qty": 10,
                     }
                 },
-                "option_hedges": [],
                 "hedge": {"underlying_order_book_id": "510300.XSHG", "qty": 0},
             },
             "advice": [
@@ -197,25 +196,9 @@ class LiveSignalReportTest(unittest.TestCase):
                         "put_qty": 10,
                     }
                 },
-                "option_hedges": [
-                    {
-                        "order_book_id": "10011702",
-                        "side": "short",
-                        "option_type": "c",
-                        "qty": 6,
-                    }
-                ],
                 "hedge": {"underlying_order_book_id": "510300.XSHG", "qty": 7100},
             },
             "advice": [
-                {
-                    "action": "CLOSE_OPTION_HEDGE",
-                    "priority": "action",
-                    "side": "short",
-                    "order_book_id": "10011702",
-                    "qty": 6,
-                    "estimated_price": 0.15235,
-                },
                 {
                     "action": "ATM_STRADDLE_DELTA_REBALANCE",
                     "priority": "action",
@@ -244,7 +227,6 @@ class LiveSignalReportTest(unittest.TestCase):
         self.assertEqual(
             [(row["合约代码"], row["数量"], row["执行后预计数量"]) for row in rows],
             [
-                ("10011702", 6, 0),
                 ("10011713", 1, 9),
                 ("10011704", 15, 16),
                 ("510300", 7100.0, 0),
@@ -252,7 +234,7 @@ class LiveSignalReportTest(unittest.TestCase):
         )
         self.assertEqual(notices, [])
 
-    def test_option_hedge_greek_impact_is_aggregated_once_per_signal(self):
+    def test_rebalance_greek_impact_is_aggregated_once_per_signal(self):
         payload = {
             "planned_account_greeks": {
                 "delta": 6804.0,
@@ -266,7 +248,7 @@ class LiveSignalReportTest(unittest.TestCase):
                     "priority": "action",
                     "side": "short",
                     "reason": "rebalance ATM short straddle delta",
-                    "residual_delta_before_option_hedge": 6804.0,
+                    "residual_delta_before_option_rebalance": 6804.0,
                     "estimated_delta_effect": -12137.0,
                     "estimated_gamma_effect": 40570.0,
                     "estimated_vega_effect": 166.5,
@@ -283,7 +265,7 @@ class LiveSignalReportTest(unittest.TestCase):
             ],
         }
 
-        rows = report._option_hedge_greek_impact_rows(payload)
+        rows = report._expected_greek_target_rows(payload)
         lines = report.format_signal_summary(payload)
 
         self.assertEqual([row["Greek"] for row in rows], ["Delta", "Gamma", "Vega", "Theta"])

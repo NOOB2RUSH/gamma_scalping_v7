@@ -59,7 +59,7 @@ def main():
     for item in result["applied"]:
         fill = item["fill"]
         prefix = "DRY_RUN" if item["dry_run"] else "CONFIRMED"
-        if fill["action"] in {"option_mark_update", "option_hedge_mark_update"}:
+        if fill["action"] == "option_mark_update":
             print(
                 f"{prefix} {fill['action']} side={fill['side']} "
                 f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
@@ -68,14 +68,6 @@ def main():
                 f"last_put_px={fill.get('last_put_price')} "
                 f"last_option_value={fill.get('last_option_value')} "
                 f"margin={fill.get('option_margin')}"
-            )
-        elif fill["action"] in {"open_option_hedge", "close_option_hedge"}:
-            print(
-                f"{prefix} {fill['action']} side={fill['side']} "
-                f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
-                f"call={fill.get('call_code')} put={fill.get('put_code')} "
-                f"price={fill.get('price', fill.get('entry_price'))} "
-                f"cash_delta={fill['cash_delta']:.2f}"
             )
         else:
             print(

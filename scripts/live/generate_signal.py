@@ -4,27 +4,41 @@ import argparse
 
 import _bootstrap  # noqa: F401
 import core
-from core.live import report, signal_engine, storage
+from core.live import market_data, report, signal_engine, storage
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate one simulated live signal.")
     parser.add_argument("--product", choices=core.config.available_live_products(), required=True)
     parser.add_argument("--account-id", default="default")
-    parser.add_argument("--date", default=None)
+    parser.add_argument(
+        "--source",
+        default="snapshot",
+        choices=["snapshot", "local", "akshare"],
+    )
+    parser.add_argument("--date", default="latest")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    snapshot = market_data.fetch_quote_snapshot(
+        args.product,
+        source=args.source,
+        date=args.date,
+    )
     payload = signal_engine.generate_signal(
         args.product,
         args.account_id,
-        args.date,
+        snapshot["quote_date"],
+        quote_snapshot=snapshot,
     )
+    payload["quote_snapshot"] = snapshot
     report_path = report.write_signal_report(args.product, payload)
     json_path = report_path.with_suffix(".json")
     storage.write_json(json_path, payload)
+    print(f"quote_date={snapshot['quote_date']}")
+    print(f"snapshot_stamp={snapshot.get('snapshot_stamp', 'unknown')}")
     print(f"signal_report={report_path}")
     print(f"signal_json={json_path}")
     for line in report.format_signal_summary(payload):

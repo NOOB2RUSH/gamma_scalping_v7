@@ -118,7 +118,6 @@ class AccountReportAumTest(unittest.TestCase):
         }
         account = SimpleNamespace(
             positions={"long": None, "short": position},
-            option_hedges=[],
         )
 
         with (

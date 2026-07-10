@@ -59,7 +59,7 @@ class StrategyConfig:
     enable_delta_hedge: bool = False
     delta_hedge_tolerance_ratio: float = 0.05
     allow_etf_short_hedge: bool = True
-    enable_option_delta_hedge: bool = False
+    enable_atm_straddle_rebalance: bool = False
     atm_rebalance_target_pair_qty: int | None = None
 
     # 卖方持仓期间，若持仓合约 call+put 成交量较开仓时明显放大，主动退出。
@@ -69,7 +69,6 @@ class StrategyConfig:
 
     # 展期信号：按到期日和 ATM 档位偏离触发。
     roll_dte_threshold: int = 7
-    roll_cooldown_days: int = 1
 
 
 @dataclass(frozen=True)

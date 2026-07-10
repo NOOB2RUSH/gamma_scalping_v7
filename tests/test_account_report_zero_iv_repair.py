@@ -140,48 +140,6 @@ class AccountReportZeroIvRepairTest(unittest.TestCase):
         self.assertEqual(row["Vega"], -4000.0)
         self.assertEqual(row["Theta"], 200.0)
 
-    def test_segmented_node_uses_position_iv_when_implied_iv_is_zero(self):
-        c_strike = "\u884c\u6743\u4ef7"
-        c_dte = "\u5269\u4f59\u5929\u6570"
-        row = pd.Series(
-            {
-                c_strike: 5.0,
-                c_dte: 10,
-                "IV": 0.25,
-            }
-        )
-        funcs = {
-            "implied_volatility": lambda **kwargs: pd.Series([0.0]),
-            "delta": lambda **kwargs: pd.Series([0.5]),
-            "gamma": lambda **kwargs: pd.Series([0.1]),
-            "vega": lambda **kwargs: pd.Series([0.2]),
-            "theta": lambda **kwargs: pd.Series([-0.01]),
-        }
-
-        with mock.patch.object(
-            account_report.core.vol_engine,
-            "_load_vollib_funcs",
-            return_value=funcs,
-        ):
-            result = account_report._single_node_option_greeks(
-                "500etf",
-                {"previous": row},
-                row,
-                price=0.01,
-                spot=5.1,
-                flag="c",
-                signed_qty=-2,
-                node_index=0,
-                node_count=2,
-            )
-
-        self.assertIsNotNone(result)
-        self.assertEqual(result["iv"], 0.25)
-        self.assertEqual(result["delta"], -10000.0)
-        self.assertEqual(result["gamma"], -2000.0)
-        self.assertEqual(result["vega"], -4000.0)
-        self.assertAlmostEqual(result["theta"], 289.6825396825397)
-
 
 if __name__ == "__main__":
     unittest.main()
