@@ -1,7 +1,7 @@
 from core.live import account, position_checker
 
 
-def test_compare_option_positions_aggregates_core_and_option_hedges():
+def test_compare_option_positions_aggregates_core_straddle_legs():
     local = account.AccountState(
         product="500etf",
         positions={
@@ -14,17 +14,8 @@ def test_compare_option_positions_aggregates_core_and_option_hedges():
                 "put_qty": 10,
             },
         },
-        option_hedges=[
-            {
-                "side": "short",
-                "option_type": "c",
-                "order_book_id": "10011721",
-                "qty": 5,
-            }
-        ],
     )
     broker_rows = [
-        {"order_book_id": "10011721", "side": "short", "total_qty": 5},
         {"order_book_id": "10011723", "side": "short", "total_qty": 1},
         {"order_book_id": "10011732", "side": "short", "total_qty": 10},
     ]
@@ -36,7 +27,6 @@ def test_compare_option_positions_aggregates_core_and_option_hedges():
         (row["合约代码"], row["方向"], row["本地数量"], row["券商数量"])
         for row in rows
     } == {
-        ("10011721", "short", 5.0, 5.0),
         ("10011723", "short", 1.0, 1.0),
         ("10011732", "short", 10.0, 10.0),
     }
@@ -55,7 +45,6 @@ def test_compare_option_positions_reports_quantity_mismatch():
                 "put_qty": 10,
             },
         },
-        option_hedges=[],
     )
     broker_rows = [
         {"order_book_id": "10011721", "side": "short", "total_qty": 5},

@@ -97,10 +97,6 @@ def _local_option_positions(local):
         side = str(position.get("side") or "short").lower()
         _add_qty(result, position.get("call_code"), side, position.get("call_qty"))
         _add_qty(result, position.get("put_code"), side, position.get("put_qty"))
-    for hedge in getattr(local, "option_hedges", []) or []:
-        side = str(hedge.get("side") or "short").lower()
-        code = hedge.get("order_book_id") or hedge.get("call_code") or hedge.get("put_code")
-        _add_qty(result, code, side, hedge.get("qty"))
     return result
 
 

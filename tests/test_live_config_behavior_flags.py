@@ -1,13 +1,13 @@
 import core
 
 
-def test_live_etf_products_use_option_hedges_instead_of_short_etf():
+def test_live_etf_products_use_atm_rebalance_instead_of_short_etf():
     for product in ("50etf", "300etf", "500etf", "kc50etf"):
         strategy = core.config.load_config(product).strategy
         assert strategy.enable_delta_hedge is True
         assert strategy.delta_hedge_tolerance_ratio == 0.0
         assert strategy.allow_etf_short_hedge is False
-        assert strategy.enable_option_delta_hedge is True
+        assert strategy.enable_atm_straddle_rebalance is True
 
 
 def test_live_etf_short_stop_loss_uses_negative_three_percent_aum():

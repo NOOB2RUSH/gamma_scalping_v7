@@ -111,19 +111,6 @@ def import_holding_file(
         warnings,
         config,
     )
-    local = _apply_missing_option_hedge_closes(
-        product,
-        account_id,
-        local,
-        snapshot_rows,
-        trade_summary,
-        trade_summary_path,
-        trade_date,
-        config,
-        dry_run,
-        applied,
-        warnings,
-    )
     local = _apply_missing_straddle_closes(
         product,
         account_id,
@@ -139,56 +126,6 @@ def import_holding_file(
     )
 
     for candidate in candidates:
-        if candidate.get("kind") == "option_hedge":
-            fill = candidate["fill"]
-            if _option_hedge_overlaps_core_position(local, fill):
-                skipped.append(
-                    {
-                        "side": fill.get("side"),
-                        "reason": "snapshot_option_hedge_overlaps_core_position",
-                        "fill": fill,
-                    }
-                )
-                continue
-            existing = _matching_option_hedge(local, fill)
-            if existing is not None:
-                skipped.append(
-                    {
-                        "side": fill.get("side"),
-                        "reason": "local_option_hedge_already_matches_snapshot",
-                        "fill": fill,
-                    }
-                )
-                if _is_newer_mark(fill, existing):
-                    mark_fill = _option_hedge_mark_update_fill(fill, source_timestamp)
-                    local = _record_or_preview_fill(
-                        product,
-                        account_id,
-                        local,
-                        mark_fill,
-                        dry_run,
-                        applied,
-                    )
-            elif dry_run:
-                local = _record_or_preview_fill(
-                    product,
-                    account_id,
-                    local,
-                    fill,
-                    dry_run,
-                    applied,
-                )
-            else:
-                local = _record_or_preview_fill(
-                    product,
-                    account_id,
-                    local,
-                    fill,
-                    dry_run,
-                    applied,
-                )
-            continue
-
         side = candidate["side"]
         fill = candidate["fill"]
         existing = local.positions.get(side)
@@ -394,60 +331,6 @@ def _straddle_leg_trade_from_summary(side, qty_change, summary):
     }
 
 
-def _apply_missing_option_hedge_closes(
-    product,
-    account_id,
-    local,
-    snapshot_rows,
-    trade_summary,
-    trade_summary_path,
-    trade_date,
-    config,
-    dry_run,
-    applied,
-    warnings,
-):
-    snapshot_codes = {str(row["order_book_id"]) for row in snapshot_rows}
-    summary_by_code = _trade_detail_by_code(trade_summary)
-    for hedge in list(getattr(local, "option_hedges", []) or []):
-        code = str(hedge.get("order_book_id") or "")
-        if not code or code in snapshot_codes:
-            continue
-        summary = summary_by_code.get(code)
-        if summary is None:
-            warnings.append(
-                {
-                    "order_book_id": code,
-                    "reason": (
-                        "local option hedge is absent from holding snapshot, but no "
-                        "matching option trade detail was found; close was not applied"
-                    ),
-                }
-            )
-            continue
-        fill = _option_hedge_close_fill(
-            hedge,
-            summary,
-            trade_date,
-            trade_summary_path,
-            config,
-        )
-        if fill is None:
-            warnings.append(
-                {
-                    "order_book_id": code,
-                    "reason": (
-                        "matching option trade detail does not prove a full close; "
-                        "close was not applied"
-                    ),
-                    "trade_detail": summary,
-                }
-            )
-            continue
-        local = _record_or_preview_fill(product, account_id, local, fill, dry_run, applied)
-    return local
-
-
 def _trade_detail_by_code(df):
     if not _is_trade_detail_export(df):
         return {}
@@ -645,60 +528,6 @@ def _straddle_close_fill(position, summary_by_code, trade_date, source_file, con
     }
 
 
-def _option_hedge_close_fill(hedge, summary, trade_date, source_file, config):
-    side = str(hedge.get("side") or "long")
-    qty_column = "卖平" if side == "long" else "买平"
-    price_column = "卖平均价" if side == "long" else "买平均价"
-    close_qty = int(_number(summary.get(qty_column), 0) or 0)
-    position_qty = int(_number(hedge.get("qty"), 0) or 0)
-    close_price = _number(summary.get(price_column))
-    if position_qty <= 0 or close_qty != position_qty or close_price is None:
-        return None
-
-    multiplier = int(
-        _number(hedge.get("contract_multiplier"), config.vol.contract_multiplier)
-        or config.vol.contract_multiplier
-    )
-    fee = close_qty * float(config.backtest.option_fee_per_contract)
-    close_value = close_price * close_qty * multiplier
-    margin_release = float(hedge.get("option_margin", 0.0) or 0.0) if side == "short" else 0.0
-    cash_delta = close_value - fee if side == "long" else -close_value - fee + margin_release
-    return {
-        "action": "close_option_hedge",
-        "side": side,
-        "option_hedge_type": hedge.get("option_hedge_type"),
-        "option_type": hedge.get("option_type"),
-        "date": trade_date,
-        "order_book_id": hedge.get("order_book_id"),
-        "call_code": (
-            hedge.get("call_code") or hedge.get("order_book_id")
-            if hedge.get("option_type") == "c"
-            else None
-        ),
-        "put_code": (
-            hedge.get("put_code") or hedge.get("order_book_id")
-            if hedge.get("option_type") == "p"
-            else None
-        ),
-        "qty": close_qty,
-        "call_qty": close_qty if hedge.get("option_type") == "c" else 0,
-        "put_qty": close_qty if hedge.get("option_type") == "p" else 0,
-        "price": close_price,
-        "close_price": close_price,
-        "contract_multiplier": multiplier,
-        "fee": fee,
-        "realized_pnl": _number(summary.get("平仓盈亏")),
-        "cash_delta": cash_delta,
-        "source_timestamp": _parse_timestamp_from_filename(source_file),
-        "import_source": "broker_option_trade_detail",
-        "source_file": str(source_file),
-        "source_limitations": [
-            "option trade detail is aggregated by contract for close confirmation",
-            "configured local option fee is used because broker export fee is unavailable",
-        ],
-    }
-
-
 def _resolve_holding_file(file_path, report_date=None):
     if file_path is not None:
         path = Path(file_path)
@@ -864,25 +693,21 @@ def _build_straddle_candidates(rows, metadata, config, trade_date, source_file, 
         }
 
     by_side = {}
-    option_hedge_candidates = []
     for key, legs in grouped.items():
         side, strike, expiry = key
         if "call" not in legs or "put" not in legs:
             leg_name, leg_payload = next(iter(legs.items()))
-            option_hedge_candidates.append(
+            warnings.append(
                 {
-                    "kind": "option_hedge",
                     "side": side,
-                    "fill": _single_leg_candidate_to_fill(
-                        side,
-                        strike,
-                        expiry,
-                        leg_name,
-                        leg_payload,
-                        config,
-                        trade_date,
-                        source_file,
+                    "order_book_id": leg_payload["row"]["order_book_id"],
+                    "reason": (
+                        "unpaired option holding is not imported; live account only "
+                        "supports paired straddle positions"
                     ),
+                    "leg": leg_name,
+                    "strike": strike,
+                    "expiry": expiry,
                 }
             )
             continue
@@ -915,7 +740,6 @@ def _build_straddle_candidates(rows, metadata, config, trade_date, source_file, 
                 ),
             }
         )
-    candidates.extend(option_hedge_candidates)
     return candidates
 
 
@@ -977,67 +801,6 @@ def _candidate_to_fill(side, strike, expiry, legs, config, trade_date, source_fi
     }
 
 
-def _single_leg_candidate_to_fill(
-    side,
-    strike,
-    expiry,
-    leg_name,
-    leg_payload,
-    config,
-    trade_date,
-    source_file,
-):
-    row = leg_payload["row"]
-    meta = leg_payload["meta"]
-    multiplier = meta["contract_multiplier"]
-    qty = int(row["qty"])
-    entry_price = float(row["entry_price"])
-    latest_price = float(row["latest_price"])
-    entry_value = entry_price * qty * multiplier
-    latest_value = latest_price * qty * multiplier
-    fee = qty * config.backtest.option_fee_per_contract
-    margin = float(row["margin"] or 0.0)
-    cash_delta = entry_value - fee - margin if side == "short" else -entry_value - fee
-    call_code = row["order_book_id"] if leg_name == "call" else None
-    put_code = row["order_book_id"] if leg_name == "put" else None
-    return {
-        "action": "open_option_hedge",
-        "side": side,
-        "option_hedge_type": f"{side}_{leg_name}",
-        "option_type": "c" if leg_name == "call" else "p",
-        "date": trade_date,
-        "order_book_id": row["order_book_id"],
-        "call_code": call_code,
-        "put_code": put_code,
-        "strike": strike,
-        "expiry": expiry,
-        "qty": qty,
-        "call_qty": qty if leg_name == "call" else 0,
-        "put_qty": qty if leg_name == "put" else 0,
-        "entry_price": entry_price,
-        "entry_call_price": entry_price if leg_name == "call" else None,
-        "entry_put_price": entry_price if leg_name == "put" else None,
-        "last_price": latest_price,
-        "last_call_price": latest_price if leg_name == "call" else None,
-        "last_put_price": latest_price if leg_name == "put" else None,
-        "contract_multiplier": multiplier,
-        "contract_symbol": meta.get("contract_symbol"),
-        "entry_option_value": entry_value,
-        "option_margin": margin if side == "short" else 0.0,
-        "last_option_value": -latest_value if side == "short" else latest_value,
-        "cash_delta": cash_delta,
-        "source_timestamp": _parse_timestamp_from_filename(source_file),
-        "import_source": "broker_holding_snapshot",
-        "source_file": source_file,
-        "source_broker_account": row.get("broker_account"),
-        "source_limitations": [
-            "single-leg option hedge inferred from unpaired broker holding row",
-            "holding snapshot has no per-fill execution id/time",
-            "cash_delta is estimated from open average, configured fee, and occupied margin",
-        ],
-    }
-
-
 def _same_position(position, fill):
     return (
         str(position.get("call_code")) == str(fill.get("call_code"))
@@ -1047,35 +810,6 @@ def _same_position(position, fill):
     )
 
 
-def _matching_option_hedge(local, fill):
-    code = fill.get("order_book_id") or fill.get("call_code") or fill.get("put_code")
-    side = fill.get("side")
-    for hedge in getattr(local, "option_hedges", []) or []:
-        if str(hedge.get("order_book_id")) != str(code):
-            continue
-        if str(hedge.get("side")) != str(side):
-            continue
-        if int(hedge.get("qty", 0) or 0) != int(fill.get("qty", 0) or 0):
-            continue
-        return hedge
-    return None
-
-
-def _option_hedge_overlaps_core_position(local, fill):
-    code = fill.get("order_book_id") or fill.get("call_code") or fill.get("put_code")
-    if code is None:
-        return False
-    display_code = str(code).split(".", 1)[0]
-    for position in (local.positions or {}).values():
-        if not position:
-            continue
-        for key in ("call_code", "put_code"):
-            position_code = position.get(key)
-            if position_code is not None and str(position_code).split(".", 1)[0] == display_code:
-                return True
-    return False
-
-
 def _local_contains_snapshot_rows(local, rows):
     local_qty = {}
     for position in local.positions.values():
@@ -1083,8 +817,6 @@ def _local_contains_snapshot_rows(local, rows):
             continue
         local_qty[str(position.get("call_code"))] = int(position.get("call_qty", 0) or 0)
         local_qty[str(position.get("put_code"))] = int(position.get("put_qty", 0) or 0)
-    for hedge in getattr(local, "option_hedges", []) or []:
-        local_qty[str(hedge.get("order_book_id"))] = int(hedge.get("qty", 0) or 0)
     return all(
         local_qty.get(str(row.get("order_book_id"))) == int(row.get("total_qty", 0) or 0)
         for row in rows
@@ -1100,30 +832,6 @@ def _mark_update_fill(fill, source_timestamp):
         "put_code": fill["put_code"],
         "call_qty": fill["call_qty"],
         "put_qty": fill["put_qty"],
-        "last_call_price": fill.get("last_call_price"),
-        "last_put_price": fill.get("last_put_price"),
-        "last_option_value": fill.get("last_option_value"),
-        "option_margin": fill.get("option_margin"),
-        "cash_delta": 0.0,
-        "source_file": fill.get("source_file"),
-        "source_timestamp": source_timestamp or fill.get("source_timestamp"),
-        "import_source": "broker_holding_mark_snapshot",
-    }
-
-
-def _option_hedge_mark_update_fill(fill, source_timestamp):
-    return {
-        "action": "option_hedge_mark_update",
-        "side": fill["side"],
-        "date": fill["date"],
-        "order_book_id": fill["order_book_id"],
-        "option_type": fill.get("option_type"),
-        "call_code": fill.get("call_code"),
-        "put_code": fill.get("put_code"),
-        "qty": fill["qty"],
-        "call_qty": fill.get("call_qty"),
-        "put_qty": fill.get("put_qty"),
-        "last_price": fill.get("last_price"),
         "last_call_price": fill.get("last_call_price"),
         "last_put_price": fill.get("last_put_price"),
         "last_option_value": fill.get("last_option_value"),

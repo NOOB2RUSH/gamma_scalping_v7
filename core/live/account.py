@@ -45,7 +45,6 @@ class AccountState:
     account_id: str = "default"
     cash: float = 1_000_000.0
     positions: dict = field(default_factory=lambda: {"long": None, "short": None})
-    option_hedges: list = field(default_factory=list)
     hedge: HedgeState = field(default_factory=HedgeState)
     strategy_state: "StrategyState" = field(default_factory=lambda: StrategyState())
     reset_at: str | None = None
@@ -57,7 +56,6 @@ class AccountState:
             "account_id": self.account_id,
             "cash": self.cash,
             "positions": self.positions,
-            "option_hedges": self.option_hedges,
             "hedge": self.hedge.to_dict(),
             "strategy_state": self.strategy_state.to_dict(),
             "reset_at": self.reset_at,
@@ -67,30 +65,21 @@ class AccountState:
 
 @dataclass
 class StrategyState:
-    roll_cooldown_left: dict = field(
-        default_factory=lambda: {"long": 0, "short": 0}
-    )
-    cooldown_total_days: dict = field(
-        default_factory=lambda: {"long": 0, "short": 0}
-    )
-    cooldown_started_date: dict = field(
-        default_factory=lambda: {"long": None, "short": None}
-    )
+    short_entry_cooldown_left: int = 0
+    short_entry_cooldown_total_days: int = 0
+    short_entry_cooldown_started_date: str | None = None
 
     def to_dict(self):
         return {
-            "roll_cooldown_left": {
-                side: int(self.roll_cooldown_left.get(side, 0) or 0)
-                for side in POSITION_SIDES
-            },
-            "cooldown_total_days": {
-                side: int(self.cooldown_total_days.get(side, 0) or 0)
-                for side in POSITION_SIDES
-            },
-            "cooldown_started_date": {
-                side: self.cooldown_started_date.get(side)
-                for side in POSITION_SIDES
-            },
+            "short_entry_cooldown_left": int(
+                self.short_entry_cooldown_left or 0
+            ),
+            "short_entry_cooldown_total_days": int(
+                self.short_entry_cooldown_total_days or 0
+            ),
+            "short_entry_cooldown_started_date": (
+                self.short_entry_cooldown_started_date
+            ),
         }
 
 
@@ -119,13 +108,6 @@ def ensure_schema(conn):
             payload text not null,
             updated_at text not null,
             primary key (account_id, side)
-        );
-        create table if not exists option_hedges (
-            account_id text not null,
-            hedge_id text not null,
-            payload text not null,
-            updated_at text not null,
-            primary key (account_id, hedge_id)
         );
         create table if not exists hedge_position (
             account_id text primary key,
@@ -193,7 +175,6 @@ def initialize_account(product, initial_cash, db_path=None, account_id="default"
         if reset:
             conn.execute("delete from account_state where account_id = ?", (account_id,))
             conn.execute("delete from option_positions where account_id = ?", (account_id,))
-            conn.execute("delete from option_hedges where account_id = ?", (account_id,))
             conn.execute("delete from hedge_position where account_id = ?", (account_id,))
             conn.execute("delete from strategy_state where account_id = ?", (account_id,))
             conn.execute("delete from fills where account_id = ?", (account_id,))
@@ -277,7 +258,6 @@ def record_fill(product, fill, db_path=None, account_id="default"):
                 account_id=account_id,
                 cash=float(_default_initial_cash(product)),
                 positions={side: None for side in POSITION_SIDES},
-                option_hedges=[],
                 hedge=HedgeState(),
                 strategy_state=StrategyState(),
             )
@@ -312,11 +292,6 @@ def normalize_fill(fill):
         "delta_hedge": "delta_hedge",
         "projected_delta_hedge": "delta_hedge",
         "final_delta_hedge": "delta_hedge",
-        "option_delta_hedge_short_call": "open_option_hedge",
-        "final_option_delta_hedge_short_call": "open_option_hedge",
-        "open_option_hedge": "open_option_hedge",
-        "option_hedge_mark_update": "option_hedge_mark_update",
-        "close_option_hedge": "close_option_hedge",
         "rebalance_hedge": "rebalance_hedge",
         "close_hedge": "close_hedge",
         "option_mark_update": "option_mark_update",
@@ -345,53 +320,6 @@ def _copy_if_missing(payload, source_key, target_key):
         payload[target_key] = payload[source_key]
 
 
-def _option_hedge_id(payload, index=0):
-    code = payload.get("order_book_id") or payload.get("call_code") or payload.get("put_code")
-    side = payload.get("side", "short")
-    if code is None:
-        return f"{side}:{index}"
-    return f"{side}:{code}"
-
-
-def _position_leg_codes(positions):
-    codes = set()
-    for position in (positions or {}).values():
-        if not position:
-            continue
-        for key in ("call_code", "put_code"):
-            code = position.get(key)
-            if code is not None:
-                codes.add(str(code).split(".", 1)[0])
-                codes.add(str(code))
-    return codes
-
-
-def _option_hedge_code(payload):
-    code = payload.get("order_book_id") or payload.get("call_code") or payload.get("put_code")
-    if code is None:
-        return None
-    return str(code).split(".", 1)[0]
-
-
-def _dedupe_option_hedges_against_positions(option_hedges, positions):
-    position_codes = _position_leg_codes(positions)
-    if not position_codes:
-        return list(option_hedges or [])
-    return [
-        hedge
-        for hedge in option_hedges or []
-        if _option_hedge_code(hedge) not in position_codes
-    ]
-
-
-def _normalize_account_option_hedges(account):
-    account.option_hedges = _dedupe_option_hedges_against_positions(
-        account.option_hedges,
-        account.positions,
-    )
-    return account
-
-
 def _load_account_from_conn(conn, product, account_id):
     state_row = conn.execute(
         "select * from account_state where account_id = ?",
@@ -406,14 +334,6 @@ def _load_account_from_conn(conn, product, account_id):
         (account_id,),
     ):
         positions[row["side"]] = json.loads(row["payload"])
-
-    option_hedges = []
-    for row in conn.execute(
-        "select payload from option_hedges where account_id = ? order by hedge_id",
-        (account_id,),
-    ):
-        option_hedges.append(json.loads(row["payload"]))
-    option_hedges = _dedupe_option_hedges_against_positions(option_hedges, positions)
 
     hedge_row = conn.execute(
         "select payload from hedge_position where account_id = ?",
@@ -431,7 +351,6 @@ def _load_account_from_conn(conn, product, account_id):
         account_id=account_id,
         cash=float(state_row["cash"]),
         positions=positions,
-        option_hedges=option_hedges,
         hedge=HedgeState(
             qty=float(hedge_payload.get("qty", 0.0) or 0.0),
             entry_price=float(hedge_payload.get("entry_price", 0.0) or 0.0),
@@ -451,7 +370,6 @@ def _load_account_from_conn(conn, product, account_id):
 
 
 def _save_account_to_conn(conn, account, now):
-    _normalize_account_option_hedges(account)
     conn.execute(
         """
         insert into account_state(account_id, product, cash, reset_at, updated_at)
@@ -485,24 +403,6 @@ def _save_account_to_conn(conn, account, now):
             (
                 account.account_id,
                 side,
-                json.dumps(payload, ensure_ascii=False, default=str),
-                now,
-            ),
-        )
-    conn.execute(
-        "delete from option_hedges where account_id = ?",
-        (account.account_id,),
-    )
-    for index, payload in enumerate(account.option_hedges or []):
-        hedge_id = _option_hedge_id(payload, index)
-        conn.execute(
-            """
-            insert into option_hedges(account_id, hedge_id, payload, updated_at)
-            values (?, ?, ?, ?)
-            """,
-            (
-                account.account_id,
-                hedge_id,
                 json.dumps(payload, ensure_ascii=False, default=str),
                 now,
             ),
@@ -550,31 +450,19 @@ def _apply_fill(account, product, fill):
     if action in {"open_straddle", "open_short_straddle", "open_long_straddle"}:
         side = side or ("short" if "short" in action else "long")
         account.positions[side] = _position_from_fill(fill, side)
-        _reset_strategy_side(account.strategy_state, side)
+        if side == "short":
+            _reset_short_entry_cooldown(account.strategy_state)
         account.cash += cash_delta
     elif action in {"roll_straddle", "roll_short_straddle", "roll_long_straddle"}:
         side = side or ("short" if "short" in action else "long")
         account.positions[side] = _position_from_fill(fill, side)
-        _start_strategy_cooldown(
-            account.strategy_state,
-            side,
-            _roll_cooldown_days(product),
-            fill.get("date"),
-        )
         account.cash += cash_delta
     elif action in {"close_straddle", "close_short_straddle", "close_long_straddle"}:
         side = side or ("short" if "short" in action else "long")
         account.positions[side] = None
-        _start_strategy_cooldown(
-            account.strategy_state,
-            side,
-            _roll_cooldown_days(product),
-            fill.get("date"),
-        )
         if side == "long" and fill.get("exit_reason") == "iv_high":
-            _start_strategy_cooldown(
+            _start_short_entry_cooldown(
                 account.strategy_state,
-                "short",
                 _short_cooldown_after_long_iv_high_exit_days(product),
                 fill.get("date"),
             )
@@ -598,14 +486,6 @@ def _apply_fill(account, product, fill):
             last_mark_source_file=hedge.get("holding_source_file"),
             last_mark_source_timestamp=hedge.get("source_timestamp"),
         )
-        account.cash += cash_delta
-    elif action == "open_option_hedge":
-        _upsert_option_hedge(account, fill)
-        account.cash += cash_delta
-    elif action == "option_hedge_mark_update":
-        _apply_option_hedge_mark_update(account, fill)
-    elif action == "close_option_hedge":
-        _remove_option_hedge(account, fill)
         account.cash += cash_delta
     elif action == "option_mark_update":
         _apply_option_mark_update(account, fill)
@@ -695,7 +575,6 @@ def rebuild_account(product, db_path=None, account_id="default", initial_cash=No
         account_id=account_id,
         cash=float(initial_cash),
         positions={side: None for side in POSITION_SIDES},
-        option_hedges=[],
         hedge=HedgeState(),
         strategy_state=StrategyState(),
     )
@@ -705,7 +584,11 @@ def rebuild_account(product, db_path=None, account_id="default", initial_cash=No
         account_id=account_id,
         include_voided=False,
     ):
-        _apply_fill(account, product, row["payload"])
+        try:
+            fill = normalize_fill(row["payload"])
+        except ValueError:
+            continue
+        _apply_fill(account, product, fill)
     return save_account(account, db_path)
 
 
@@ -942,90 +825,6 @@ def _position_from_fill(fill, side):
     }
 
 
-def _option_hedge_from_fill(fill):
-    option_type = str(fill.get("option_type") or "").lower()
-    code = fill.get("order_book_id")
-    if not option_type:
-        if fill.get("call_code") is not None:
-            option_type = "c"
-            code = fill.get("call_code")
-        elif fill.get("put_code") is not None:
-            option_type = "p"
-            code = fill.get("put_code")
-    qty = int(fill.get("qty", fill.get("call_qty", fill.get("put_qty", 0))) or 0)
-    price_key = "entry_call_price" if option_type == "c" else "entry_put_price"
-    last_price_key = "last_call_price" if option_type == "c" else "last_put_price"
-    return {
-        "order_book_id": code,
-        "option_type": option_type,
-        "side": fill.get("side", "short"),
-        "qty": qty,
-        "strike": float(fill.get("strike", 0.0) or 0.0),
-        "expiry": fill.get("expiry"),
-        "entry_price": float(fill.get("entry_price", fill.get(price_key, 0.0)) or 0.0),
-        "last_price": _optional_float(fill.get("last_price", fill.get(last_price_key))),
-        "contract_multiplier": int(fill.get("contract_multiplier", 10000) or 10000),
-        "underlying_order_book_id": fill.get("underlying_order_book_id"),
-        "option_margin": float(fill.get("option_margin", 0.0) or 0.0),
-        "last_option_value": float(fill.get("last_option_value", 0.0) or 0.0),
-        "last_mark_date": fill.get("date"),
-        "last_mark_source_file": fill.get("source_file"),
-        "last_mark_source_timestamp": fill.get("source_timestamp"),
-        "option_hedge_type": fill.get("option_hedge_type"),
-        "contract_symbol": fill.get("contract_symbol"),
-    }
-
-
-def _upsert_option_hedge(account, fill):
-    hedge = _option_hedge_from_fill(fill)
-    if _option_hedge_code(hedge) in _position_leg_codes(account.positions):
-        return
-    hedge_id = _option_hedge_id(hedge)
-    for index, existing in enumerate(account.option_hedges or []):
-        if _option_hedge_id(existing, index) == hedge_id:
-            account.option_hedges[index] = hedge
-            return
-    account.option_hedges.append(hedge)
-
-
-def _apply_option_hedge_mark_update(account, fill):
-    code = fill.get("order_book_id") or fill.get("call_code") or fill.get("put_code")
-    side = fill.get("side", "short")
-    for hedge in account.option_hedges or []:
-        if str(hedge.get("order_book_id")) != str(code) or str(hedge.get("side")) != str(side):
-            continue
-        if fill.get("qty") is not None or fill.get("call_qty") is not None or fill.get("put_qty") is not None:
-            hedge["qty"] = int(fill.get("qty", fill.get("call_qty", fill.get("put_qty", hedge.get("qty", 0)))) or 0)
-        last_price = fill.get("last_price")
-        if last_price is None and hedge.get("option_type") == "c":
-            last_price = fill.get("last_call_price")
-        if last_price is None and hedge.get("option_type") == "p":
-            last_price = fill.get("last_put_price")
-        hedge["last_price"] = _optional_float(last_price)
-        if fill.get("option_margin") is not None:
-            hedge["option_margin"] = float(fill.get("option_margin") or 0.0)
-        if fill.get("last_option_value") is not None:
-            hedge["last_option_value"] = float(fill.get("last_option_value") or 0.0)
-        hedge["last_mark_date"] = fill.get("date")
-        hedge["last_mark_source_file"] = fill.get("source_file")
-        hedge["last_mark_source_timestamp"] = fill.get("source_timestamp")
-        return
-    raise ValueError(f"Cannot update missing option hedge code={code} side={side}.")
-
-
-def _remove_option_hedge(account, fill):
-    code = fill.get("order_book_id") or fill.get("call_code") or fill.get("put_code")
-    side = fill.get("side", "short")
-    account.option_hedges = [
-        hedge
-        for hedge in account.option_hedges or []
-        if not (
-            str(hedge.get("order_book_id")) == str(code)
-            and str(hedge.get("side")) == str(side)
-        )
-    ]
-
-
 def _apply_option_mark_update(account, fill):
     side = fill.get("side")
     if side not in account.positions or account.positions.get(side) is None:
@@ -1068,56 +867,39 @@ def _optional_float(value):
 
 
 def _strategy_state_from_payload(payload):
-    state = StrategyState()
-    for field_name in [
-        "roll_cooldown_left",
-        "cooldown_total_days",
-        "cooldown_started_date",
-    ]:
-        values = payload.get(field_name, {}) or {}
-        current = getattr(state, field_name)
-        for side in POSITION_SIDES:
-            if side in values:
-                current[side] = values[side]
-    state.roll_cooldown_left = {
-        side: int(state.roll_cooldown_left.get(side, 0) or 0)
-        for side in POSITION_SIDES
-    }
-    state.cooldown_total_days = {
-        side: int(state.cooldown_total_days.get(side, 0) or 0)
-        for side in POSITION_SIDES
-    }
-    return state
+    return StrategyState(
+        short_entry_cooldown_left=int(
+            payload.get("short_entry_cooldown_left", 0) or 0
+        ),
+        short_entry_cooldown_total_days=int(
+            payload.get("short_entry_cooldown_total_days", 0) or 0
+        ),
+        short_entry_cooldown_started_date=payload.get(
+            "short_entry_cooldown_started_date"
+        ),
+    )
 
 
-def _reset_strategy_side(strategy_state, side):
-    strategy_state.roll_cooldown_left[side] = 0
-    strategy_state.cooldown_total_days[side] = 0
-    strategy_state.cooldown_started_date[side] = None
+def _reset_short_entry_cooldown(strategy_state):
+    strategy_state.short_entry_cooldown_left = 0
+    strategy_state.short_entry_cooldown_total_days = 0
+    strategy_state.short_entry_cooldown_started_date = None
 
 
-def _start_strategy_cooldown(strategy_state, side, days, date_text):
+def _start_short_entry_cooldown(strategy_state, days, date_text):
     days = int(days or 0)
     if days <= 0:
-        strategy_state.roll_cooldown_left[side] = 0
-        strategy_state.cooldown_total_days[side] = 0
-        strategy_state.cooldown_started_date[side] = None
+        _reset_short_entry_cooldown(strategy_state)
         return
-    strategy_state.roll_cooldown_left[side] = max(
-        int(strategy_state.roll_cooldown_left.get(side, 0) or 0),
+    strategy_state.short_entry_cooldown_left = max(
+        int(strategy_state.short_entry_cooldown_left or 0),
         days,
     )
-    strategy_state.cooldown_total_days[side] = max(
-        int(strategy_state.cooldown_total_days.get(side, 0) or 0),
+    strategy_state.short_entry_cooldown_total_days = max(
+        int(strategy_state.short_entry_cooldown_total_days or 0),
         days,
     )
-    strategy_state.cooldown_started_date[side] = date_text
-
-
-def _roll_cooldown_days(product):
-    import core
-
-    return core.config.load_config(product).strategy.roll_cooldown_days
+    strategy_state.short_entry_cooldown_started_date = date_text
 
 
 def _short_cooldown_after_long_iv_high_exit_days(product):

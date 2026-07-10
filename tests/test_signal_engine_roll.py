@@ -65,7 +65,6 @@ class SignalEngineRollTest(unittest.TestCase):
             ),
             backtest=SimpleNamespace(short_qty=80, long_qty=10),
         )
-        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
         position = {"strike": 1.75}
         feature_row = pd.Series({"atm_strike": 1.75})
 
@@ -86,7 +85,6 @@ class SignalEngineRollTest(unittest.TestCase):
                 None,
                 1.746,
                 10,
-                strategy_state,
             )
 
         self.assertIsNone(result)
@@ -98,7 +96,6 @@ class SignalEngineRollTest(unittest.TestCase):
             ),
             backtest=SimpleNamespace(short_qty=10, long_qty=10),
         )
-        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
         position = {"strike": 1.75}
         feature_row = pd.Series({"atm_strike": 1.80})
         chain_df = pd.DataFrame(
@@ -127,10 +124,63 @@ class SignalEngineRollTest(unittest.TestCase):
                 None,
                 1.80,
                 10,
-                strategy_state,
             )
 
         self.assertIsNone(result)
+
+    def test_roll_triggers_when_spot_exceeds_adjacent_atm_strike(self):
+        config = SimpleNamespace(
+            strategy=SimpleNamespace(
+                roll_dte_threshold=7,
+            ),
+            backtest=SimpleNamespace(short_qty=10, long_qty=10),
+        )
+        position = {
+            "strike": 8.5,
+            "expiry": "2026-07-22",
+            "call_code": "OLD_CALL",
+            "put_code": "OLD_PUT",
+        }
+        feature_row = pd.Series({"atm_strike": 8.75})
+        chain_df = pd.DataFrame(
+            [
+                {"strike_price": 8.25},
+                {"strike_price": 8.50},
+                {"strike_price": 8.75},
+                {"strike_price": 9.00},
+            ]
+        )
+        target_atm = {
+            "strike": 8.75,
+            "expiry": pd.Timestamp("2026-07-22"),
+            "call": {"order_book_id": "NEW_CALL", "mid": 0.2},
+            "put": {"order_book_id": "NEW_PUT", "mid": 0.15},
+        }
+
+        with mock.patch.object(
+            signal_engine.core.vol_engine,
+            "select_atm_from_chain",
+            return_value=target_atm,
+        ):
+            result = signal_engine._roll_payload(
+                config,
+                "500etf",
+                "short",
+                position,
+                chain_df,
+                feature_row,
+                pd.DataFrame(),
+                pd.Timestamp("2026-07-09"),
+                target_atm,
+                8.797,
+                9,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["reason"], "held_strike_differs_from_current_atm")
+        self.assertEqual(result["target_strike"], 8.75)
+        self.assertEqual(result["target_call_code"], "NEW_CALL")
+        self.assertEqual(result["target_put_code"], "NEW_PUT")
 
     def test_roll_treats_adjacent_uneven_strikes_as_one_step(self):
         config = SimpleNamespace(
@@ -139,7 +189,6 @@ class SignalEngineRollTest(unittest.TestCase):
             ),
             backtest=SimpleNamespace(short_qty=10, long_qty=10),
         )
-        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
         position = {"strike": 3.1}
         feature_row = pd.Series({"atm_strike": 3.0})
         chain_df = pd.DataFrame(
@@ -167,7 +216,6 @@ class SignalEngineRollTest(unittest.TestCase):
                 None,
                 3.025,
                 14,
-                strategy_state,
             )
 
         self.assertIsNone(result)
@@ -179,7 +227,6 @@ class SignalEngineRollTest(unittest.TestCase):
             ),
             backtest=SimpleNamespace(short_qty=10, long_qty=10),
         )
-        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
         position = {"strike": 1.75}
         feature_row = pd.Series({"atm_strike": pd.NA})
         chain_df = pd.DataFrame(
@@ -208,7 +255,6 @@ class SignalEngineRollTest(unittest.TestCase):
                 {"strike": 1.80},
                 1.80,
                 10,
-                strategy_state,
             )
 
         self.assertIsNone(result)
@@ -220,7 +266,6 @@ class SignalEngineRollTest(unittest.TestCase):
             ),
             backtest=SimpleNamespace(short_qty=10, long_qty=10),
         )
-        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
         position = {"strike": 4.9}
         feature_row = pd.Series({"atm_strike": 5.0})
         chain_df = pd.DataFrame(
@@ -251,7 +296,6 @@ class SignalEngineRollTest(unittest.TestCase):
                 None,
                 4.974,
                 24,
-                strategy_state,
             )
 
         self.assertIsNone(result)
@@ -263,7 +307,6 @@ class SignalEngineRollTest(unittest.TestCase):
             ),
             backtest=SimpleNamespace(short_qty=10, long_qty=10),
         )
-        strategy_state = SimpleNamespace(roll_cooldown_left={"short": 0})
         position = {
             "strike": 1.75,
             "expiry": "2026-06-24",
@@ -316,7 +359,6 @@ class SignalEngineRollTest(unittest.TestCase):
                 None,
                 1.922,
                 10,
-                strategy_state,
             )
 
         self.assertIsNotNone(result)

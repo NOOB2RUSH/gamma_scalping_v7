@@ -7,6 +7,8 @@
 .vscode/
 __pycache__/
 *.py[cod]
+build/
+dist/
 
 data/
 live_hold/

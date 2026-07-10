@@ -14,7 +14,7 @@ def _config():
             enable_delta_hedge=True,
             delta_hedge_tolerance_ratio=0.10,
             allow_etf_short_hedge=True,
-            enable_option_delta_hedge=False,
+            enable_atm_straddle_rebalance=False,
         ),
         backtest=SimpleNamespace(
             etf_fee_rate=0.0,
@@ -76,7 +76,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             None,
             {"underlying_order_book_id": "588000.XSHG"},
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -98,7 +97,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             None,
             {"underlying_order_book_id": "588000.XSHG"},
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -122,7 +120,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             None,
             {"underlying_order_book_id": "588000.XSHG"},
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -132,7 +129,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
     def test_positive_delta_after_etf_zero_uses_atm_straddle_leg_rebalance(self):
         config = _config()
         config.strategy.allow_etf_short_hedge = False
-        config.strategy.enable_option_delta_hedge = True
+        config.strategy.enable_atm_straddle_rebalance = True
         config.strategy.delta_hedge_tolerance_ratio = 0.0
         live_account = account.AccountState(
             product="300etf",
@@ -197,7 +194,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             chain,
             atm,
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -219,7 +215,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
         self.assertAlmostEqual(rebalance["estimated_vega_effect"], -40.0)
         self.assertAlmostEqual(rebalance["estimated_theta_effect"], 20.0)
         self.assertAlmostEqual(
-            rebalance["projected_account_delta_after_option_hedge"],
+            rebalance["projected_account_delta_after_option_rebalance"],
             -8000.0,
         )
         self.assertAlmostEqual(rebalance["etf_delta_correction"], 8000.0)
@@ -236,7 +232,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
     def test_imbalanced_atm_straddle_rebalances_shape_before_etf(self):
         config = _config()
         config.strategy.allow_etf_short_hedge = False
-        config.strategy.enable_option_delta_hedge = True
+        config.strategy.enable_atm_straddle_rebalance = True
         config.strategy.delta_hedge_tolerance_ratio = 0.0
         live_account = account.AccountState(
             product="50etf",
@@ -303,7 +299,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             chain,
             atm,
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -316,7 +311,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
     def test_imbalanced_shape_rebalance_does_not_override_delta_control(self):
         config = _config()
         config.strategy.allow_etf_short_hedge = False
-        config.strategy.enable_option_delta_hedge = True
+        config.strategy.enable_atm_straddle_rebalance = True
         config.strategy.delta_hedge_tolerance_ratio = 0.10
         live_account = account.AccountState(
             product="50etf",
@@ -383,7 +378,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             chain,
             atm,
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -406,7 +400,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
     def test_one_strike_from_atm_main_straddle_can_rebalance_delta(self):
         config = _config()
         config.strategy.allow_etf_short_hedge = False
-        config.strategy.enable_option_delta_hedge = True
+        config.strategy.enable_atm_straddle_rebalance = True
         config.strategy.delta_hedge_tolerance_ratio = 0.0
         live_account = account.AccountState(
             product="300etf",
@@ -497,7 +491,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             chain,
             atm,
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -528,7 +521,7 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
     def test_adjacent_uneven_strike_is_treated_as_atm_tolerated_main_straddle(self):
         config = _config()
         config.strategy.allow_etf_short_hedge = False
-        config.strategy.enable_option_delta_hedge = True
+        config.strategy.enable_atm_straddle_rebalance = True
         config.strategy.delta_hedge_tolerance_ratio = 0.0
         live_account = account.AccountState(
             product="50etf",
@@ -632,7 +625,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
             chain,
             atm,
             action="DELTA_HEDGE",
-            option_action="ATM_STRADDLE_DELTA_REBALANCE",
             reason="test",
         )
 
@@ -707,7 +699,6 @@ class DeltaHedgeToleranceTest(unittest.TestCase):
                 chain,
                 {"underlying_order_book_id": "588000.XSHG"},
                 action="DELTA_HEDGE",
-                option_action="ATM_STRADDLE_DELTA_REBALANCE",
                 reason="test",
             )
 

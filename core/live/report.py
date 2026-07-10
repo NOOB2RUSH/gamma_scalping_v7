@@ -107,7 +107,7 @@ def _expected_greek_target_rows(signal_payload):
     if delta_before is None:
         delta_before = _first_number(
             advice,
-            "residual_delta_before_option_hedge",
+            "residual_delta_before_option_rebalance",
             "planned_account_delta",
             "account_delta",
         )
@@ -148,10 +148,6 @@ def _expected_greek_target_rows(signal_payload):
     ]
 
 
-def _option_hedge_greek_impact_rows(signal_payload):
-    return _expected_greek_target_rows(signal_payload)
-
-
 def _target_delta_after_signal(
     advice,
     planned_greeks,
@@ -161,7 +157,7 @@ def _target_delta_after_signal(
         advice,
         "projected_account_delta_after_hedge",
         "projected_account_delta_after_combined_hedge",
-        "projected_account_delta_after_option_hedge",
+        "projected_account_delta_after_option_rebalance",
     )
     if delta_after is not None:
         return delta_after
@@ -282,9 +278,6 @@ def _annotate_contract_symbols(rows, signal_payload):
 def _contract_symbol_map(signal_payload):
     mapping = {}
     account = signal_payload.get("account") or {}
-    for hedge in account.get("option_hedges") or []:
-        _add_contract_symbol(mapping, hedge.get("order_book_id"), hedge.get("contract_symbol"))
-
     snapshot = signal_payload.get("quote_snapshot") or {}
     option_snapshot = snapshot.get("option_snapshot")
     if option_snapshot:
@@ -329,8 +322,6 @@ def _initial_display_quantities(signal_payload):
             continue
         _add_quantity(quantities, position.get("call_code"), position.get("call_qty"))
         _add_quantity(quantities, position.get("put_code"), position.get("put_qty"))
-    for hedge in account.get("option_hedges") or []:
-        _add_quantity(quantities, hedge.get("order_book_id"), hedge.get("qty"))
     hedge_state = account.get("hedge") or {}
     hedge_code = _display_code(hedge_state.get("underlying_order_book_id"))
     _add_quantity(quantities, hedge_code, hedge_state.get("qty"))
@@ -360,14 +351,6 @@ def _display_quantity(value):
 def _advice_execution_rows(item, include_etf=True):
     action = item.get("action", "")
     side = item.get("side")
-
-    if action == "CLOSE_OPTION_HEDGE":
-        return [_execution_row(
-            item.get("order_book_id"),
-            "买入平仓" if side == "short" else "卖出平仓",
-            item.get("qty"),
-            item.get("estimated_price"),
-        )]
 
     if action == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
         return _option_pair_rows(

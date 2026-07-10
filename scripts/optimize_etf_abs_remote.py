@@ -35,7 +35,6 @@ PARAM_NAMES = [
     "strategy.short_volume_spike_multiplier",
     "strategy.roll_dte_threshold",
     "strategy.short_cooldown_after_long_iv_high_exit_days",
-    "strategy.roll_cooldown_days",
 ]
 
 FIXED_PARAMS = {
@@ -60,7 +59,6 @@ COARSE_SPACE = {
     "strategy.short_volume_spike_multiplier": (1.200, 2.500, 0.100),
     "strategy.roll_dte_threshold": (3, 12, 1),
     "strategy.short_cooldown_after_long_iv_high_exit_days": (0, 12, 1),
-    "strategy.roll_cooldown_days": (0, 12, 1),
 }
 
 FINE_RADII = [
@@ -77,7 +75,6 @@ FINE_RADII = [
         "strategy.short_volume_spike_multiplier": 0.300,
         "strategy.roll_dte_threshold": 3,
         "strategy.short_cooldown_after_long_iv_high_exit_days": 4,
-        "strategy.roll_cooldown_days": 4,
     },
     {
         "strategy.long_open_iv_threshold": 0.010,
@@ -92,7 +89,6 @@ FINE_RADII = [
         "strategy.short_volume_spike_multiplier": 0.200,
         "strategy.roll_dte_threshold": 2,
         "strategy.short_cooldown_after_long_iv_high_exit_days": 2,
-        "strategy.roll_cooldown_days": 2,
     },
     {
         "strategy.long_open_iv_threshold": 0.005,
@@ -107,7 +103,6 @@ FINE_RADII = [
         "strategy.short_volume_spike_multiplier": 0.100,
         "strategy.roll_dte_threshold": 1,
         "strategy.short_cooldown_after_long_iv_high_exit_days": 1,
-        "strategy.roll_cooldown_days": 1,
     },
 ]
 
@@ -508,7 +503,6 @@ def write_best_snippet(result_df, output_dir, stage_name, objective, product):
         f"short_volume_spike_multiplier={typed_best['strategy.short_volume_spike_multiplier']:.3f},",
         f"roll_dte_threshold={typed_best['strategy.roll_dte_threshold']},",
         f"short_cooldown_after_long_iv_high_exit_days={typed_best['strategy.short_cooldown_after_long_iv_high_exit_days']},",
-        f"roll_cooldown_days={typed_best['strategy.roll_cooldown_days']},",
         "",
         f"long_qty={typed_best['backtest.long_qty']},",
         f"short_qty={typed_best['backtest.short_qty']},",

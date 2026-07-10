@@ -48,14 +48,13 @@ CONFIG = AppConfig(
         enable_delta_hedge=True,
         delta_hedge_tolerance_ratio=0.0,
         allow_etf_short_hedge=False,
-        enable_option_delta_hedge=True,
+        enable_atm_straddle_rebalance=True,
         # 该退出信号依赖估算后的单合约成交量，适合捕捉明显放量，
         # 但不代表真实逐合约成交量的严格放大。
         short_volume_spike_exit_enabled=True,
         short_volume_spike_multiplier=1.5,
         short_cooldown_after_long_iv_high_exit_days=3,
         roll_dte_threshold=7,
-        roll_cooldown_days=6,
     ),
     vol=VolConfig(
         annual_days=252,

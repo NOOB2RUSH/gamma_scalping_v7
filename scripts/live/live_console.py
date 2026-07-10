@@ -25,7 +25,6 @@ from core.live.runtime import load_product_config
 
 MARK_UPDATE_ACTIONS = {
     "option_mark_update",
-    "option_hedge_mark_update",
     "hedge_mark_update",
 }
 
@@ -781,18 +780,6 @@ def _print_account_state(state, show_cash=True, show_account=True):
                 f"qty={position.get('call_qty')}/{position.get('put_qty')} "
                 f"strike={strike} expiry={expiry}"
             )
-    if not state.option_hedges:
-        print("option_hedges=None")
-    else:
-        for index, hedge in enumerate(state.option_hedges, start=1):
-            print(
-                f"option_hedge.{index}={hedge.get('order_book_id')} "
-                f"side={hedge.get('side')} qty={hedge.get('qty')} "
-                f"type={hedge.get('option_type')} strike={hedge.get('strike')} "
-                f"expiry={hedge.get('expiry')}"
-            )
-
-
 def _print_import_result(result):
     if "file" in result:
         print(f"file={result['file']}")
@@ -823,7 +810,7 @@ def _print_import_result(result):
                 f"latest_price={_fmt_optional(fill.get('latest_price'))} "
                 f"cash_delta={fill['cash_delta']:.2f}"
             )
-        elif fill["action"] in {"option_mark_update", "option_hedge_mark_update"}:
+        elif fill["action"] == "option_mark_update":
             print(
                 f"{prefix} {fill['action']} side={fill.get('side')} "
                 f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
@@ -831,14 +818,6 @@ def _print_import_result(result):
                 f"last_call_px={_fmt_optional(fill.get('last_call_price'))} "
                 f"last_put_px={_fmt_optional(fill.get('last_put_price'))} "
                 f"last_option_value={_fmt_optional(fill.get('last_option_value'))} "
-                f"cash_delta={fill['cash_delta']:.2f}"
-            )
-        elif fill["action"] in {"open_option_hedge", "close_option_hedge"}:
-            print(
-                f"{prefix} {fill['action']} side={fill.get('side')} "
-                f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "
-                f"call={fill.get('call_code')} put={fill.get('put_code')} "
-                f"price={_fmt_optional(fill.get('price', fill.get('entry_price')))} "
                 f"cash_delta={fill['cash_delta']:.2f}"
             )
         else:

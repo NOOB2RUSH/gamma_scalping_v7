@@ -184,7 +184,7 @@ class LiveMultiProductSupportTest(unittest.TestCase):
             "short_open_regime": "absolute",
         }
         strategy_state = SimpleNamespace(
-            roll_cooldown_left={"long": 0, "short": 0},
+            short_entry_cooldown_left=0,
         )
 
         with mock.patch.object(
@@ -676,21 +676,6 @@ class LiveMultiProductSupportTest(unittest.TestCase):
                 "option_margin": 184884.0,
                 "cash_delta": 0.0,
             }
-            old_hedge = {
-                "action": "open_option_hedge",
-                "side": "short",
-                "option_type": "c",
-                "date": "2026-06-26",
-                "order_book_id": "10011721",
-                "call_code": "10011721",
-                "qty": 5,
-                "strike": 8.5,
-                "expiry": "2026-07-22",
-                "entry_price": 0.4179,
-                "contract_multiplier": 10000,
-                "option_margin": 83950.0,
-                "cash_delta": 0.0,
-            }
             metadata = {
                 "10011721": {
                     "strike": 8.5,
@@ -721,7 +706,6 @@ class LiveMultiProductSupportTest(unittest.TestCase):
                 mock.patch.object(holding_importer, "_load_contract_metadata", return_value=metadata),
             ):
                 account.record_fill("500etf", old_straddle)
-                account.record_fill("500etf", old_hedge)
                 result = holding_importer.import_holding_file(
                     "500etf",
                     file_path=holding_path,
@@ -731,14 +715,15 @@ class LiveMultiProductSupportTest(unittest.TestCase):
 
         self.assertEqual(
             [item["fill"]["action"] for item in result["applied"]],
-            ["rebalance_straddle_legs", "option_hedge_mark_update"],
+            ["rebalance_straddle_legs"],
         )
         self.assertEqual(local.positions["short"]["call_qty"], 1)
         self.assertEqual(local.positions["short"]["put_qty"], 10)
-        self.assertEqual(local.option_hedges[0]["order_book_id"], "10011721")
-        self.assertEqual(local.option_hedges[0]["qty"], 5)
+        self.assertTrue(
+            any("unpaired option holding" in item["reason"] for item in result["warnings"])
+        )
 
-    def test_roll_fill_starts_live_roll_cooldown_like_backtest(self):
+    def test_roll_fill_does_not_start_a_cooldown(self):
         fill = {
             "action": "roll_short_straddle",
             "side": "short",
@@ -755,15 +740,30 @@ class LiveMultiProductSupportTest(unittest.TestCase):
         }
 
         state = account.AccountState(product="kc50etf")
-        with mock.patch.object(account, "_roll_cooldown_days", return_value=3):
-            account._apply_fill(state, "kc50etf", fill)
+        account._apply_fill(state, "kc50etf", fill)
 
-        self.assertEqual(state.strategy_state.roll_cooldown_left["short"], 3)
-        self.assertEqual(state.strategy_state.cooldown_total_days["short"], 3)
         self.assertEqual(
-            state.strategy_state.cooldown_started_date["short"],
-            "2026-06-24",
+            state.strategy_state.to_dict(),
+            {
+                "short_entry_cooldown_left": 0,
+                "short_entry_cooldown_total_days": 0,
+                "short_entry_cooldown_started_date": None,
+            },
         )
+
+    def test_legacy_roll_cooldown_state_is_ignored(self):
+        state = account._strategy_state_from_payload(
+            {
+                "roll_cooldown_left": {"long": 5, "short": 5},
+                "cooldown_total_days": {"long": 5, "short": 5},
+                "cooldown_started_date": {
+                    "long": "2026-07-08",
+                    "short": "2026-07-08",
+                },
+            }
+        )
+
+        self.assertEqual(state, account.StrategyState())
 
 
 if __name__ == "__main__":

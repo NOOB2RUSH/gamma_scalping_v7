@@ -45,12 +45,11 @@ CONFIG = AppConfig(
         enable_delta_hedge=True,
         delta_hedge_tolerance_ratio=0.0,
         allow_etf_short_hedge=False,
-        enable_option_delta_hedge=True,
+        enable_atm_straddle_rebalance=True,
         short_volume_spike_exit_enabled=True,
         short_volume_spike_multiplier=1.5,
         short_cooldown_after_long_iv_high_exit_days=3,
         roll_dte_threshold=7,
-        roll_cooldown_days=1,
     ),
     vol=VolConfig(
         annual_days=252,
