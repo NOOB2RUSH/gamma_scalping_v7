@@ -71,7 +71,7 @@ class LiveMultiProductSupportTest(unittest.TestCase):
         config = SimpleNamespace(
             strategy=SimpleNamespace(
                 enable_delta_hedge=True,
-                delta_hedge_tolerance_ratio=0.05,
+                delta_hedge_tolerance_ratio=0.02,
                 allow_etf_short_hedge=True,
             ),
             backtest=SimpleNamespace(
@@ -138,8 +138,8 @@ class LiveMultiProductSupportTest(unittest.TestCase):
             "FINAL_DELTA_HEDGE",
         ])
         self.assertEqual(plan[-1]["trade_etf_qty"], 6000.0)
-        self.assertEqual(plan[-1]["delta_hedge_capacity"], 100000.0)
-        self.assertAlmostEqual(plan[-1]["normalized_account_delta"], -0.06)
+        self.assertEqual(plan[-1]["delta_hedge_capacity"], 200000.0)
+        self.assertAlmostEqual(plan[-1]["normalized_account_delta"], -0.03)
 
     def test_live_supports_four_sse_etf_products_with_expected_underlyings(self):
         expected = {

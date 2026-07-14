@@ -23,7 +23,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        "numba",
+        "coverage",
+        "pytest",
+        "_pytest",
+        "IPython",
+        "torch",
+        "cupy",
+        "dask",
+    ],
     noarchive=False,
     optimize=0,
 )

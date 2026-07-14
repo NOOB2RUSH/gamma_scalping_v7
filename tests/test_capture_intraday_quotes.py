@@ -165,6 +165,37 @@ class CaptureIntradayQuotesTest(unittest.TestCase):
             {pd.Timestamp("2026-07-07").date()},
         )
 
+    def test_etf_minute_can_select_historical_target_date(self):
+        raw = pd.DataFrame(
+            {
+                "day": [
+                    "2026-07-06 14:59:00",
+                    "2026-07-07 09:30:00",
+                    "2026-07-07 09:31:00",
+                ],
+                "open": [3.0, 3.1, 3.2],
+                "high": [3.1, 3.2, 3.3],
+                "low": [2.9, 3.0, 3.1],
+                "close": [3.0, 3.1, 3.2],
+                "volume": [100, 200, 300],
+                "amount": [300.0, 620.0, 960.0],
+            }
+        )
+        ak = SimpleNamespace(
+            stock_zh_a_minute=lambda symbol, period, adjust: raw,
+            fund_etf_hist_min_em=lambda symbol, period, adjust: pd.DataFrame(),
+        )
+
+        result = capture_intraday_quotes._fetch_etf_minute(
+            ak,
+            "510050",
+            pd.Timestamp("2026-07-10 10:00:00"),
+            target_date=pd.Timestamp("2026-07-06").date(),
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["timestamp"], pd.Timestamp("2026-07-06 14:59:00"))
+
     def test_append_dedup_csv_can_filter_existing_timestamp_date(self):
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "etf_510050_1m.csv"
@@ -233,6 +264,32 @@ class CaptureIntradayQuotesTest(unittest.TestCase):
         self.assertEqual(result.iloc[-1]["source"], "option_sse_minute_sina")
         self.assertEqual(result.iloc[-1]["open_interest"], 100)
 
+    def test_option_minute_can_select_historical_finance_date(self):
+        finance = pd.DataFrame(
+            {
+                "date": ["2026-07-03", "2026-07-07"],
+                "time": ["15:00:00", "09:30:00"],
+                "price": [0.05, 0.06],
+                "average_price": [0.05, 0.055],
+                "volume": [1, 2],
+            }
+        )
+        ak = SimpleNamespace(
+            option_finance_minute_sina=lambda symbol: finance,
+            option_sse_minute_sina=lambda symbol: pd.DataFrame(),
+        )
+
+        result = capture_intraday_quotes._fetch_option_minute(
+            ak,
+            "10010393",
+            pd.Timestamp("2026-07-10 13:31:00"),
+            target_date=pd.Timestamp("2026-07-03").date(),
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0]["timestamp"], pd.Timestamp("2026-07-03 15:00:00"))
+        self.assertEqual(result.iloc[0]["source"], "option_finance_minute_sina")
+
     def test_both_stale_sources_raise_error(self):
         stale = pd.DataFrame(
             {
@@ -254,6 +311,81 @@ class CaptureIntradayQuotesTest(unittest.TestCase):
                 "10010393",
                 pd.Timestamp("2026-06-10 13:31:00"),
             )
+
+    def test_refresh_intraday_status_marks_missing_option_code(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            day = root / "data" / "live" / "50etf" / "intraday" / "20260707"
+            day.mkdir(parents=True)
+            pd.DataFrame({"timestamp": ["2026-07-07 09:30:00"]}).to_csv(
+                day / "etf_510050_1m.csv",
+                index=False,
+            )
+            pd.DataFrame({"timestamp": ["2026-07-07 09:30:00"]}).to_csv(
+                day / "option_10000001_1m.csv",
+                index=False,
+            )
+
+            with mock.patch.object(capture_intraday_quotes.storage, "PROJECT_ROOT", root):
+                status = capture_intraday_quotes.refresh_intraday_status(
+                    "50etf",
+                    option_codes=["10000001", "10000002"],
+                    etf_symbol="510050",
+                )
+
+        row = status["dates"]["2026-07-07"]
+        self.assertFalse(row["complete"])
+        self.assertEqual(row["missing_option_codes"], ["10000002"])
+        self.assertEqual(row["etf_rows"], 1)
+
+    def test_discover_backfill_dates_reports_complete_and_missing_dates(self):
+        fake_ak = SimpleNamespace(
+            stock_zh_a_minute=lambda symbol, period, adjust: pd.DataFrame(
+                {
+                    "day": ["2026-07-06 09:30:00", "2026-07-07 09:30:00"],
+                    "open": [1.0, 1.1],
+                    "high": [1.0, 1.1],
+                    "low": [1.0, 1.1],
+                    "close": [1.0, 1.1],
+                    "volume": [10, 11],
+                    "amount": [10, 12],
+                }
+            ),
+            fund_etf_hist_min_em=lambda symbol, period, adjust: pd.DataFrame(),
+            option_finance_minute_sina=lambda symbol: pd.DataFrame(
+                {
+                    "date": ["2026-07-06"],
+                    "time": ["09:30:00"],
+                    "price": [0.05],
+                    "average_price": [0.05],
+                    "volume": [1],
+                }
+            ),
+            option_sse_minute_sina=lambda symbol: pd.DataFrame(),
+        )
+
+        with (
+            mock.patch.dict(sys.modules, {"akshare": fake_ak}),
+            mock.patch.object(
+                capture_intraday_quotes.market_data,
+                "SSE_ETF_OPTION_SPECS",
+                {"50etf": SimpleNamespace(etf_symbol="510050")},
+            ),
+            mock.patch.object(
+                capture_intraday_quotes,
+                "_account_option_codes",
+                return_value=[],
+            ),
+        ):
+            result = capture_intraday_quotes.discover_backfill_dates(
+                "50etf",
+                option_codes=["10000001"],
+            )
+
+        by_date = {row["date"]: row for row in result["dates"]}
+        self.assertTrue(by_date["2026-07-06"]["complete"])
+        self.assertFalse(by_date["2026-07-07"]["complete"])
+        self.assertEqual(by_date["2026-07-07"]["missing_option_codes"], ["10000001"])
 
 
 if __name__ == "__main__":

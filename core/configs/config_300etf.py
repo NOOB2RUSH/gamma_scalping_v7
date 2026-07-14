@@ -54,15 +54,15 @@ CONFIG = AppConfig(
         short_volume_spike_exit_enabled=True,
         short_volume_spike_multiplier=1.5,
         short_cooldown_after_long_iv_high_exit_days=6,
-        roll_dte_threshold=7,
+        roll_dte_threshold=3,
     ),
     vol=VolConfig(
         annual_days=252,
         hv_windows=(60,),
         atm_iv_percentile_window=252,
         atm_target_dte=20,
-        atm_target_dte_min=7,
-        atm_target_dte_max=30,
+        atm_target_dte_min=3,
+        atm_target_dte_max=35,
         atm_moneyness_tol=0.25,
         # ATM 低成交量过滤使用同一套估算成交量口径；
         # 可用于避开显著冷门合约，但不要把阈值理解为真实精确张数。

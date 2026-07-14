@@ -24,14 +24,13 @@ def round_etf_hedge_target(qty, lot_size=ETF_HEDGE_LOT_SIZE):
 
 
 def option_delta_capacity(positions, default_multiplier=10000):
-    """Return the underlying-unit capacity used to normalize account delta."""
+    """Return option-contract capacity used to normalize account delta."""
     capacity = 0.0
     for position in (positions or {}).values():
         if position is None:
             continue
-        qty = max(
-            abs(float(position.get("call_qty", 0) or 0)),
-            abs(float(position.get("put_qty", 0) or 0)),
+        qty = abs(float(position.get("call_qty", 0) or 0)) + abs(
+            float(position.get("put_qty", 0) or 0)
         )
         multiplier = float(
             position.get("contract_multiplier", default_multiplier)

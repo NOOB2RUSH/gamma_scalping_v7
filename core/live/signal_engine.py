@@ -16,6 +16,7 @@ from .runtime import load_product_config
 
 
 LIVE_ENTRY_QTY_PER_LEG = 10
+POSITION_TARGET_KEY = "position_target"
 
 
 def generate_signal(product, account_id="default", date=None, quote_snapshot=None):
@@ -128,7 +129,7 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
             default_multiplier=config.vol.contract_multiplier,
         )
     )
-    return {
+    item = {
         "product": product,
         "account_id": account_id,
         "date": str(market["date"].date()),
@@ -149,6 +150,7 @@ def generate_signal(product, account_id="default", date=None, quote_snapshot=Non
             "read_only_signal": True,
         },
     }
+    return item
 
 
 def preview_signal(product, account_id="default", date=None, quote_snapshot=None):
@@ -741,7 +743,7 @@ def _open_advice(action, side, qty, atm, spot):
     trade_value = core.position.value(position, atm["call"], atm["put"])
     fee = core.position.calc_option_fee(qty, qty)
     cash_effect = trade_value - fee - position["option_margin"] if side == "short" else -trade_value - fee
-    return {
+    item = {
         "action": action,
         "priority": "action",
         "side": side,
@@ -760,6 +762,16 @@ def _open_advice(action, side, qty, atm, spot):
         "estimated_cash_effect": float(cash_effect),
         "liquidity": _liquidity_summary(atm["call"], atm["put"], qty),
     }
+    _set_position_target(
+        item,
+        call_code=item["call_code"],
+        put_code=item["put_code"],
+        call_qty=qty,
+        put_qty=qty,
+        strike=item["strike"],
+        expiry=item["expiry"],
+    )
+    return item
 
 
 def _advice_for_existing_position(
@@ -852,6 +864,22 @@ def _advice_for_existing_position(
             position_dte,
         )
         if roll_payload:
+            if roll_payload.get("close_current_position"):
+                item = _close_advice(
+                    side,
+                    position,
+                    call_row,
+                    put_row,
+                    option_value,
+                    roll_payload["reason"],
+                )
+                item.update(roll_payload)
+                advice.append(item)
+                return advice, greeks, core.position.signed_value(
+                    position,
+                    call_row,
+                    put_row,
+                )
             item = {
                 "action": "ROLL_SHORT_STRADDLE" if side == "short" else "ROLL_LONG_STRADDLE",
                 "priority": "action",
@@ -867,9 +895,15 @@ def _advice_for_existing_position(
                 "current_dte": position_dte,
                 **roll_payload,
             }
-            if item.get("target_call_code") is None or item.get("target_put_code") is None:
-                item["action"] = "DATA_WARNING"
-                item["priority"] = "warning"
+            _set_position_target(
+                item,
+                call_code=item["target_call_code"],
+                put_code=item["target_put_code"],
+                call_qty=item["target_call_qty"],
+                put_qty=item["target_put_qty"],
+                strike=item.get("target_strike"),
+                expiry=item.get("target_expiry"),
+            )
             advice.append(item)
 
     return advice, greeks, core.position.signed_value(position, call_row, put_row)
@@ -938,7 +972,7 @@ def _short_daily_loss_aum_metrics(
     if aum <= 0:
         return None
     daily_pnl = float(previous_market_value) - float(current_market_value)
-    return {
+    item = {
         "short_stop_loss_previous_date": str(previous_close_date.date()),
         "short_previous_close_value": float(previous_market_value),
         "short_current_market_value": float(current_market_value),
@@ -969,6 +1003,8 @@ def _close_advice(side, position, call_row, put_row, option_value, reason):
         "estimated_fee": float(fee),
         "estimated_cash_effect": float(cash_effect),
     }
+    _set_position_target(item, close=True)
+    return item
 
 
 def _roll_payload(
@@ -1021,7 +1057,13 @@ def _roll_payload(
     )
     if target_atm is None:
         return {
-            "reason": "roll_condition_active_but_no_valid_target_atm",
+            "close_current_position": True,
+            "reason": (
+                "Roll is required, but no eligible replacement ATM straddle is "
+                "available. Close the current position; do not substitute a "
+                "delta hedge for this roll."
+            ),
+            "roll_failure_reason": "roll_condition_active_but_no_valid_target_atm",
             "strike_mismatch_days": mismatch_days,
             "strike_mismatch_days_source": atm_strike_source,
             "strike_mismatch_trace": [],
@@ -1037,7 +1079,7 @@ def _roll_payload(
     if strike_roll_ready:
         reasons.append("held_strike_differs_from_current_atm")
     max_qty = config.backtest.short_qty if side == "short" else config.backtest.long_qty
-    return {
+    item = {
         "reason": "+".join(reasons),
         "strike_mismatch_days": mismatch_days,
         "strike_mismatch_days_source": atm_strike_source,
@@ -1053,6 +1095,7 @@ def _roll_payload(
         "estimated_target_call_price": float(target_atm["call"]["mid"]),
         "estimated_target_put_price": float(target_atm["put"]["mid"]),
     }
+    return item
 
 
 def _entry_target_qty(feature_row, max_qty, side):
@@ -1076,11 +1119,17 @@ def _build_execution_plan(
         item
         for item in plan
         if item.get("priority") == "action"
-        and _is_option_execution_action(item.get("action"))
+        and _has_position_target(item)
     ]
     if not option_actions:
         plan.extend(_hedge_advice(config, live_account, account_greeks, spot, chain_df, atm))
-        return plan, account_greeks
+        option_actions = [
+            item
+            for item in plan
+            if item.get("priority") == "action" and _has_position_target(item)
+        ]
+        if not option_actions:
+            return plan, account_greeks
 
     projected_cash = _projected_cash_after_option_actions(
         config,
@@ -1312,7 +1361,7 @@ def _live_capacity_reduction_item(
 
     target_qty = current_qty - close_qty
     estimated_cash_effect = cash_relief_per_contract * close_qty
-    return {
+    item = {
         "action": "REDUCE_SHORT_STRADDLE_FOR_CAPACITY",
         "priority": "action",
         "side": "short",
@@ -1342,6 +1391,14 @@ def _live_capacity_reduction_item(
         "margin_limit": margin_limit,
         "requires_import_and_rerun": True,
     }
+    _set_position_target(
+        item,
+        call_code=item["call_code"],
+        put_code=item["put_code"],
+        call_qty=target_qty,
+        put_qty=target_qty,
+    )
+    return item
 
 
 def _delta_hedge_capacity_reduction_item(
@@ -1525,25 +1582,62 @@ def _current_short_margin(config, position, call_row, put_row, spot):
     )
 
 
-def _is_option_execution_action(action):
-    if action is None:
-        return False
-    return (
-        action.startswith("OPEN_")
-        or action.startswith("ROLL_")
-        or action.startswith("CLOSE_")
-    )
+def _set_position_target(
+    item,
+    *,
+    close=False,
+    call_code=None,
+    put_code=None,
+    call_qty=None,
+    put_qty=None,
+    strike=None,
+    expiry=None,
+):
+    """Declare the post-trade option position for generic plan projection.
+
+    Action names are presentation/execution labels.  Planning relies only on this
+    explicit state transition, so a new option action does not need registration
+    in a central action-name allowlist.
+    """
+    if close:
+        item[POSITION_TARGET_KEY] = None
+        return item
+    if None in {call_code, put_code, call_qty, put_qty}:
+        raise ValueError("A position target requires both legs and quantities.")
+    item[POSITION_TARGET_KEY] = {
+        "call_code": str(call_code),
+        "put_code": str(put_code),
+        "call_qty": int(call_qty),
+        "put_qty": int(put_qty),
+        "strike": strike,
+        "expiry": expiry,
+    }
+    return item
+
+
+def _has_position_target(item):
+    if POSITION_TARGET_KEY in item:
+        return True
+    # Compatibility for persisted/third-party plans created before the explicit
+    # position-target contract. New actions should always use position_target.
+    action = str(item.get("action") or "")
+    return action.startswith(("OPEN_", "ROLL_", "CLOSE_"))
+
+
+def _position_target_is_close(item):
+    if POSITION_TARGET_KEY in item:
+        return item[POSITION_TARGET_KEY] is None
+    return str(item.get("action") or "").startswith("CLOSE_")
 
 
 def _project_greeks_after_plan(option_actions, chain_df, current_greeks_by_side):
     projected_by_side = dict(current_greeks_by_side)
     for item in option_actions:
-        action = item.get("action")
         side = item.get("side")
         if side not in account_store.POSITION_SIDES:
             continue
 
-        if action.startswith("CLOSE_"):
+        if _position_target_is_close(item):
             projected_by_side.pop(side, None)
             continue
 
@@ -1568,7 +1662,15 @@ def _project_greeks_after_plan(option_actions, chain_df, current_greeks_by_side)
 
 
 def _planned_leg_fields(item):
-    action = item.get("action")
+    target = item.get(POSITION_TARGET_KEY)
+    if isinstance(target, dict):
+        return (
+            target.get("call_code"),
+            target.get("put_code"),
+            target.get("call_qty"),
+            target.get("put_qty"),
+        )
+    action = str(item.get("action") or "")
     if action.startswith("OPEN_"):
         return (
             item.get("call_code"),
@@ -1611,14 +1713,26 @@ def _final_hedge_advice(
     if not config.strategy.enable_delta_hedge:
         return []
 
-    planned_option_delta = float(planned_greeks["delta"])
-    planned_account_delta = planned_option_delta + live_account.hedge.qty
     planned_positions = _positions_after_option_actions(
         config,
         live_account.positions,
         option_actions,
         chain_df,
     )
+    projected_account = deepcopy(live_account)
+    projected_account.positions = planned_positions
+    projected_account.hedge.qty = _projected_hedge_qty(live_account, option_actions)
+    projected_cash = _projected_cash_after_option_actions(
+        config,
+        live_account,
+        option_actions,
+        chain_df,
+        spot,
+    )
+    if projected_cash is not None:
+        projected_account.cash = projected_cash
+    planned_option_delta = float(planned_greeks["delta"])
+    planned_account_delta = planned_option_delta + projected_account.hedge.qty
     normalized_delta, delta_capacity = core.strategy.normalized_account_delta(
         planned_account_delta,
         planned_positions,
@@ -1631,7 +1745,7 @@ def _final_hedge_advice(
 
     plan = _delta_hedge_plan(
         config,
-        live_account,
+        projected_account,
         planned_greeks,
         spot,
         chain_df,
@@ -1663,11 +1777,10 @@ def _final_hedge_advice(
 def _positions_after_option_actions(config, current_positions, option_actions, chain_df):
     planned_positions = dict(current_positions)
     for item in option_actions:
-        action = str(item.get("action") or "")
         side = item.get("side")
         if side not in account_store.POSITION_SIDES:
             continue
-        if action.startswith("CLOSE_"):
+        if _position_target_is_close(item):
             planned_positions[side] = None
             continue
 
@@ -1690,6 +1803,15 @@ def _positions_after_option_actions(config, current_positions, option_actions, c
             ),
         }
     return planned_positions
+
+
+def _projected_hedge_qty(live_account, actions):
+    qty = float(live_account.hedge.qty or 0.0)
+    for item in actions:
+        target_qty = item.get("target_hedge_qty")
+        if target_qty is not None:
+            qty = float(target_qty)
+    return qty
 
 
 def _delta_hedge_plan(
@@ -1917,7 +2039,12 @@ def _delta_hedge_plan(
 
 
 def _can_plan_option_delta_hedge_after(after_actions):
-    return not after_actions
+    if not after_actions:
+        return True
+    return all(
+        str(action or "").startswith(("OPEN_", "ROLL_"))
+        for action in after_actions
+    )
 
 
 def _atm_rebalance_target_pair_qty(config, side="short"):
@@ -2033,7 +2160,7 @@ def _atm_rebalance_candidate(
         else 0.0
     )
     combined_delta = projected_delta + target_hedge_qty
-    projected_capacity = max(target_call_qty, target_put_qty) * multiplier
+    projected_capacity = (target_call_qty + target_put_qty) * multiplier
     normalized_projected_delta = abs(projected_delta) / projected_capacity
     normalized_combined_delta = abs(combined_delta) / projected_capacity
     delta_not_worse = (
@@ -2362,6 +2489,15 @@ def _atm_straddle_shape_rebalance_item(
         ),
         "underlying_order_book_id": underlying_order_book_id,
     }
+    _set_position_target(
+        item,
+        call_code=item["target_call_code"],
+        put_code=item["target_put_code"],
+        call_qty=item["target_call_qty"],
+        put_qty=item["target_put_qty"],
+        strike=item.get("strike"),
+        expiry=item.get("expiry"),
+    )
     if after_actions is not None:
         item["after_actions"] = after_actions
     return item
@@ -2409,11 +2545,13 @@ def _atm_straddle_delta_rebalance_item(
 
     best = None
     fallback_best = None
+    soft_shape_best = None
     target_pair_qty = context["target_pair_qty"]
     target_pair_value = context["target_pair_value"]
     normalized_delta_tolerance = max(
         0.0, float(config.strategy.delta_hedge_tolerance_ratio)
     )
+    soft_normalized_delta_tolerance = max(normalized_delta_tolerance, 0.05)
     for close_put_qty in range(0, current_put_qty + 1):
         for open_call_qty in range(0, max_open_call + 1):
             if close_put_qty <= 0 and open_call_qty <= 0:
@@ -2443,14 +2581,36 @@ def _atm_straddle_delta_rebalance_item(
                 abs(candidate["target_pair_value_error"]),
                 open_call_qty + close_put_qty,
             )
+            soft_shape_score = (
+                candidate["target_pair_qty_deviation_balance"],
+                candidate["target_pair_qty_deviation"],
+                open_call_qty + close_put_qty,
+                abs(candidate["target_hedge_qty"]),
+                abs(candidate["combined_delta"]),
+                abs(candidate["target_pair_value_error"]),
+            )
             candidate["score"] = score
             candidate["fallback_score"] = fallback_score
+            candidate["soft_shape_score"] = soft_shape_score
             if candidate["delta_tolerance_met"] and (
                 best is None or score < best["score"]
             ):
                 best = candidate
+            if (
+                candidate["normalized_combined_delta"]
+                <= soft_normalized_delta_tolerance
+                and (
+                    soft_shape_best is None
+                    or soft_shape_score < soft_shape_best["soft_shape_score"]
+                )
+            ):
+                soft_shape_best = candidate
             if fallback_best is None or fallback_score < fallback_best["fallback_score"]:
                 fallback_best = candidate
+    if soft_shape_best is not None and (
+        best is None or soft_shape_best["soft_shape_score"] < best["soft_shape_score"]
+    ):
+        best = soft_shape_best
     if best is None:
         best = fallback_best
     if best is None:
@@ -2597,6 +2757,15 @@ def _atm_straddle_delta_rebalance_item(
             }
         ],
     }
+    _set_position_target(
+        item,
+        call_code=item["target_call_code"],
+        put_code=item["target_put_code"],
+        call_qty=item["target_call_qty"],
+        put_qty=item["target_put_qty"],
+        strike=item.get("strike"),
+        expiry=item.get("expiry"),
+    )
     if after_actions is not None:
         item["after_actions"] = after_actions
     return item

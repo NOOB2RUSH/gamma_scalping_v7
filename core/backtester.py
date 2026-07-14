@@ -1883,6 +1883,174 @@ class BacktestEngine:
                 return target_qty
         return 0
 
+    def _live_rebalance_account(self, state):
+        """Expose the simulated state through the live planner's read-only shape."""
+        from .live import account as live_account_store
+
+        return live_account_store.AccountState(
+            product=CONFIG.data.product,
+            cash=float(state.cash),
+            positions=state.positions,
+            hedge=live_account_store.HedgeState(qty=float(state.hedge_etf_qty)),
+        )
+
+    def _atm_straddle_rebalance_item(
+        self,
+        state,
+        day,
+        option_delta,
+        account_delta,
+        *,
+        shape_only=False,
+    ):
+        """Use the live ATM-leg solver so both execution paths share its choices."""
+        from .live import signal_engine
+
+        atm = vol_engine.select_atm_from_chain(day["chain_df"], day["spot"])
+        if atm is None:
+            return None
+        live_account = self._live_rebalance_account(state)
+        underlying_order_book_id = atm.get("underlying_order_book_id")
+        if shape_only:
+            return signal_engine._atm_straddle_shape_rebalance_item(
+                CONFIG,
+                live_account,
+                day["chain_df"],
+                day["spot"],
+                atm,
+                underlying_order_book_id,
+                option_delta=option_delta,
+                account_delta=account_delta,
+            )
+        return signal_engine._atm_straddle_delta_rebalance_item(
+            CONFIG,
+            live_account,
+            day["chain_df"],
+            account_delta,
+            day["spot"],
+            atm,
+            underlying_order_book_id,
+            current_hedge_qty=float(state.hedge_etf_qty),
+            option_delta=option_delta,
+        )
+
+    def _execute_atm_straddle_rebalance(self, date, state, day, item):
+        """Fill a live-planner leg-rebalance item at the backtest day's mid prices."""
+        position = state.positions.get("short")
+        if position is None:
+            return False
+        try:
+            call_row, put_row = self._get_position_rows(day, state, "short")
+        except IndexError:
+            return False
+
+        target_call_qty = int(item.get("target_call_qty", 0) or 0)
+        target_put_qty = int(item.get("target_put_qty", 0) or 0)
+        if target_call_qty <= 0 or target_put_qty <= 0:
+            return False
+
+        current_call_qty = int(position.get("call_qty", 0) or 0)
+        current_put_qty = int(position.get("put_qty", 0) or 0)
+        open_call_qty = int(item.get("open_call_qty", 0) or 0)
+        close_call_qty = int(item.get("close_call_qty", 0) or 0)
+        open_put_qty = int(item.get("open_put_qty", 0) or 0)
+        close_put_qty = int(item.get("close_put_qty", 0) or 0)
+        if (
+            target_call_qty != current_call_qty - close_call_qty + open_call_qty
+            or target_put_qty != current_put_qty - close_put_qty + open_put_qty
+        ):
+            raise ValueError("ATM straddle rebalance item has inconsistent leg quantities.")
+
+        current_margin = float(position.get("option_margin", 0.0) or 0.0)
+        target_margin = opt_position.calc_short_margin(
+            call_row,
+            put_row,
+            target_call_qty,
+            target_put_qty,
+            self._position_underlying_price(day, position, day["spot"]),
+        )
+        fee = opt_position.calc_option_fee(
+            open_call_qty + close_call_qty,
+            open_put_qty + close_put_qty,
+        )
+        multiplier = float(position["contract_multiplier"])
+        premium_effect = (
+            open_call_qty * float(call_row["mid"])
+            + open_put_qty * float(put_row["mid"])
+            - close_call_qty * float(call_row["mid"])
+            - close_put_qty * float(put_row["mid"])
+        ) * multiplier
+        margin_change = target_margin - current_margin
+        projected_cash = state.cash + premium_effect - fee - margin_change
+        if not self._has_cash_reserve(projected_cash):
+            self._record_cash_reserve_skip(
+                date,
+                state,
+                "skip_atm_straddle_rebalance_cash_reserve",
+                projected_cash,
+                side="short",
+            )
+            return False
+
+        state.cash = projected_cash
+        position["call_qty"] = target_call_qty
+        position["put_qty"] = target_put_qty
+        position["option_margin"] = target_margin
+        # A live rebalance is persisted as a replacement position without the
+        # original entry-volume fields, so do not keep an obsolete baseline for
+        # the short-volume-spike exit in the simulated state.
+        position["entry_date"] = date
+        position["entry_call_volume"] = None
+        position["entry_put_volume"] = None
+        position["entry_total_volume"] = None
+        position["short_entry_regime"] = None
+        position["last_option_value"] = opt_position.signed_value(
+            position, call_row, put_row
+        )
+        greeks = strategy.calc_position_greeks(
+            call_row,
+            put_row,
+            target_call_qty,
+            target_put_qty,
+            side="short",
+        )
+        self._set_side_eod(day, state, "short", position["last_option_value"], greeks, int(call_row["dte"]))
+        self._update_day_aggregates(day, state)
+        trade_type = (
+            "atm_straddle_shape_rebalance"
+            if "SHAPE" in str(item.get("action", ""))
+            else "atm_straddle_delta_rebalance"
+        )
+        state.trades.append(
+            {
+                "date": date,
+                "type": trade_type,
+                "cash": state.cash,
+                "fee": fee,
+                "option_margin": target_margin,
+                "margin_change": margin_change,
+                "trade_call_qty": target_call_qty - current_call_qty,
+                "trade_put_qty": target_put_qty - current_put_qty,
+                "position_call_qty": target_call_qty,
+                "position_put_qty": target_put_qty,
+                "estimated_delta_effect": item.get("estimated_delta_effect"),
+                "target_hedge_qty": item.get("target_hedge_qty"),
+                "projected_account_delta_after_combined_hedge": item.get(
+                    "projected_account_delta_after_combined_hedge"
+                ),
+                **opt_position._build_liquidity_fields(
+                    call_row,
+                    put_row,
+                    open_call_qty + close_call_qty,
+                    open_put_qty + close_put_qty,
+                ),
+                **opt_position.trade_fields(position),
+            }
+        )
+        if day is not None:
+            day["daily_option_fee"] += fee
+        return True
+
     def _hedge_to(
         self,
         date,
@@ -1930,6 +2098,31 @@ class BacktestEngine:
         projected_target_qty = strategy.round_etf_hedge_target(
             -option_delta if target_qty is None else float(target_qty)
         )
+
+        if (
+            target_qty is None
+            and getattr(CONFIG.strategy, "enable_atm_straddle_rebalance", False)
+        ):
+            shape_item = self._atm_straddle_rebalance_item(
+                state,
+                day,
+                option_delta,
+                account_delta,
+                shape_only=True,
+            )
+            if shape_item is not None and shape_item.get("delta_tolerance_met"):
+                if self._execute_atm_straddle_rebalance(date, state, day, shape_item):
+                    self._execute_etf_target(
+                        date,
+                        spot,
+                        state,
+                        day,
+                        day["greeks"],
+                        shape_item.get("target_hedge_qty", 0.0),
+                        "delta_hedge_after_atm_shape_rebalance",
+                    )
+                return
+
         if (
             self.config.get("allow_etf_short_hedge", True)
             or projected_target_qty >= 0
@@ -1945,6 +2138,46 @@ class BacktestEngine:
                 trade_type,
             )
             return
+
+        # Match live behavior when an ETF short hedge is forbidden: first close
+        # any existing ETF long hedge, then reshape the current ATM short
+        # straddle and use ETF only for any remaining non-negative hedge target.
+        self._execute_etf_target(
+            date,
+            spot,
+            state,
+            day,
+            greeks,
+            0.0,
+            "reduce_hedge_before_atm_straddle_rebalance",
+        )
+        self._update_day_aggregates(day, state)
+        residual_delta = float(day["greeks"]["delta"]) + float(state.hedge_etf_qty)
+        if abs(residual_delta) <= tolerance:
+            return
+        if (
+            residual_delta > 0
+            and getattr(CONFIG.strategy, "enable_atm_straddle_rebalance", False)
+        ):
+            rebalance_item = self._atm_straddle_rebalance_item(
+                state,
+                day,
+                float(day["greeks"]["delta"]),
+                residual_delta,
+            )
+            if rebalance_item is not None and self._execute_atm_straddle_rebalance(
+                date, state, day, rebalance_item
+            ):
+                self._execute_etf_target(
+                    date,
+                    spot,
+                    state,
+                    day,
+                    day["greeks"],
+                    rebalance_item.get("target_hedge_qty", 0.0),
+                    "delta_hedge_after_atm_straddle_rebalance",
+                )
+                return
 
         state.trades.append(
             {

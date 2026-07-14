@@ -432,6 +432,85 @@ class SignalEngineRollTest(unittest.TestCase):
 
         self.assertIsNotNone(projected)
 
+    def test_missing_roll_target_closes_position_instead_of_falling_back_to_delta_hedge(self):
+        config = SimpleNamespace(
+            strategy=SimpleNamespace(short_stop_loss_enabled=False),
+        )
+        position = {
+            "call_code": "CALL",
+            "put_code": "PUT",
+            "call_qty": 10,
+            "put_qty": 10,
+            "contract_multiplier": 10_000,
+            "option_margin": 20_000.0,
+        }
+        chain_df = pd.DataFrame(
+            [
+                {
+                    "order_book_id": "CALL",
+                    "mid": 0.10,
+                    "dte": 7,
+                    "delta": 0.5,
+                    "gamma": 0.1,
+                    "vega": 0.1,
+                    "theta": -0.1,
+                },
+                {
+                    "order_book_id": "PUT",
+                    "mid": 0.10,
+                    "dte": 7,
+                    "delta": -0.5,
+                    "gamma": 0.1,
+                    "vega": 0.1,
+                    "theta": -0.1,
+                },
+            ]
+        )
+        roll_failure = {
+            "close_current_position": True,
+            "reason": "Roll is required, but no eligible replacement ATM straddle is available. Close the current position; do not substitute a delta hedge for this roll.",
+            "roll_failure_reason": "roll_condition_active_but_no_valid_target_atm",
+        }
+
+        with (
+            mock.patch.object(
+                signal_engine.core.strategy,
+                "get_short_close_reason",
+                return_value=None,
+            ),
+            mock.patch.object(
+                signal_engine.core.position,
+                "has_short_volume_spike",
+                return_value=False,
+            ),
+            mock.patch.object(
+                signal_engine.core.strategy,
+                "calc_position_greeks",
+                return_value={},
+            ),
+            mock.patch.object(signal_engine, "_roll_payload", return_value=roll_failure),
+        ):
+            advice, _, _ = signal_engine._advice_for_existing_position(
+                "500etf",
+                "short",
+                position,
+                chain_df,
+                pd.Series(),
+                pd.DataFrame(),
+                pd.Timestamp("2026-07-13"),
+                None,
+                8.316,
+                None,
+                config,
+            )
+
+        self.assertEqual(advice[0]["action"], "CLOSE_SHORT_STRADDLE")
+        self.assertEqual(advice[0]["priority"], "action")
+        self.assertEqual(
+            advice[0]["roll_failure_reason"],
+            "roll_condition_active_but_no_valid_target_atm",
+        )
+
     def test_merge_latest_features_persists_date_column(self):
         history = pd.DataFrame(
             {"atm_iv": [0.20]},
