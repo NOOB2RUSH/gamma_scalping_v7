@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -42,6 +43,28 @@ class IntradayCaptureAppHelpersTest(TestCase):
 
             self.assertEqual(intraday_capture_app.read_pid(pid_path), 12345)
             self.assertEqual(intraday_capture_app.tail_text(log_path, max_lines=2), "b\nc")
+
+    def test_intraday_status_summary_counts_complete_dates(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            status_path = root / "data" / "live" / "50etf" / "intraday" / "status.json"
+            status_path.parent.mkdir(parents=True)
+            status_path.write_text(
+                json.dumps(
+                    {
+                        "dates": {
+                            "2026-07-06": {"complete": True},
+                            "2026-07-07": {"complete": False},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(intraday_capture_app.storage, "PROJECT_ROOT", root):
+                summary = intraday_capture_app.intraday_status_summary("50etf")
+
+        self.assertEqual(summary, "dates=1/2")
 
     def test_capture_command_uses_python_script_when_not_frozen(self):
         command = intraday_capture_app.capture_command(

@@ -54,15 +54,15 @@ CONFIG = AppConfig(
         short_volume_spike_exit_enabled=True,
         short_volume_spike_multiplier=1.5,
         short_cooldown_after_long_iv_high_exit_days=3,
-        roll_dte_threshold=7,
+        roll_dte_threshold=3,
     ),
     vol=VolConfig(
         annual_days=252,
         hv_windows=(60,),
         atm_iv_percentile_window=252,
         atm_target_dte=20,
-        atm_target_dte_min=7,
-        atm_target_dte_max=30,
+        atm_target_dte_min=3,
+        atm_target_dte_max=35,
         # 中证1000行权价档位是指数点位，ATM 偏离容忍度不能沿用 50ETF 的 0.10 元。
         atm_moneyness_tol=100,
         # 若目标 DTE 合约成交量过低，优先回到同 strike 的更近月活跃合约。

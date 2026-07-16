@@ -68,7 +68,7 @@ class StrategyConfig:
     short_cooldown_after_long_iv_high_exit_days: int = 3
 
     # 展期信号：按到期日和 ATM 档位偏离触发。
-    roll_dte_threshold: int = 7
+    roll_dte_threshold: int = 3
 
 
 @dataclass(frozen=True)
@@ -81,8 +81,8 @@ class VolConfig:
     # surface_percentile: 固定期限曲面 + 历史分位数阈值。
     iv_observation_mode: str = "legacy"
     atm_target_dte: int = 20
-    atm_target_dte_min: int = 7
-    atm_target_dte_max: int = 30
+    atm_target_dte_min: int = 3
+    atm_target_dte_max: int = 35
     atm_selection_mode: str = "target_dte"
     atm_moneyness_tol: float = 0.10
     atm_min_total_volume: float = 0.0

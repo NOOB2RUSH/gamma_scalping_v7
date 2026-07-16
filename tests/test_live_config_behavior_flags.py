@@ -24,3 +24,12 @@ def test_live_etf_products_search_near_month_when_atm_volume_is_low():
             core.config.load_config(product).vol.atm_low_volume_search_near_month
             is True
         )
+
+
+def test_live_etf_products_use_three_to_thirty_five_day_atm_window():
+    for product in ("50etf", "300etf", "500etf", "kc50etf"):
+        config = core.config.load_config(product)
+        vol = config.vol
+        assert vol.atm_target_dte_min == 3
+        assert vol.atm_target_dte_max == 35
+        assert config.strategy.roll_dte_threshold == vol.atm_target_dte_min

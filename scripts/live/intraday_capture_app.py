@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, Button, Checkbutton, Entry, Frame, IntVar, Label, Listbox, Scrollbar, StringVar, Tk, messagebox
+from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, Button, Checkbutton, Entry, Frame, IntVar, Label, Listbox, Scrollbar, StringVar, Text, Tk, Toplevel, messagebox
 
 import _bootstrap  # noqa: F401
 import core
@@ -155,6 +156,20 @@ def capture_status(product: str) -> CaptureStatus:
     )
 
 
+def intraday_status_summary(product: str) -> str:
+    path = Path(storage.PROJECT_ROOT) / "data" / "live" / product / "intraday" / "status.json"
+    if not path.exists():
+        return "dates=-"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return "dates=invalid"
+    rows = payload.get("dates", {})
+    total = len(rows)
+    complete = sum(1 for row in rows.values() if row.get("complete"))
+    return f"dates={complete}/{total}"
+
+
 def start_capture(
     product: str,
     account_id: str,
@@ -270,6 +285,9 @@ class IntradayCaptureApp:
         self.account_id = StringVar(value=DEFAULT_ACCOUNT_ID)
         self.interval = StringVar(value=str(DEFAULT_INTERVAL_SECONDS))
         self.extra_codes = StringVar(value="")
+        self.backfill_days = StringVar(value="5")
+        self.browse_date = StringVar(value="")
+        self.browse_symbol = StringVar(value="")
         self.save_greeks_snapshot = IntVar(value=0)
         self.status_list: Listbox | None = None
         self.log_text: Listbox | None = None
@@ -299,6 +317,15 @@ class IntradayCaptureApp:
             variable=self.save_greeks_snapshot,
         ).pack(side=LEFT, padx=4)
 
+        data_tools = Frame(self.root)
+        data_tools.pack(fill="x", padx=8, pady=4)
+        Label(data_tools, text="Backfill days").pack(side=LEFT)
+        Entry(data_tools, textvariable=self.backfill_days, width=6).pack(side=LEFT, padx=4)
+        Label(data_tools, text="Browse date YYYY-MM-DD").pack(side=LEFT)
+        Entry(data_tools, textvariable=self.browse_date, width=12).pack(side=LEFT, padx=4)
+        Label(data_tools, text="Symbol/code").pack(side=LEFT)
+        Entry(data_tools, textvariable=self.browse_symbol, width=16).pack(side=LEFT, padx=4)
+
         controls = Frame(self.root)
         controls.pack(fill="x", padx=8, pady=4)
         Button(controls, text="Start Selected", command=self.start_selected).pack(
@@ -312,6 +339,12 @@ class IntradayCaptureApp:
         )
         Button(controls, text="Refresh", command=self.refresh).pack(side=LEFT, padx=4)
         Button(controls, text="Show Selected Log", command=self.show_selected_log).pack(
+            side=LEFT, padx=4
+        )
+        Button(controls, text="Backfill Missing", command=self.backfill_missing).pack(
+            side=LEFT, padx=4
+        )
+        Button(controls, text="Browse Data", command=self.browse_data).pack(
             side=LEFT, padx=4
         )
 
@@ -347,6 +380,13 @@ class IntradayCaptureApp:
             if int(self.product_vars[product].get() or 0) == 1
         ]
 
+    def extra_option_codes(self) -> list[str]:
+        return [
+            item.strip()
+            for item in self.extra_codes.get().split(",")
+            if item.strip()
+        ]
+
     def start_selected(self):
         try:
             interval = int(self.interval.get())
@@ -355,11 +395,7 @@ class IntradayCaptureApp:
         except ValueError:
             messagebox.showerror("Invalid interval", "Interval seconds must be positive.")
             return
-        codes = [
-            item.strip()
-            for item in self.extra_codes.get().split(",")
-            if item.strip()
-        ]
+        codes = self.extra_option_codes()
         errors = []
         for product in self.selected_products():
             try:
@@ -384,11 +420,7 @@ class IntradayCaptureApp:
         except ValueError:
             messagebox.showerror("Invalid interval", "Interval seconds must be positive.")
             return
-        codes = [
-            item.strip()
-            for item in self.extra_codes.get().split(",")
-            if item.strip()
-        ]
+        codes = self.extra_option_codes()
         errors = []
         for product in self.selected_products():
             try:
@@ -427,9 +459,10 @@ class IntradayCaptureApp:
             latest = str(status.latest_file) if status.latest_file else "-"
             mtime = status.latest_file_mtime or "-"
             pid = status.pid if status.pid is not None else "-"
+            date_status = intraday_status_summary(product)
             self.status_list.insert(
                 END,
-                f"{product:8s} {running:8s} pid={pid} latest={mtime} file={latest}",
+                f"{product:8s} {running:8s} pid={pid} {date_status} latest={mtime} file={latest}",
             )
 
     def show_selected_log(self):
@@ -449,6 +482,182 @@ class IntradayCaptureApp:
             return
         for line in text.splitlines():
             self.log_text.insert(END, line)
+
+    def backfill_missing(self):
+        try:
+            days = int(self.backfill_days.get())
+            if days <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid days", "Backfill days must be positive.")
+            return
+
+        import argparse
+        import capture_intraday_quotes
+
+        account_id = self.account_id.get().strip() or DEFAULT_ACCOUNT_ID
+        codes = self.extra_option_codes()
+        products = self.selected_products()
+        if not products:
+            messagebox.showinfo("No product", "Select at least one product.")
+            return
+
+        plans = []
+        errors = []
+        for product in products:
+            try:
+                discovery = capture_intraday_quotes.discover_backfill_dates(
+                    product,
+                    account_id=account_id,
+                    option_codes=codes,
+                    max_days=days,
+                )
+                status = capture_intraday_quotes.refresh_intraday_status(
+                    product,
+                    option_codes=discovery["option_codes"],
+                    etf_symbol=discovery["etf_symbol"],
+                )
+                status_by_date = status.get("dates", {})
+                missing = [
+                    row["date"]
+                    for row in discovery["dates"]
+                    if row["complete"]
+                    and not status_by_date.get(row["date"], {}).get("complete")
+                ]
+                plans.append((product, discovery, missing))
+            except Exception as exc:
+                errors.append(f"{product}: {exc}")
+
+        if errors:
+            messagebox.showerror("Backfill discovery failed", "\n".join(errors))
+            return
+
+        summary_lines = []
+        for product, discovery, missing in plans:
+            available = [row["date"] for row in discovery["dates"] if row["complete"]]
+            summary_lines.append(
+                f"{product}: source_available={len(available)} "
+                f"missing={len(missing)} dates={','.join(missing) or '-'}"
+            )
+        if not any(missing for _, _, missing in plans):
+            messagebox.showinfo("Backfill", "No missing available dates.")
+            self.refresh()
+            return
+        if not messagebox.askyesno(
+            "Confirm backfill",
+            "Backfill missing minute data?\n\n" + "\n".join(summary_lines),
+        ):
+            return
+
+        run_errors = []
+        results = []
+        for product, _, _ in plans:
+            args = argparse.Namespace(
+                product=product,
+                account_id=account_id,
+                interval_seconds=None,
+                daily_schedule="",
+                option_code=codes,
+                no_account_positions=False,
+                once=True,
+                save_option_greeks_snapshot=False,
+                max_runs=None,
+                output_dir=None,
+                pid_file=None,
+                target_date=None,
+                backfill_missing=True,
+                backfill_days=days,
+            )
+            try:
+                results.append(capture_intraday_quotes.backfill_missing_dates(args))
+            except Exception as exc:
+                run_errors.append(f"{product}: {exc}")
+
+        self.refresh()
+        self._show_lines(
+            "Backfill result",
+            [
+                f"{item['product']}: filled={len(item['results'])} "
+                f"missing={','.join(item['missing_dates']) or '-'} "
+                f"status={item['status_path']}"
+                for item in results
+            ]
+            + run_errors,
+        )
+        if run_errors:
+            messagebox.showerror("Backfill failed", "\n".join(run_errors))
+
+    def browse_data(self):
+        import pandas as pd
+        import capture_intraday_quotes
+
+        product = self._selected_product_for_detail()
+        date_text = self.browse_date.get().strip()
+        symbol = self.browse_symbol.get().strip()
+        if not date_text:
+            status = capture_intraday_quotes.load_intraday_status(product)
+            dates = sorted(status.get("dates", {}))
+            date_text = dates[-1] if dates else pd.Timestamp.now().strftime("%Y-%m-%d")
+        try:
+            date_part = pd.Timestamp(date_text).strftime("%Y%m%d")
+        except Exception:
+            messagebox.showerror("Invalid date", "Browse date must be YYYY-MM-DD.")
+            return
+
+        root = Path(storage.PROJECT_ROOT) / "data" / "live" / product / "intraday" / date_part
+        if not root.exists():
+            messagebox.showinfo("No data", f"No intraday directory: {root}")
+            return
+        if not symbol:
+            files = sorted(path.name for path in root.glob("*.csv"))
+            self._show_lines(
+                f"{product} {date_text} files",
+                files or ["(no csv files)"],
+            )
+            return
+
+        candidates = [
+            root / f"option_{symbol}_1m.csv",
+            root / f"etf_{symbol}_1m.csv",
+            root / symbol,
+        ]
+        path = next((item for item in candidates if item.exists()), None)
+        if path is None:
+            files = sorted(item.name for item in root.glob("*.csv"))
+            self._show_lines(
+                "Data not found",
+                [f"Not found for symbol/code: {symbol}", f"Directory: {root}", *files],
+            )
+            return
+        try:
+            frame = pd.read_csv(path)
+        except Exception as exc:
+            messagebox.showerror("Read failed", str(exc))
+            return
+        preview = frame.head(300).to_string(index=False)
+        self._show_text(
+            f"{product} {date_text} {path.name}",
+            f"path={path}\nrows={len(frame)} columns={list(frame.columns)}\n\n{preview}",
+        )
+
+    def _selected_product_for_detail(self) -> str:
+        assert self.status_list is not None
+        selection = self.status_list.curselection()
+        if selection:
+            return self.products[int(selection[0])]
+        products = self.selected_products()
+        return products[0] if products else self.products[0]
+
+    def _show_lines(self, title: str, lines: list[str]):
+        self._show_text(title, "\n".join(lines))
+
+    def _show_text(self, title: str, text: str):
+        window = Toplevel(self.root)
+        window.title(title)
+        window.geometry("1100x640")
+        box = Text(window, wrap="none")
+        box.pack(fill=BOTH, expand=True)
+        box.insert("1.0", text)
 
 
 def main():
