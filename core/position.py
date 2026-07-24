@@ -244,9 +244,10 @@ def liquidity_capacity(row, ratio=None):
     return max(0, int(math.floor(float(volume) * float(ratio))))
 
 
-def has_short_volume_spike(position, call_row, put_row):
+def has_short_volume_spike(position, call_row, put_row, config=None):
     """卖方持仓成交量放大止损：当前持仓合约成交量较开仓时显著放大。"""
-    if not CONFIG.strategy.short_volume_spike_exit_enabled:
+    config = CONFIG if config is None else config
+    if not config.strategy.short_volume_spike_exit_enabled:
         return False
 
     entry_volume = position.get("entry_total_volume")
@@ -261,7 +262,7 @@ def has_short_volume_spike(position, call_row, put_row):
     current_volume = float(call_volume) + float(put_volume)
     return (
         current_volume
-        >= float(entry_volume) * CONFIG.strategy.short_volume_spike_multiplier
+        >= float(entry_volume) * config.strategy.short_volume_spike_multiplier
     )
 
 

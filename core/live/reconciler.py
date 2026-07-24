@@ -8,6 +8,7 @@ import pandas as pd
 
 from . import account as account_store
 from . import account_report
+from . import corporate_actions
 from . import storage
 
 
@@ -470,8 +471,7 @@ def _portfolio_net_daily_pnl_by_date(account_id, products=None):
             history = history[history["账户ID"].astype(str).eq(str(account_id))].copy()
         if history.empty:
             continue
-        history = _merge_latest_report_summary(product, history)
-        by_date = _product_net_daily_pnl_by_date(history)
+        by_date = _product_net_daily_pnl_by_date(history, product=product)
         for date, value in by_date.items():
             totals[date] = totals.get(date, 0.0) + value
     return totals
@@ -489,14 +489,29 @@ def _available_live_products():
         return tuple(path.name for path in root.iterdir() if path.is_dir())
 
 
-def _product_net_daily_pnl_by_date(frame):
-    if frame is None or frame.empty or "日期" not in frame.columns or "净单日盈亏" not in frame.columns:
+def _product_net_daily_pnl_by_date(frame, product=None):
+    if (
+        frame is None
+        or frame.empty
+        or "日期" not in frame.columns
+        or "净单日盈亏" not in frame.columns
+    ):
         return {}
     result = frame.copy()
-    result["_fund_date"] = pd.to_datetime(result["日期"], errors="coerce").dt.strftime(
-        "%Y-%m-%d"
-    )
-    result["_fund_net_pnl"] = pd.to_numeric(result["净单日盈亏"], errors="coerce")
+    result["_fund_timestamp"] = pd.to_datetime(result["日期"], errors="coerce")
+    result = result.sort_values("_fund_timestamp", kind="stable")
+    result["_fund_date"] = result["_fund_timestamp"].dt.strftime("%Y-%m-%d")
+    funding_pnl = pd.to_numeric(result["净单日盈亏"], errors="coerce")
+    if product is not None and "对冲持仓" in result.columns:
+        distributions = corporate_actions.cash_distribution_series(
+            product,
+            result["日期"],
+        )
+        prior_hedge_qty = pd.to_numeric(
+            result["对冲持仓"], errors="coerce"
+        ).shift(1).fillna(0.0)
+        funding_pnl = funding_pnl - prior_hedge_qty * distributions
+    result["_fund_net_pnl"] = funding_pnl
     result = result.dropna(subset=["_fund_date", "_fund_net_pnl"])
     if result.empty:
         return {}

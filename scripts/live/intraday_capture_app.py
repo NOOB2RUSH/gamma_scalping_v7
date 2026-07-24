@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, VERTICAL, Button, Checkbutton, Entry, Frame, IntVar, Label, Listbox, Scrollbar, StringVar, Text, Tk, Toplevel, messagebox
+from tkinter.ttk import Progressbar
 
 import _bootstrap  # noqa: F401
 import core
@@ -177,6 +178,7 @@ def start_capture(
     extra_option_codes: list[str] | None = None,
     once: bool = False,
     save_option_greeks_snapshot: bool = False,
+    all_option_contracts: bool = False,
 ) -> subprocess.Popen:
     status = capture_status(product)
     if status.running:
@@ -192,10 +194,13 @@ def start_capture(
         extra_option_codes=extra_option_codes,
         once=once,
         save_option_greeks_snapshot=save_option_greeks_snapshot,
+        all_option_contracts=all_option_contracts,
     )
 
     log = status.log_path.open("a", encoding="utf-8")
-    log.write(f"\n[start] command={' '.join(command)}\n")
+    mode = "once" if once else "continuous"
+    log.write(f"\n[capture_mode] product={product} mode={mode}\n")
+    log.write(f"[start] command={' '.join(command)}\n")
     log.flush()
     return subprocess.Popen(
         command,
@@ -214,6 +219,7 @@ def capture_command(
     extra_option_codes: list[str] | None = None,
     once: bool = False,
     save_option_greeks_snapshot: bool = False,
+    all_option_contracts: bool = False,
 ) -> list[str]:
     if getattr(sys, "frozen", False):
         command = [sys.executable, CAPTURE_WORKER_ARG]
@@ -238,6 +244,8 @@ def capture_command(
         command.append("--once")
     if save_option_greeks_snapshot:
         command.append("--save-option-greeks-snapshot")
+    if all_option_contracts:
+        command.append("--all-option-contracts")
     for code in extra_option_codes or []:
         clean = str(code).strip()
         if clean:
@@ -276,6 +284,41 @@ def tail_text(path: Path, max_lines: int = 80) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def capture_progress_summary(product: str) -> dict[str, object]:
+    """Read the most recent worker progress event from a product's log."""
+    mode = "unknown"
+    progress: dict[str, object] = {
+        "mode": mode,
+        "phase": "idle",
+        "completed": 0,
+        "total": 0,
+        "detail": "",
+    }
+    for line in tail_text(log_path(product), max_lines=400).splitlines():
+        if line.startswith("[capture_mode] "):
+            for token in line.split()[1:]:
+                key, separator, value = token.partition("=")
+                if separator and key == "mode":
+                    progress["mode"] = value
+        if not line.startswith("capture_progress "):
+            continue
+        fields = {}
+        for token in line.split()[1:]:
+            key, separator, value = token.partition("=")
+            if separator:
+                fields[key] = value
+        try:
+            progress["completed"] = int(fields.get("completed", 0))
+            progress["total"] = int(fields.get("total", 0))
+        except ValueError:
+            continue
+        progress["phase"] = fields.get("phase", "unknown")
+        progress["detail"] = " ".join(
+            token for token in line.split()[1:] if not token.startswith(("product=", "phase=", "completed=", "total="))
+        )
+    return progress
+
+
 class IntradayCaptureApp:
     def __init__(self, root: Tk):
         self.root = root
@@ -289,10 +332,13 @@ class IntradayCaptureApp:
         self.browse_date = StringVar(value="")
         self.browse_symbol = StringVar(value="")
         self.save_greeks_snapshot = IntVar(value=0)
+        self.all_option_contracts = IntVar(value=0)
         self.status_list: Listbox | None = None
         self.log_text: Listbox | None = None
+        self.progress_vars: dict[str, StringVar] = {}
+        self.progress_bars: dict[str, Progressbar] = {}
         self._build()
-        self.refresh()
+        self._schedule_refresh()
 
     def _build(self):
         top = Frame(self.root)
@@ -315,6 +361,11 @@ class IntradayCaptureApp:
             settings,
             text="Save Greeks snapshot",
             variable=self.save_greeks_snapshot,
+        ).pack(side=LEFT, padx=4)
+        Checkbutton(
+            settings,
+            text="All available contracts → daily Parquet (Run Once)",
+            variable=self.all_option_contracts,
         ).pack(side=LEFT, padx=4)
 
         data_tools = Frame(self.root)
@@ -347,6 +398,22 @@ class IntradayCaptureApp:
         Button(controls, text="Browse Data", command=self.browse_data).pack(
             side=LEFT, padx=4
         )
+
+        progress_panel = Frame(self.root)
+        progress_panel.pack(fill="x", padx=8, pady=4)
+        Label(progress_panel, text="Capture progress").grid(row=0, column=0, sticky="w")
+        for row, product in enumerate(self.products, start=1):
+            Label(progress_panel, text=product, width=9, anchor="w").grid(
+                row=row, column=0, sticky="w"
+            )
+            bar = Progressbar(progress_panel, length=310, mode="determinate", maximum=1)
+            bar.grid(row=row, column=1, padx=4, sticky="w")
+            variable = StringVar(value="Stopped")
+            Label(progress_panel, textvariable=variable, width=95, anchor="w").grid(
+                row=row, column=2, sticky="w"
+            )
+            self.progress_bars[product] = bar
+            self.progress_vars[product] = variable
 
         body = Frame(self.root)
         body.pack(fill=BOTH, expand=True, padx=8, pady=8)
@@ -388,6 +455,12 @@ class IntradayCaptureApp:
         ]
 
     def start_selected(self):
+        if self.all_option_contracts.get():
+            messagebox.showinfo(
+                "Use Run Once",
+                "Full-chain minute capture uses many source requests. Use Run Once Selected.",
+            )
+            return
         try:
             interval = int(self.interval.get())
             if interval <= 0:
@@ -405,6 +478,7 @@ class IntradayCaptureApp:
                     interval,
                     codes,
                     save_option_greeks_snapshot=bool(self.save_greeks_snapshot.get()),
+                    all_option_contracts=bool(self.all_option_contracts.get()),
                 )
             except Exception as exc:
                 errors.append(f"{product}: {exc}")
@@ -431,6 +505,7 @@ class IntradayCaptureApp:
                     codes,
                     once=True,
                     save_option_greeks_snapshot=bool(self.save_greeks_snapshot.get()),
+                    all_option_contracts=bool(self.all_option_contracts.get()),
                 )
             except Exception as exc:
                 errors.append(f"{product}: {exc}")
@@ -460,10 +535,35 @@ class IntradayCaptureApp:
             mtime = status.latest_file_mtime or "-"
             pid = status.pid if status.pid is not None else "-"
             date_status = intraday_status_summary(product)
+            self._refresh_progress(product, status)
             self.status_list.insert(
                 END,
                 f"{product:8s} {running:8s} pid={pid} {date_status} latest={mtime} file={latest}",
             )
+
+    def _schedule_refresh(self):
+        self.refresh()
+        self.root.after(1000, self._schedule_refresh)
+
+    def _refresh_progress(self, product: str, status: CaptureStatus):
+        progress = capture_progress_summary(product)
+        completed = int(progress["completed"])
+        total = int(progress["total"])
+        bar = self.progress_bars[product]
+        bar.configure(maximum=max(total, 1), value=min(completed, max(total, 1)))
+
+        mode = str(progress["mode"])
+        phase = str(progress["phase"])
+        detail = str(progress["detail"])
+        if status.running and mode == "continuous":
+            text = f"正在持续运行 · 最近一轮 {completed}/{total} · {phase} {detail}".strip()
+        elif status.running:
+            text = f"单次抓取中 · {completed}/{total} · {phase} {detail}".strip()
+        elif phase == "completed":
+            text = f"单次抓取完成 · {completed}/{total} · {detail}".strip()
+        else:
+            text = "Stopped"
+        self.progress_vars[product].set(text)
 
     def show_selected_log(self):
         assert self.status_list is not None

@@ -18,7 +18,7 @@
 
 - 固定流程：验证数据源 -> 小样本检查 -> 完整下载 -> 独立配置 -> 小范围回测 -> 全范围回测。
 - 数据至少覆盖标的价格、期权代码、日期、到期日、行权价、call/put、期权价格和成交量；估算字段必须注明局限。
-- 下载脚本放入 `scripts/download/<product>/`，数据放入 `data/<product>/`，品种配置放入 `core/configs/`。
+- 上交所 ETF 期权下载统一使用 `scripts/download/build_data.py --product <product>`；交易所或数据协议不同的品种可保留独立下载器。数据放入 `data/<product>/`，品种配置放入 `core/configs/`。
 - 品种专属参数不得写入公共入口；修改公共模块后必须复核现有品种。
 - 验证 ATM、DTE、IV/Greeks、成交量、保证金、手续费、对冲标的、现金和输出品种是否正确。
 

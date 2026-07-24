@@ -9,6 +9,79 @@ from core.live import account, account_report
 
 
 class AccountReportPnlClassificationTest(unittest.TestCase):
+    def test_reopened_etf_does_not_inherit_stale_pre_flat_position(self):
+        payload = {
+            "product": "500etf",
+            "account_id": "default",
+            "date": "2026-07-21",
+            "spot": 7.792,
+            "current_chain_metadata": {},
+            "position_history": pd.DataFrame(
+                [
+                    {
+                        "日期": "2026-07-14",
+                        "账户ID": "default",
+                        "方向": "hedge",
+                        "合约代码": "510500",
+                        "合约名称": "510500.XSHG",
+                        "总持仓": 142_400,
+                        "最新价": 8.090,
+                        "持仓均价": 8.100,
+                    },
+                    {
+                        "日期": "2026-07-21",
+                        "账户ID": "default",
+                        "方向": "hedge",
+                        "合约代码": "510500",
+                        "合约名称": "510500.XSHG",
+                        "总持仓": 8_200,
+                        "最新价": 7.804,
+                        "持仓均价": 7.804,
+                    },
+                ]
+            ),
+            "summary_history": pd.DataFrame(
+                [
+                    {
+                        "日期": "2026-07-15",
+                        "账户ID": "default",
+                        "对冲持仓": 0,
+                    },
+                    {
+                        "日期": "2026-07-20",
+                        "账户ID": "default",
+                        "对冲持仓": 0,
+                    },
+                ]
+            ),
+            "trade_rows": [
+                {
+                    "日期": "2026-07-21",
+                    "合约代码": "510500",
+                    "合约名称": "中证500ETF南方",
+                    "买卖": "买",
+                    "成交价格": 7.804,
+                    "成交数量": 8_200,
+                    "成交时间": "14:55:55",
+                    "类型": "ETF对冲",
+                }
+            ],
+        }
+
+        with mock.patch.object(
+            account_report,
+            "_option_contract_adjustments_by_code",
+            return_value={},
+        ):
+            result = account_report._position_report_frame(payload)
+
+        self.assertEqual(len(result), 1)
+        row = result.iloc[0]
+        self.assertEqual(row["今日变化"], 8_200)
+        self.assertEqual(row["持仓盈亏"], 0.0)
+        self.assertAlmostEqual(row["交易盈亏"], -98.4)
+        self.assertAlmostEqual(row["当日盈亏分解合计"], -98.4)
+
     def test_new_intraday_position_pnl_is_transaction_to_close(self):
         result = account_report._daily_position_pnl_breakdown(
             current_qty=80,

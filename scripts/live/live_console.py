@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import _bootstrap  # noqa: F401
@@ -158,21 +160,51 @@ def _snapshot_time_text(snapshot):
 
 
 def _action_fetch_akshare_snapshots(session):
-    for product in session["products"]:
-        print(f"\n== {product} ==")
-        try:
-            snapshot = market_data.fetch_quote_snapshot(
+    products = tuple(session["products"])
+    if not products:
+        return
+
+    started_at = time.perf_counter()
+    print(f"\n正在并发拉取 {len(products)} 个品种的 AKShare 快照...")
+    with ThreadPoolExecutor(max_workers=min(4, len(products))) as executor:
+        futures = {
+            executor.submit(
+                market_data.fetch_quote_snapshot,
                 product,
                 source="akshare",
                 date="latest",
-            )
-            print(
-                f"saved={snapshot['snapshot_stamp']} "
-                f"quote_date={snapshot['quote_date']} "
-                f"option_rows={snapshot.get('option_rows', 0)}"
-            )
-        except Exception as exc:
+            ): product
+            for product in products
+        }
+        results = {}
+        for future in as_completed(futures):
+            product = futures[future]
+            try:
+                results[product] = (future.result(), None)
+            except Exception as exc:
+                results[product] = (None, exc)
+
+    for product in products:
+        print(f"\n== {product} ==")
+        snapshot, exc = results[product]
+        if exc is not None:
             print(f"FAILED {exc}")
+            continue
+        timings = snapshot.get("timings_seconds") or {}
+        timing_text = (
+            f" total_seconds={timings.get('total')}"
+            f" option_seconds={timings.get('option_fetch')}"
+            f" write_seconds={timings.get('write')}"
+            if timings
+            else ""
+        )
+        print(
+            f"saved={snapshot['snapshot_stamp']} "
+            f"quote_date={snapshot['quote_date']} "
+            f"option_rows={snapshot.get('option_rows', 0)}"
+            f"{timing_text}"
+        )
+    print(f"\n整批快照耗时: {time.perf_counter() - started_at:.3f} 秒")
 
 
 def _action_import_holdings(session):
@@ -808,6 +840,15 @@ def _print_import_result(result):
                 f"entry_price={fill['entry_price']:.6f} "
                 f"trade_price={_fmt_optional(fill.get('price'))} "
                 f"latest_price={_fmt_optional(fill.get('latest_price'))} "
+                f"cash_delta={fill['cash_delta']:.2f}"
+            )
+        elif fill["action"] == "option_contract_adjustment":
+            print(
+                f"{prefix} {fill['action']} side={fill.get('side')} "
+                f"strike={fill.get('old_strike')}->{fill.get('new_strike')} "
+                f"multiplier={fill.get('old_contract_multiplier')}"
+                f"->{fill.get('new_contract_multiplier')} "
+                f"call={fill.get('call_code')} put={fill.get('put_code')} "
                 f"cash_delta={fill['cash_delta']:.2f}"
             )
         elif fill["action"] == "option_mark_update":

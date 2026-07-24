@@ -338,6 +338,56 @@ class CaptureIntradayQuotesTest(unittest.TestCase):
         self.assertEqual(row["missing_option_codes"], ["10000002"])
         self.assertEqual(row["etf_rows"], 1)
 
+    def test_all_option_parquet_is_counted_by_intraday_status(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            day = root / "data" / "live" / "50etf" / "intraday" / "20260707"
+            day.mkdir(parents=True)
+            pd.DataFrame({"timestamp": ["2026-07-07 09:30:00"]}).to_csv(
+                day / "etf_510050_1m.csv", index=False
+            )
+            pd.DataFrame(
+                {
+                    "symbol": ["10000001", "10000001", "10000002"],
+                    "timestamp": pd.to_datetime(
+                        ["2026-07-07 09:30:00", "2026-07-07 09:31:00", "2026-07-07 09:30:00"]
+                    ),
+                }
+            ).to_parquet(day / "option_all_1m.parquet", index=False)
+
+            with mock.patch.object(capture_intraday_quotes.storage, "PROJECT_ROOT", root):
+                status = capture_intraday_quotes.refresh_intraday_status(
+                    "50etf",
+                    option_codes=["10000001", "10000002"],
+                    etf_symbol="510050",
+                )
+
+        row = status["dates"]["2026-07-07"]
+        self.assertTrue(row["complete"])
+        self.assertEqual(row["all_option_minute_rows"], 3)
+        self.assertEqual(row["option_rows"], {"10000001": 2, "10000002": 1})
+
+    def test_write_all_option_minutes_parquet_deduplicates_by_contract_and_minute(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "option_all_1m.parquet"
+            frame = pd.DataFrame(
+                {
+                    "symbol": ["10000001", "10000001", "10000002"],
+                    "timestamp": pd.to_datetime(
+                        ["2026-07-07 09:30:00", "2026-07-07 09:30:00", "2026-07-07 09:31:00"]
+                    ),
+                    "price": [0.1, 0.2, 0.3],
+                }
+            )
+            _, rows = capture_intraday_quotes._write_all_option_minutes_parquet(
+                path, [frame], "2026-07-07"
+            )
+            saved = pd.read_parquet(path)
+
+        self.assertEqual(rows, 2)
+        self.assertEqual(len(saved), 2)
+        self.assertEqual(float(saved.loc[saved["symbol"] == "10000001", "price"].iloc[0]), 0.2)
+
     def test_discover_backfill_dates_reports_complete_and_missing_dates(self):
         fake_ak = SimpleNamespace(
             stock_zh_a_minute=lambda symbol, period, adjust: pd.DataFrame(

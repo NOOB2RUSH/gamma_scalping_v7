@@ -132,7 +132,7 @@ def pull_output(args, project_root):
 def main():
     args = parse_args()
     require_rsync()
-    project_root = Path(__file__).resolve().parent
+    project_root = Path(__file__).resolve().parents[2]
 
     if args.mode == "code":
         sync_code(args, project_root)

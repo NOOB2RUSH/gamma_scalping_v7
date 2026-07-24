@@ -14,6 +14,18 @@ def write_signal_report(product, signal_payload):
     lines = [
         f"# Live Signal: {product}",
     ]
+    plan_status = signal_payload.get("plan_status")
+    if plan_status:
+        lines.extend(
+            [
+                "",
+                "## Plan Status",
+                "",
+                f"- status: {plan_status}",
+                "- execution_allowed: "
+                f"{str(bool(signal_payload.get('execution_allowed'))).lower()}",
+            ]
+        )
     if reasons:
         lines.extend(["", "## Reasons", ""])
         lines.extend(f"- {reason}" for reason in reasons)
@@ -63,6 +75,14 @@ def format_signal_summary(signal_payload):
     """Return terminal-friendly live advice lines for manual execution."""
     rows, notices = _execution_rows(signal_payload)
     lines = _advice_reason_lines(signal_payload)
+    plan_status = signal_payload.get("plan_status")
+    if plan_status:
+        lines.insert(
+            0,
+            "plan_status="
+            f"{plan_status} | execution_allowed="
+            f"{str(bool(signal_payload.get('execution_allowed'))).lower()}",
+        )
     greek_target_rows = _expected_greek_target_rows(signal_payload)
     if greek_target_rows:
         lines.append("预期Greeks目标 | Greek | 调整前 | 信号影响 | 影响/原值 | 调整目标")
@@ -89,7 +109,7 @@ def _advice_reason_lines(signal_payload):
     return [
         f"reason: {item.get('action')}={item.get('reason')}"
         for item in signal_payload.get("advice", [])
-        if item.get("reason")
+        if item.get("reason") and not _is_zero_quantity_etf_advice(item)
     ]
 
 
@@ -100,10 +120,12 @@ def _expected_greek_target_rows(signal_payload):
 
     account_greeks = signal_payload.get("account_greeks") or {}
     planned_greeks = signal_payload.get("planned_account_greeks") or account_greeks
-    base_greeks = account_greeks or planned_greeks
+    available_greeks = account_greeks or planned_greeks
     current_hedge_qty = _current_hedge_qty(signal_payload)
 
-    delta_before = _number(signal_payload.get("account_delta_after_hedge"))
+    delta_before = _number(signal_payload.get("current_account_delta"))
+    if delta_before is None:
+        delta_before = _number(signal_payload.get("account_delta_after_hedge"))
     if delta_before is None:
         delta_before = _first_number(
             advice,
@@ -112,32 +134,27 @@ def _expected_greek_target_rows(signal_payload):
             "account_delta",
         )
     if delta_before is None:
-        option_delta = _number(base_greeks.get("delta"))
+        option_delta = _number(available_greeks.get("delta"))
         delta_before = (
             None
             if option_delta is None
             else option_delta + current_hedge_qty
         )
-    delta_after = _target_delta_after_signal(
-        advice,
-        planned_greeks,
-        current_hedge_qty,
-    )
+    delta_after = _number(signal_payload.get("planned_account_delta"))
+    if delta_after is None:
+        delta_after = _target_delta_after_signal(
+            advice,
+            planned_greeks,
+            current_hedge_qty,
+        )
     delta_effect = _difference(delta_after, delta_before)
 
     rows = [
         _greek_target_row("Delta", delta_before, delta_effect, delta_after),
     ]
     for label, key in [("Gamma", "gamma"), ("Vega", "vega"), ("Theta", "theta")]:
-        before = _number(base_greeks.get(key))
+        before = _number(account_greeks.get(key))
         target = _number(planned_greeks.get(key))
-        extra_effect = sum(
-            _number(item.get(f"estimated_{key}_effect")) or 0.0 for item in advice
-        )
-        if target is None and before is not None:
-            target = before
-        if target is not None:
-            target += extra_effect
         effect = _difference(target, before)
         rows.append(_greek_target_row(label, before, effect, target))
 
@@ -232,7 +249,11 @@ def _execution_rows(signal_payload):
         item_rows = _advice_execution_rows(item, include_etf=False)
         if item_rows:
             rows.extend(item_rows)
-        elif item.get("reason") and etf_netting.extract_etf_trade(item) is None:
+        elif (
+            item.get("reason")
+            and etf_netting.extract_etf_trade(item) is None
+            and not _is_zero_quantity_etf_advice(item)
+        ):
             notices.append(f"{item.get('action')}: {item.get('reason')}")
     for item in netted_etf_items:
         rows.extend(_advice_execution_rows(item, include_etf=True))
@@ -242,6 +263,18 @@ def _execution_rows(signal_payload):
     for index, row in enumerate(rows, start=1):
         row["执行顺序"] = index
     return rows, notices
+
+
+def _is_zero_quantity_etf_advice(item):
+    action = str(item.get("action") or "")
+    if action not in etf_netting.ETF_HEDGE_ACTIONS | {
+        etf_netting.NETTED_ETF_HEDGE_ACTION,
+    }:
+        return False
+    if item.get("trade_etf_qty") is None:
+        return False
+    trade_qty = _number(item.get("trade_etf_qty"))
+    return trade_qty is not None and abs(trade_qty) <= 1e-9
 
 
 def _annotate_projected_quantities(rows, signal_payload):
@@ -352,6 +385,17 @@ def _advice_execution_rows(item, include_etf=True):
     action = item.get("action", "")
     side = item.get("side")
 
+    if action == etf_netting.PRE_ROLL_HEDGE_CLOSE_ACTION:
+        if not include_etf:
+            return []
+        trade_qty = item.get("trade_etf_qty")
+        return [_execution_row(
+            item.get("underlying_order_book_id"),
+            _trade_direction(trade_qty),
+            abs(float(trade_qty or 0.0)),
+            item.get("estimated_price"),
+        )]
+
     if action == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
         return _option_pair_rows(
             item,
@@ -412,21 +456,6 @@ def _advice_execution_rows(item, include_etf=True):
         )
 
     if action in {
-        "DELTA_HEDGE",
-        "FINAL_DELTA_HEDGE",
-        etf_netting.NETTED_ETF_HEDGE_ACTION,
-    }:
-        if not include_etf:
-            return []
-        trade_qty = item.get("trade_etf_qty")
-        return [_execution_row(
-            item.get("underlying_order_book_id"),
-            _trade_direction(trade_qty),
-            abs(float(trade_qty or 0.0)),
-            item.get("estimated_price"),
-        )]
-
-    if action in {
         "ATM_STRADDLE_DELTA_REBALANCE",
         "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
         "ATM_STRADDLE_SHAPE_REBALANCE",
@@ -462,6 +491,19 @@ def _advice_execution_rows(item, include_etf=True):
         ]
             if (_number(row.get("数量")) or 0.0) > 0
         ]
+
+    if action in etf_netting.ETF_HEDGE_ACTIONS | {
+        etf_netting.NETTED_ETF_HEDGE_ACTION,
+    }:
+        if not include_etf:
+            return []
+        trade_qty = item.get("trade_etf_qty")
+        return [_execution_row(
+            item.get("underlying_order_book_id"),
+            _trade_direction(trade_qty),
+            abs(float(trade_qty or 0.0)),
+            item.get("estimated_price"),
+        )]
     return []
 
 

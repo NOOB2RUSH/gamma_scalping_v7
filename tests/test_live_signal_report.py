@@ -1,6 +1,7 @@
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 
@@ -13,6 +14,39 @@ def _row_values(row):
 
 
 class LiveSignalReportTest(unittest.TestCase):
+    def test_plan_status_is_visible_in_markdown_and_terminal_summary(self):
+        payload = {
+            "plan_status": "ACTIONABLE_WITH_RESIDUAL",
+            "execution_allowed": True,
+            "advice": [
+                {
+                    "action": "RESIDUAL_RISK",
+                    "priority": "notice",
+                    "code": "DELTA_ROUNDING_RESIDUAL",
+                    "reason": "A small delta residual remains.",
+                    "blocking": False,
+                }
+            ],
+        }
+
+        terminal_lines = report.format_signal_summary(payload)
+        with TemporaryDirectory() as tmpdir, mock.patch.object(
+            report.storage,
+            "output_dir",
+            return_value=Path(tmpdir),
+        ):
+            markdown = report.write_signal_report("50etf", payload).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(
+            terminal_lines[0],
+            "plan_status=ACTIONABLE_WITH_RESIDUAL | execution_allowed=true",
+        )
+        self.assertIn("## Plan Status", markdown)
+        self.assertIn("status: ACTIONABLE_WITH_RESIDUAL", markdown)
+        self.assertIn("execution_allowed: true", markdown)
+
     def test_executable_advice_reason_is_shown_before_execution_table(self):
         payload = {
             "advice": [
@@ -68,6 +102,114 @@ class LiveSignalReportTest(unittest.TestCase):
         self.assertEqual(qty, 900.0)
         self.assertEqual(price, 4.938)
         self.assertEqual(notices, [])
+
+    def test_legacy_pre_roll_hedge_close_is_moved_after_option_roll(self):
+        payload = {
+            "product": "300etf",
+            "account": {
+                "positions": {
+                    "short": {
+                        "call_code": "OLD_CALL",
+                        "put_code": "OLD_PUT",
+                        "call_qty": 10,
+                        "put_qty": 10,
+                    }
+                },
+                "hedge": {
+                    "underlying_order_book_id": "510300.XSHG",
+                    "qty": 12_600,
+                },
+            },
+            "account_greeks": {
+                "delta": -50_095.58289447949,
+                "gamma": -213_824.0,
+                "vega": -971.0,
+                "theta": 369.0,
+            },
+            "planned_account_greeks": {
+                "delta": 1_170.1910488991125,
+                "gamma": -265_401.0,
+                "vega": -1_226.0,
+                "theta": 471.0,
+            },
+            "current_account_delta": -37_495.58289447949,
+            "planned_account_delta": 1_170.1910488991125,
+            "account_delta_after_hedge": 1_170.1910488991125,
+            "advice": [
+                {
+                    "action": "CLOSE_HEDGE_BEFORE_ROLL",
+                    "priority": "action",
+                    "reason": "Close the ETF hedge before rolling.",
+                    "current_hedge_qty": 12_600,
+                    "target_hedge_qty": 0,
+                    "trade_etf_qty": -12_600,
+                    "estimated_price": 4.786,
+                    "underlying_order_book_id": "510300.XSHG",
+                },
+                {
+                    "action": "ROLL_SHORT_STRADDLE",
+                    "priority": "action",
+                    "side": "short",
+                    "reason": "held_strike_differs_from_current_atm",
+                    "current_call_code": "OLD_CALL",
+                    "current_put_code": "OLD_PUT",
+                    "current_call_qty": 10,
+                    "current_put_qty": 10,
+                    "estimated_current_call_price": 0.2191,
+                    "estimated_current_put_price": 0.06155,
+                    "target_call_code": "NEW_CALL",
+                    "target_put_code": "NEW_PUT",
+                    "target_call_qty": 10,
+                    "target_put_qty": 10,
+                    "estimated_target_call_price": 0.1004,
+                    "estimated_target_put_price": 0.14345,
+                },
+            ],
+        }
+
+        rows, notices = report._execution_rows(payload)
+        greek_rows = report._expected_greek_target_rows(payload)
+        with TemporaryDirectory() as tmpdir, mock.patch.object(
+            report.storage,
+            "output_dir",
+            return_value=Path(tmpdir),
+        ):
+            markdown = report.write_signal_report("300etf", payload).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(
+            [row["合约代码"] for row in rows],
+            ["OLD_CALL", "OLD_PUT", "NEW_CALL", "NEW_PUT", "510300"],
+        )
+        self.assertEqual(rows[-1]["数量"], 12_600.0)
+        self.assertEqual(rows[-1]["执行后预计数量"], 0)
+        self.assertEqual(notices, [])
+        self.assertAlmostEqual(greek_rows[0]["调整前"], -37_495.58289447949)
+        self.assertAlmostEqual(greek_rows[0]["调整目标"], 1_170.1910488991125)
+        self.assertGreater(markdown.index("510300"), markdown.index("NEW_PUT"))
+
+    def test_zero_quantity_delta_hedge_is_not_shown_as_notice(self):
+        payload = {
+            "advice": [
+                {
+                    "action": "DELTA_HEDGE",
+                    "priority": "action",
+                    "reason": "Account delta exceeds tolerance.",
+                    "trade_etf_qty": 0,
+                    "target_hedge_qty": 0,
+                    "estimated_price": 8.1,
+                    "underlying_order_book_id": "510500.XSHG",
+                }
+            ]
+        }
+
+        rows, notices = report._execution_rows(payload)
+        lines = report.format_signal_summary(payload)
+
+        self.assertEqual(rows, [])
+        self.assertEqual(notices, [])
+        self.assertNotIn("Account delta exceeds tolerance.", "\n".join(lines))
 
     def test_etf_delta_hedge_shows_expected_greek_target(self):
         payload = {
@@ -234,13 +376,19 @@ class LiveSignalReportTest(unittest.TestCase):
         )
         self.assertEqual(notices, [])
 
-    def test_rebalance_greek_impact_is_aggregated_once_per_signal(self):
+    def test_rebalance_uses_planned_greeks_without_readding_action_effect(self):
         payload = {
-            "planned_account_greeks": {
+            "account_greeks": {
                 "delta": 6804.0,
                 "gamma": -276615.0,
                 "vega": -1112.0,
                 "theta": 579.0,
+            },
+            "planned_account_greeks": {
+                "delta": -5333.0,
+                "gamma": -236045.0,
+                "vega": -945.5,
+                "theta": 492.0,
             },
             "advice": [
                 {

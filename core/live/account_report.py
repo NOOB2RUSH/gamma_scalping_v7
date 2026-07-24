@@ -11,6 +11,7 @@ import pandas as pd
 
 import core
 from . import account as account_store
+from . import corporate_actions
 from . import market_data
 from . import signal_engine
 from . import storage
@@ -232,6 +233,7 @@ POSITION_COLUMNS = [
     "持仓均价",
     "开仓均价",
     "期权市值",
+    "合约乘数",
     "占用保证金",
     "持仓盈亏",
     "浮动盈亏",
@@ -488,7 +490,7 @@ def _history_rows_between_dates(frame, from_date, through_date):
 
 def _restore_position_history_from_total(product, account_id, position_report):
     config = load_product_config(product)
-    multiplier = float(config.vol.contract_multiplier)
+    multiplier_default = float(config.vol.contract_multiplier)
     spots = {}
     for _, report_row in position_report.iterrows():
         if pd.isna(report_row.get("到期日")):
@@ -500,6 +502,11 @@ def _restore_position_history_from_total(product, account_id, position_report):
         report_date = str(pd.Timestamp(report_row.get("日期")).date())
         report_row["_恢复标的价格"] = spots.get(report_date)
         is_option = pd.notna(report_row.get("到期日"))
+        multiplier = (
+            _number(report_row.get("合约乘数")) or multiplier_default
+            if is_option
+            else 1.0
+        )
         side = (
             "short"
             if str(report_row.get("交易方向")) == "空"
@@ -532,6 +539,7 @@ def _restore_position_history_from_total(product, account_id, position_report):
                 if latest is None
                 else latest * qty * (multiplier if is_option else 1.0)
             ),
+            "合约乘数": multiplier if is_option else None,
             "占用保证金": None,
             "持仓盈亏": report_row.get("持仓盈亏"),
             "浮动盈亏": (
@@ -586,7 +594,9 @@ def _restore_option_position_greeks(row, report_row, config):
     )
     greeks = core.vol_engine.add_greeks_for_day(chain, spot).iloc[0]
     direction = -1.0 if row["方向"] == "short" else 1.0
-    scale = direction * qty * float(config.vol.contract_multiplier)
+    scale = direction * qty * float(
+        _number(row.get("合约乘数")) or config.vol.contract_multiplier
+    )
     row["行权价"] = strike
     row["剩余天数"] = dte
     row["单张Delta"] = direction * float(greeks["delta"])
@@ -911,10 +921,17 @@ def write_live_account_report(product, payload, mode="default"):
 def _daily_report_frames(payload, mode="default"):
     report_date = str(payload["date"])
     frames = _report_frames(payload, mode=mode)
-    return {
+    daily = {
         sheet_name: _rows_for_report_date(frame, report_date)
         for sheet_name, frame in frames.items()
     }
+    note = _dividend_report_note(payload)
+    summary = daily.get("账户总体情况")
+    if note and isinstance(summary, pd.DataFrame) and not summary.empty:
+        summary = summary.copy()
+        summary["备注"] = note
+        daily["账户总体情况"] = summary
+    return daily
 
 
 def _append_daily_frames_to_total_report(
@@ -1172,6 +1189,9 @@ def format_terminal_summary(payload, mode="default"):
             f"Theta={_fmt(summary.get('单日ThetaPnL'))}"
         ),
     ]
+    dividend_note = _dividend_report_note(payload)
+    if dividend_note:
+        lines.insert(3, f"备注: {dividend_note}")
     if mode == "diagnose":
         lines.extend(
             [
@@ -1471,8 +1491,15 @@ def _summary_aum_by_date(payload):
         for column in ("账户ID", "方向", "行权价", "到期日")
         if column in option_rows.columns
     ]
+    multiplier_default = _contract_multiplier(payload.get("product"))
+    option_rows["_aum_multiplier"] = (
+        pd.to_numeric(option_rows["合约乘数"], errors="coerce")
+        if "合约乘数" in option_rows.columns
+        else pd.Series(multiplier_default, index=option_rows.index)
+    ).fillna(multiplier_default)
+    option_rows["_aum_capacity"] = option_rows["_aum_qty"] * option_rows["_aum_multiplier"]
     capacity = (
-        option_rows.groupby(group_columns, dropna=False)["_aum_qty"]
+        option_rows.groupby(group_columns, dropna=False)["_aum_capacity"]
         .max()
         .groupby(level=0)
         .sum()
@@ -1501,12 +1528,23 @@ def _summary_aum_by_date(payload):
     if current_spot is not None:
         spots.setdefault(report_date, current_spot)
 
-    multiplier = _contract_multiplier(payload.get("product"))
-    return {
-        date: float(qty) * float(multiplier) * float(spots[date])
-        for date, qty in capacity.items()
-        if date in spots and float(qty) > 0
+    result = {
+        date: float(value) * float(spots[date])
+        for date, value in capacity.items()
+        if date in spots and float(value) > 0
     }
+    if report_date not in result:
+        has_option_trade = any(
+            str(row.get("日期")) == report_date
+            and str(_security_code(row.get("合约代码")) or "").startswith("100")
+            for row in payload.get("trade_rows", [])
+        )
+        prior_dates = sorted(date for date in result if date < report_date)
+        if has_option_trade and prior_dates:
+            # A closing day still consumed the opening option capacity even if
+            # the end-of-day position snapshot is empty.
+            result[report_date] = result[prior_dates[-1]]
+    return result
 
 
 def _daily_pnl_aum_ratio(frame, aum_by_date=None, position_report=None):
@@ -1569,6 +1607,64 @@ def _apply_current_pnl_decomposition(payload):
         }
     )
     return totals
+
+
+def _current_dividend_receivable(payload):
+    distribution = corporate_actions.cash_distribution_per_share(
+        payload.get("product"),
+        payload.get("date"),
+    )
+    if abs(distribution) <= 1e-12:
+        return 0.0
+    history = payload.get("position_history")
+    if not isinstance(history, pd.DataFrame) or history.empty:
+        return 0.0
+    dates = pd.to_datetime(history.get("日期"), errors="coerce")
+    report_date = pd.Timestamp(payload.get("date")).normalize()
+    account_mask = history.get("账户ID", pd.Series("", index=history.index)).astype(
+        str
+    ).eq(str(payload.get("account_id")))
+    prior = history.loc[account_mask & dates.lt(report_date)].copy()
+    if prior.empty:
+        return 0.0
+    previous_date = pd.to_datetime(prior["日期"], errors="coerce").max()
+    prior = prior.loc[pd.to_datetime(prior["日期"], errors="coerce").eq(previous_date)]
+    hedge = prior.loc[prior["方向"].astype(str).str.lower().eq("hedge")]
+    quantity = sum(
+        _signed_position_qty(row.get("总持仓"), row.get("方向"))
+        for _, row in hedge.iterrows()
+    )
+    return float(quantity) * float(distribution)
+
+
+def _dividend_report_note(payload):
+    receivable = _current_dividend_receivable(payload)
+    if abs(receivable) <= 1e-9:
+        return None
+    details = corporate_actions.cash_distribution_details(
+        payload.get("product"),
+        payload.get("date"),
+    )
+    distribution = corporate_actions.cash_distribution_per_share(
+        payload.get("product"),
+        payload.get("date"),
+    )
+    quantity = receivable / distribution if abs(distribution) > 1e-12 else None
+    payment_dates = sorted(
+        {
+            str(row.get("payment_date"))
+            for row in details
+            if row.get("payment_date") is not None
+            and not pd.isna(row.get("payment_date"))
+        }
+    )
+    payment_text = ",".join(payment_dates) if payment_dates else "待确认"
+    quantity_text = f"{quantity:,.0f}" if quantity is not None else ""
+    return (
+        f"除息日确认应收股息{receivable:,.2f}元"
+        f"（登记持仓{quantity_text}份，每份{distribution:.6f}元，"
+        f"预计现金支付日{payment_text}）；已计入单日盈亏，当前尚未到账。"
+    )
 
 
 def _prefer_numeric_column(frame, preferred, fallback):
@@ -1716,6 +1812,17 @@ def _position_report_frame(payload):
     previous_codes = set(previous_code_series.dropna())
     codes = sorted(current_codes | (previous_codes & trade_codes) | trade_codes)
     current_aum_by_code = _position_aum_by_code(payload, current)
+    contract_adjustments = _option_contract_adjustments_by_code(
+        payload.get("product"),
+        payload.get("account_id"),
+        report_date,
+        previous_positions=previous,
+        current_metadata=payload.get("current_chain_metadata"),
+    )
+    cash_distribution = corporate_actions.cash_distribution_per_share(
+        payload.get("product"),
+        report_date,
+    )
 
     rows = []
     for code in codes:
@@ -1724,6 +1831,13 @@ def _position_report_frame(payload):
         trade_rows = [
             row for row in today_trades if _security_code(row.get("合约代码")) == code
         ]
+        previous_rows = _previous_rows_in_current_position_cycle(
+            payload,
+            previous_rows,
+            current_rows,
+            trade_rows,
+            report_date,
+        )
         if current_rows.empty and previous_rows.empty and not trade_rows:
             continue
         rows.append(
@@ -1734,9 +1848,168 @@ def _position_report_frame(payload):
                 previous_rows,
                 trade_rows,
                 current_aum_by_code,
+                contract_adjustments.get(code),
+                cash_distribution
+                if str(_position_rows_side(current_rows, previous_rows)).lower()
+                == "hedge"
+                else 0.0,
             )
         )
     return pd.DataFrame(rows, columns=DIAGNOSE_POSITION_REPORT_COLUMNS)
+
+
+def _previous_rows_in_current_position_cycle(
+    payload,
+    previous_rows,
+    current_rows,
+    trade_rows,
+    report_date,
+):
+    """Discard a stale same-code position after the account has been flat."""
+    if previous_rows.empty:
+        return previous_rows
+
+    side = _position_rows_side(current_rows, previous_rows)
+    if str(side or "").lower() == "hedge" and _hedge_was_flat_after_position(
+        payload,
+        previous_rows,
+        report_date,
+    ):
+        return previous_rows.iloc[0:0]
+
+    if not trade_rows:
+        return previous_rows
+    previous_signed_qty = _signed_position_qty(
+        _rows_total_qty(previous_rows),
+        _first_value(previous_rows, "方向"),
+    )
+    current_signed_qty = _signed_position_qty(
+        _rows_total_qty(current_rows),
+        _first_value(current_rows, "方向") or side,
+    )
+    trade_signed_qty = sum(_trade_signed_position_qty(row) for row in trade_rows)
+    flat_start_matches = math.isclose(
+        current_signed_qty,
+        trade_signed_qty,
+        abs_tol=1e-6,
+    )
+    carry_start_matches = math.isclose(
+        current_signed_qty,
+        previous_signed_qty + trade_signed_qty,
+        abs_tol=1e-6,
+    )
+    if flat_start_matches and not carry_start_matches:
+        return previous_rows.iloc[0:0]
+    return previous_rows
+
+
+def _hedge_was_flat_after_position(payload, previous_rows, report_date):
+    summary_history = payload.get("summary_history")
+    if (
+        not isinstance(summary_history, pd.DataFrame)
+        or summary_history.empty
+        or "日期" not in summary_history.columns
+        or "对冲持仓" not in summary_history.columns
+        or "日期" not in previous_rows.columns
+    ):
+        return False
+    previous_dates = pd.to_datetime(previous_rows["日期"], errors="coerce").dropna()
+    if previous_dates.empty:
+        return False
+    dates = pd.to_datetime(summary_history["日期"], errors="coerce")
+    report_timestamp = pd.Timestamp(report_date)
+    between = dates.gt(previous_dates.max()) & dates.lt(report_timestamp)
+    quantities = pd.to_numeric(
+        summary_history.loc[between, "对冲持仓"],
+        errors="coerce",
+    ).dropna()
+    return bool(quantities.abs().le(1e-9).any())
+
+
+def _position_rows_side(current_rows, previous_rows):
+    side = _first_value(current_rows, "方向")
+    return side if side is not None else _first_value(previous_rows, "方向")
+
+
+def _option_contract_adjustments_by_code(
+    product,
+    account_id,
+    report_date,
+    previous_positions=None,
+    current_metadata=None,
+):
+    if product is None or account_id is None:
+        return {}
+    result = {}
+    for row in account_store.list_fills(
+        product,
+        account_id=str(account_id),
+        include_voided=False,
+        order="asc",
+    ):
+        fill = _supported_fill(row["payload"])
+        if fill is None or fill.get("action") != "option_contract_adjustment":
+            continue
+        if str(fill.get("date")) != str(report_date):
+            continue
+        for leg in ("call", "put"):
+            code = _security_code(fill.get(f"{leg}_code"))
+            if code is not None:
+                result[code] = fill
+
+    previous_positions = (
+        previous_positions
+        if isinstance(previous_positions, pd.DataFrame)
+        else pd.DataFrame()
+    )
+    if previous_positions.empty:
+        return result
+    if current_metadata is None:
+        codes = {
+            _security_code(value)
+            for value in previous_positions.get("合约代码", pd.Series(dtype=object))
+        }
+        current_metadata = _option_metadata_from_quote_snapshot(
+            product,
+            report_date,
+            codes,
+        )
+    current_metadata = current_metadata or {}
+    multiplier_default = _contract_multiplier(product)
+    for _, previous in previous_positions.iterrows():
+        if str(previous.get("方向") or "").lower() == "hedge":
+            continue
+        code = _security_code(previous.get("合约代码"))
+        metadata = current_metadata.get(code, {})
+        if code is None or not metadata or code in result:
+            continue
+        old_multiplier = _number(previous.get("合约乘数")) or multiplier_default
+        new_multiplier = _number(metadata.get("contract_multiplier")) or old_multiplier
+        old_strike = _number(previous.get("行权价"))
+        new_strike = _number(metadata.get("strike_price"))
+        symbol = str(metadata.get("contract_symbol") or "").upper()
+        terms_changed = (
+            not math.isclose(old_multiplier, new_multiplier, abs_tol=1e-9)
+            or (
+                old_strike is not None
+                and new_strike is not None
+                and not math.isclose(old_strike, new_strike, abs_tol=1e-9)
+            )
+        )
+        adjusted_contract = symbol.endswith("A") or "调整" in symbol
+        if not terms_changed and not adjusted_contract:
+            continue
+        result[code] = {
+            "action": "inferred_option_contract_adjustment",
+            "date": str(report_date),
+            "old_strike": old_strike,
+            "new_strike": new_strike,
+            "old_contract_multiplier": old_multiplier,
+            "new_contract_multiplier": new_multiplier,
+            "adjustment_price_ratio": old_multiplier / new_multiplier,
+            "source": "current_quote_terms",
+        }
+    return result
 
 
 def _position_report_row(
@@ -1746,6 +2019,8 @@ def _position_report_row(
     previous_rows,
     trade_rows,
     current_aum_by_code=None,
+    contract_adjustment=None,
+    cash_distribution_per_unit=0.0,
 ):
     reference = (
         current_rows.iloc[0]
@@ -1775,16 +2050,30 @@ def _position_report_row(
     if holding_cost is None:
         holding_cost = _weighted_trade_open_price(trade_rows)
     multiplier = _number(metadata.get("contract_multiplier")) if is_option else 1.0
+    if is_option and multiplier is None and contract_adjustment is not None:
+        multiplier = _number(contract_adjustment.get("new_contract_multiplier"))
+    previous_price = _first_value(previous_rows, "最新价")
+    previous_cost = _weighted_position_value(previous_rows, "持仓均价")
+    if contract_adjustment is not None:
+        ratio = _number(contract_adjustment.get("adjustment_price_ratio"))
+        if ratio is not None and ratio > 0:
+            previous_price = (
+                None if previous_price is None else float(previous_price) * ratio
+            )
+            previous_cost = (
+                None if previous_cost is None else float(previous_cost) * ratio
+            )
     pnl_breakdown = _daily_position_pnl_breakdown(
         current_qty=current_qty,
         current_side=side,
         current_price=latest_price,
         previous_qty=previous_qty,
         previous_side=_first_value(previous_rows, "方向"),
-        previous_price=_first_value(previous_rows, "最新价"),
-        previous_cost=_weighted_position_value(previous_rows, "持仓均价"),
+        previous_price=previous_price,
+        previous_cost=previous_cost,
         trade_rows=trade_rows,
         multiplier=multiplier or 1.0,
+        cash_distribution_per_unit=cash_distribution_per_unit,
     )
     if pnl_breakdown["ending_cost"] is not None and current_qty != 0:
         holding_cost = pnl_breakdown["ending_cost"]
@@ -1839,6 +2128,7 @@ def _position_report_row(
         "日期": payload["date"],
         "合约代码": code,
         "合约名称": contract_name,
+        "合约乘数": multiplier if is_option else None,
         "交易方向": "空" if direction_sign < 0 else "多",
         "总持仓张数": current_qty,
         "今日变化": current_qty - previous_qty,
@@ -1852,6 +2142,8 @@ def _position_report_row(
             (current_aum_by_code or {}).get(code)
             if (current_aum_by_code or {}).get(code) is not None
             else _first_value(current_rows, "AUM")
+            if _first_value(current_rows, "AUM") is not None
+            else _first_value(previous_rows, "AUM")
         ),
         "到期日": metadata.get("maturity_date") if is_option else None,
         "IV": current_iv if use_current_greeks else metadata.get("iv") if is_option else None,
@@ -1876,7 +2168,7 @@ def _position_aum_by_code(payload, rows):
     spot = _number(payload.get("spot"))
     if spot is None:
         return {}
-    multiplier = _contract_multiplier(payload.get("product"))
+    multiplier_default = _contract_multiplier(payload.get("product"))
     option_rows = rows.copy()
     if "到期日" not in option_rows.columns or "行权价" not in option_rows.columns:
         return {}
@@ -1888,13 +2180,19 @@ def _position_aum_by_code(payload, rows):
     option_rows["_qty_abs"] = (
         pd.to_numeric(option_rows["总持仓"], errors="coerce").fillna(0.0).abs()
     )
+    option_rows["_contract_multiplier"] = (
+        pd.to_numeric(option_rows["合约乘数"], errors="coerce")
+        if "合约乘数" in option_rows.columns
+        else pd.Series(multiplier_default, index=option_rows.index)
+    ).fillna(multiplier_default)
     result = {}
     for _, group in option_rows.groupby(
         ["账户ID", "方向", "行权价", "到期日"],
         dropna=False,
         sort=False,
     ):
-        aum = float(group["_qty_abs"].max()) * float(multiplier) * float(spot)
+        capacity = (group["_qty_abs"] * group["_contract_multiplier"]).max()
+        aum = float(capacity) * float(spot)
         for code in group["合约代码"]:
             result[_security_code(code)] = aum
     return result
@@ -1910,6 +2208,7 @@ def _daily_position_pnl_breakdown(
     previous_cost,
     trade_rows,
     multiplier,
+    cash_distribution_per_unit=0.0,
 ):
     current_price = _number(current_price)
     previous_price = _number(previous_price)
@@ -1927,6 +2226,9 @@ def _daily_position_pnl_breakdown(
             * (float(current_price) - float(previous_price))
             * multiplier
         )
+    holding_pnl += previous_signed_qty * float(
+        _number(cash_distribution_per_unit) or 0.0
+    )
 
     for trade in sorted(trade_rows, key=_trade_sort_key):
         trade_price = _number(trade.get("成交价格"))
@@ -1934,16 +2236,27 @@ def _daily_position_pnl_breakdown(
         if trade_price is None or trade_signed_qty == 0:
             continue
 
-        if current_price is not None:
-            transaction_pnl += (
-                trade_signed_qty
-                * (float(current_price) - float(trade_price))
-                * multiplier
-            )
-
         remaining_trade_qty = trade_signed_qty
+        close_qty = 0.0
         if total_signed_qty != 0 and total_signed_qty * trade_signed_qty < 0:
             close_qty = min(abs(total_signed_qty), abs(trade_signed_qty))
+            closed_signed_qty = math.copysign(close_qty, total_signed_qty)
+            realized = _number(trade.get("平仓盈亏"))
+            if realized is not None:
+                closed_holding_pnl = 0.0
+                if current_price is not None and previous_price is not None:
+                    closed_holding_pnl = (
+                        closed_signed_qty
+                        * (float(current_price) - float(previous_price))
+                        * multiplier
+                    )
+                transaction_pnl += float(realized) - closed_holding_pnl
+            elif current_price is not None:
+                transaction_pnl += (
+                    -closed_signed_qty
+                    * (float(current_price) - float(trade_price))
+                    * multiplier
+                )
             total_signed_qty -= np.sign(total_signed_qty) * close_qty
             remaining_trade_qty += np.sign(trade_signed_qty) * -close_qty
             if abs(total_signed_qty) <= 1e-9:
@@ -1951,6 +2264,12 @@ def _daily_position_pnl_breakdown(
                 total_cost = None
 
         if abs(remaining_trade_qty) > 1e-9:
+            if current_price is not None:
+                transaction_pnl += (
+                    remaining_trade_qty
+                    * (float(current_price) - float(trade_price))
+                    * multiplier
+                )
             total_cost = _weighted_signed_cost(
                 total_signed_qty,
                 total_cost,
@@ -2159,6 +2478,7 @@ def _account_leg_row(report_date, account_id, side, position, row, leg, greeks):
             * position.get(qty_key)
             * position.get("contract_multiplier")
         ),
+        "合约乘数": multiplier,
         "占用保证金": position.get("option_margin") if leg == "call" else None,
         "持仓盈亏": None,
         "浮动盈亏": None,
@@ -2478,6 +2798,11 @@ def _add_summary_greeks_pnl(
         current_position_report,
         product,
     )
+    result = _override_corporate_action_option_greeks_with_full_revaluation(
+        result,
+        position_history,
+        product,
+    )
     result = _refresh_summary_pnl_reconciliation_residual(result)
     result = result.sort_values(["日期", "账户ID"]).reset_index(drop=True)
     return result.reindex(columns=SUMMARY_COLUMNS)
@@ -2594,6 +2919,258 @@ def _override_vega_pnl_with_same_contract_iv(
     return result
 
 
+def _override_corporate_action_option_greeks_with_full_revaluation(
+    summary_history,
+    position_history,
+    product,
+):
+    """Use exact endpoint repricing on ex-dividend contract-adjustment days.
+
+    The ordinary report uses previous-close Taylor Greeks.  An exchange
+    contract adjustment changes strike, multiplier and the comparable spot at
+    the same time, making that approximation unnecessarily noisy.  This
+    routine keeps the existing four PnL buckets but makes their sum equal the
+    model endpoint revaluation of the previous option positions.
+    """
+    if (
+        product is None
+        or summary_history is None
+        or summary_history.empty
+        or position_history is None
+        or position_history.empty
+    ):
+        return summary_history
+    result = summary_history.copy().sort_values(["账户ID", "日期"])
+    for _, indexes in result.groupby("账户ID", dropna=False, sort=False).groups.items():
+        ordered = list(indexes)
+        for offset, current_index in enumerate(ordered):
+            if offset == 0:
+                continue
+            current = result.loc[current_index]
+            previous = result.loc[ordered[offset - 1]]
+            current_date = str(current.get("日期"))
+            distribution = corporate_actions.cash_distribution_per_share(
+                product,
+                current_date,
+            )
+            if abs(distribution) <= 1e-12:
+                continue
+            previous_spot = _number(previous.get("标的价格"))
+            current_spot = _number(current.get("标的价格"))
+            if previous_spot is None or current_spot is None:
+                continue
+            account_id = str(current.get("账户ID"))
+            previous_positions = _option_position_rows_for_intraday(
+                position_history,
+                str(previous.get("日期")),
+                account_id,
+            )
+            if previous_positions.empty:
+                continue
+            adjustments = _option_contract_adjustments_by_code(
+                product,
+                account_id,
+                current_date,
+                previous_positions=previous_positions,
+            )
+            parts = _corporate_action_option_revaluation_parts(
+                product,
+                current_date,
+                previous_spot,
+                current_spot,
+                distribution,
+                previous_positions,
+                adjustments,
+            )
+            if parts is None:
+                continue
+            for column, key in (
+                ("期权单日DeltaPnL", "delta_pnl"),
+                ("期权单日GammaPnL", "gamma_pnl"),
+                ("期权单日VegaPnL", "vega_pnl"),
+                ("期权单日ThetaPnL", "theta_pnl"),
+            ):
+                result.at[current_index, column] = parts[key]
+            option_total = sum(parts.values())
+            hedge_total = _number(result.at[current_index, "对冲单日GreeksPnL"]) or 0.0
+            transaction_total = _number(result.at[current_index, "交易GreeksPnL"]) or 0.0
+            result.at[current_index, "期权单日GreeksPnL"] = option_total
+            result.at[current_index, "昨仓GreeksPnL"] = option_total + hedge_total
+            result.at[current_index, "单日DeltaPnL"] = (
+                parts["delta_pnl"]
+                + (_number(result.at[current_index, "对冲单日DeltaPnL"]) or 0.0)
+                + (_number(result.at[current_index, "交易DeltaPnL"]) or 0.0)
+            )
+            for option_column, transaction_column, total_column in (
+                ("gamma_pnl", "交易GammaPnL", "单日GammaPnL"),
+                ("vega_pnl", "交易VegaPnL", "单日VegaPnL"),
+                ("theta_pnl", "交易ThetaPnL", "单日ThetaPnL"),
+            ):
+                result.at[current_index, total_column] = parts[option_column] + (
+                    _number(result.at[current_index, transaction_column]) or 0.0
+                )
+            result.at[current_index, "单日GreeksPnL"] = (
+                option_total + hedge_total + transaction_total
+            )
+            result.at[current_index, "GreeksPnL说明"] = (
+                "corporate_action_full_revaluation_plus_intraday_trades"
+                if abs(transaction_total) > 1e-9
+                else "corporate_action_full_revaluation"
+            )
+    return result
+
+
+def _corporate_action_option_revaluation_parts(
+    product,
+    report_date,
+    previous_spot,
+    current_spot,
+    distribution,
+    previous_positions,
+    adjustments,
+):
+    parts = {key: 0.0 for key in ("delta_pnl", "gamma_pnl", "vega_pnl", "theta_pnl")}
+    config = load_product_config(product)
+    comparable_previous_spot = float(previous_spot) - float(distribution)
+    if comparable_previous_spot <= 0:
+        return None
+    matched = False
+    for _, previous_position in previous_positions.iterrows():
+        code = _security_code(previous_position.get("合约代码"))
+        adjustment = adjustments.get(code)
+        if code is None or adjustment is None:
+            return None
+        previous_price = _number(previous_position.get("最新价"))
+        old_multiplier = _number(previous_position.get("合约乘数")) or _contract_multiplier(product)
+        new_multiplier = (
+            _number(adjustment.get("new_contract_multiplier")) or old_multiplier
+        )
+        new_strike = _number(adjustment.get("new_strike"))
+        if new_strike is None:
+            metadata = _option_metadata_from_quote_snapshot(
+                product,
+                report_date,
+                {code},
+            ).get(code, {})
+            new_strike = _number(metadata.get("strike_price"))
+        current_price = _option_close_price_from_quote_snapshot(
+            product,
+            report_date,
+            code,
+        )
+        if previous_price is None or new_strike is None or current_price is None:
+            return None
+        leg = _position_row_leg(previous_position)
+        flag = "c" if leg == "Call" else "p" if leg == "Put" else None
+        if flag is None:
+            return None
+        qty = abs(_number(previous_position.get("总持仓")) or 0.0)
+        direction = (
+            -1.0
+            if str(previous_position.get("方向") or "").lower() == "short"
+            else 1.0
+        )
+        previous_dte = _option_close_dte(
+            product,
+            str(previous_position.get("日期")),
+            {"previous": previous_position},
+            previous_position,
+        )
+        current_dte = _option_close_dte(
+            product,
+            report_date,
+            {"previous": previous_position},
+            previous_position,
+        )
+        if previous_dte is None or current_dte is None or current_dte <= 0:
+            return None
+        adjusted_row = previous_position.copy()
+        adjusted_row["行权价"] = new_strike
+        adjusted_price = float(previous_price) * float(old_multiplier) / float(new_multiplier)
+        start = _option_greeks_for_dte(
+            product,
+            adjusted_row,
+            adjusted_price,
+            comparable_previous_spot,
+            flag,
+            direction * qty,
+            previous_dte,
+            fallback_iv=_number(previous_position.get("IV")),
+            contract_multiplier=new_multiplier,
+        )
+        end = _option_greeks_for_dte(
+            product,
+            adjusted_row,
+            current_price,
+            current_spot,
+            flag,
+            direction * qty,
+            current_dte,
+            fallback_iv=None,
+            contract_multiplier=new_multiplier,
+        )
+        if start is None or end is None:
+            return None
+        start_ttm = float(previous_dte) / float(config.vol.annual_days)
+        end_ttm = float(current_dte) / float(config.vol.annual_days)
+        rate = float(config.vol.risk_free_rate)
+        spot_price = _black_scholes_price(
+            flag,
+            current_spot,
+            new_strike,
+            start_ttm,
+            rate,
+            start["iv"],
+        )
+        time_price = _black_scholes_price(
+            flag,
+            current_spot,
+            new_strike,
+            end_ttm,
+            rate,
+            start["iv"],
+        )
+        if spot_price is None or time_price is None:
+            return None
+        scale = direction * qty * float(new_multiplier)
+        spot_change = float(current_spot) - comparable_previous_spot
+        delta_pnl = start["delta"] * spot_change
+        exact_spot_pnl = scale * (spot_price - adjusted_price)
+        parts["delta_pnl"] += delta_pnl
+        parts["gamma_pnl"] += exact_spot_pnl - delta_pnl
+        parts["theta_pnl"] += scale * (time_price - spot_price)
+        parts["vega_pnl"] += scale * (float(current_price) - time_price)
+        matched = True
+    return parts if matched else None
+
+
+def _black_scholes_price(flag, spot, strike, ttm, rate, sigma):
+    values = [spot, strike, ttm, sigma]
+    if any(_number(value) is None for value in values):
+        return None
+    spot = float(spot)
+    strike = float(strike)
+    ttm = float(ttm)
+    sigma = float(sigma)
+    rate = float(rate)
+    if spot <= 0 or strike <= 0 or sigma <= 0:
+        return None
+    if ttm <= 0:
+        return max(spot - strike, 0.0) if flag == "c" else max(strike - spot, 0.0)
+    root_t = math.sqrt(ttm)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * sigma * sigma) * ttm) / (
+        sigma * root_t
+    )
+    d2 = d1 - sigma * root_t
+    normal_cdf = lambda value: 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+    discount = math.exp(-rate * ttm)
+    if flag == "c":
+        return spot * normal_cdf(d1) - strike * discount * normal_cdf(d2)
+    if flag == "p":
+        return strike * discount * normal_cdf(-d2) - spot * normal_cdf(-d1)
+    return None
+
+
 def _refresh_summary_pnl_reconciliation_residual(summary_history):
     if summary_history is None or summary_history.empty:
         return summary_history
@@ -2618,7 +3195,16 @@ def _close_snapshot_option_daily_pnl(
     if previous_positions.empty and current_positions.empty:
         return None
 
-    multiplier = _contract_multiplier(product)
+    multiplier_default = _contract_multiplier(product)
+    account_id = _first_value(current_positions, "账户ID")
+    if account_id is None:
+        account_id = _first_value(previous_positions, "账户ID")
+    adjustments = _option_contract_adjustments_by_code(
+        product,
+        account_id,
+        report_date,
+        previous_positions=previous_positions,
+    )
     previous_quantities = _signed_option_quantities(previous_positions)
     remaining_previous_quantities = dict(previous_quantities)
     previous_prices = {}
@@ -2626,6 +3212,14 @@ def _close_snapshot_option_daily_pnl(
         code = _security_code(row.get("合约代码"))
         price = _number(row.get("最新价"))
         if code is not None and price is not None:
+            adjustment = adjustments.get(code)
+            ratio = (
+                _number(adjustment.get("adjustment_price_ratio"))
+                if adjustment is not None
+                else None
+            )
+            if ratio is not None and ratio > 0:
+                price *= ratio
             previous_prices[code] = price
 
     current_marks = {}
@@ -2634,6 +3228,22 @@ def _close_snapshot_option_daily_pnl(
         price = _number(row.get("最新价"))
         if code is not None and price is not None:
             current_marks[code] = price
+
+    multipliers = {}
+    for frame in (current_positions, previous_positions):
+        for _, row in frame.iterrows():
+            code = _security_code(row.get("合约代码"))
+            if code is None:
+                continue
+            multiplier = _number(row.get("合约乘数"))
+            if multiplier is not None:
+                multipliers[code] = multiplier
+    for code, adjustment in adjustments.items():
+        multipliers[code] = (
+            _number(adjustment.get("new_contract_multiplier"))
+            or multipliers.get(code)
+            or multiplier_default
+        )
 
     option_trades = [
         row
@@ -2670,7 +3280,9 @@ def _close_snapshot_option_daily_pnl(
                     if previous_price is None:
                         return None
                     close_trade_pnl += (
-                        closed_qty * (float(price) - float(previous_price)) * multiplier
+                        closed_qty
+                        * (float(price) - float(previous_price))
+                        * multipliers.get(code, multiplier_default)
                     )
         closed_qty = _closed_signed_quantity(remaining_qty, signed_trade_qty)
         if abs(closed_qty) > 1e-9:
@@ -2684,7 +3296,11 @@ def _close_snapshot_option_daily_pnl(
         current_price = current_marks.get(code)
         if previous_price is None or current_price is None:
             return None
-        holding_pnl += qty * (float(current_price) - float(previous_price)) * multiplier
+        holding_pnl += (
+            qty
+            * (float(current_price) - float(previous_price))
+            * multipliers.get(code, multiplier_default)
+        )
 
     return float(holding_pnl + close_trade_pnl)
 
@@ -2787,6 +3403,48 @@ def _option_price_from_quote_snapshot(product, report_date, code, timestamp):
     return bid if bid is not None and bid > 0 else ask
 
 
+def _option_metadata_from_quote_snapshot(product, report_date, codes):
+    codes = {_security_code(code) for code in codes if _security_code(code) is not None}
+    if product is None or not codes:
+        return {}
+    root = (
+        storage.PROJECT_ROOT
+        / "data"
+        / "live"
+        / product
+        / "quotes"
+        / pd.Timestamp(report_date).strftime("%Y%m%d")
+    )
+    if not root.exists():
+        return {}
+    candidates = []
+    for path in root.glob("*_option_chain.parquet"):
+        prefix = path.name.split("_", 1)[0]
+        if re.fullmatch(r"\d{6}", prefix):
+            candidates.append((prefix, path))
+    if not candidates:
+        return {}
+    try:
+        frame = pd.read_parquet(sorted(candidates, key=lambda item: item[0])[-1][1])
+    except Exception:
+        return {}
+    if frame.empty or "order_book_id" not in frame.columns:
+        return {}
+    result = {}
+    for _, row in frame.iterrows():
+        code = _security_code(row.get("order_book_id"))
+        if code not in codes:
+            continue
+        result[code] = {
+            "contract_symbol": row.get("contract_symbol"),
+            "strike_price": row.get("strike_price"),
+            "contract_multiplier": row.get("contract_multiplier"),
+            "close": _option_mark_from_chain_row(row),
+            "maturity_date": row.get("maturity_date"),
+        }
+    return result
+
+
 def _option_greeks_for_dte(
     product,
     row,
@@ -2796,6 +3454,7 @@ def _option_greeks_for_dte(
     signed_qty,
     dte,
     fallback_iv=None,
+    contract_multiplier=None,
 ):
     strike = _number(row.get("行权价"))
     if strike is None or strike <= 0:
@@ -2843,7 +3502,9 @@ def _option_greeks_for_dte(
         theta_365 = float(vollib["theta"](**kwargs).iloc[0])
     except Exception:
         return None
-    scale = float(signed_qty) * _contract_multiplier(product)
+    scale = float(signed_qty) * float(
+        contract_multiplier or _contract_multiplier(product)
+    )
     theta = theta_365 * (365.0 / float(config.vol.annual_days))
     return {
         "iv": float(iv),
@@ -3014,11 +3675,17 @@ def _add_summary_greeks_pnl_for_account(
     )
     hedge_mark = _numeric_series(group, "对冲最新价")
     hedge_qty = _numeric_series(group, "对冲持仓").fillna(0.0)
+    cash_distribution = corporate_actions.cash_distribution_series(
+        product,
+        group["日期"],
+    )
+    dividend_receivable = hedge_qty.shift(1).fillna(0.0) * cash_distribution
     etf_actual_pnl = _previous_close_hedge_pnl_series(
         raw_etf_actual_pnl,
         spot,
         hedge_mark,
         hedge_qty,
+        cash_distribution=cash_distribution,
     )
     call_iv = _numeric_series(group, "Call IV")
     put_iv = _numeric_series(group, "Put IV")
@@ -3031,40 +3698,47 @@ def _add_summary_greeks_pnl_for_account(
     call_theta = _numeric_series(group, "Call Theta")
     put_theta = _numeric_series(group, "Put Theta")
 
-    spot_chg = spot.diff()
-    option_explainable = (
-        spot.shift(1).notna()
-        & call_iv.shift(1).notna()
-        & put_iv.shift(1).notna()
-        & call_iv.notna()
-        & put_iv.notna()
+    spot_chg = spot.diff() + cash_distribution
+    delta_explainable = spot.shift(1).notna() & (
+        call_delta.shift(1).notna() | put_delta.shift(1).notna()
+    )
+    gamma_explainable = spot.shift(1).notna() & (
+        call_gamma.shift(1).notna() | put_gamma.shift(1).notna()
+    )
+    vega_explainable = (
+        (call_vega.shift(1).notna() & call_iv.shift(1).notna() & call_iv.notna())
+        | (put_vega.shift(1).notna() & put_iv.shift(1).notna() & put_iv.notna())
+    )
+    theta_explainable = spot.shift(1).notna() & (
+        call_theta.shift(1).notna() | put_theta.shift(1).notna()
     )
 
     option_delta_pnl = (
-        call_delta.shift(1)
-        + put_delta.shift(1)
+        call_delta.shift(1).fillna(0.0)
+        + put_delta.shift(1).fillna(0.0)
     ) * spot_chg
     hedge_delta_pnl = _previous_close_hedge_pnl_series(
         raw_etf_actual_pnl,
         spot,
         hedge_mark,
         hedge_qty,
+        cash_distribution=cash_distribution,
     )
     gamma_pnl = (
         0.5
         * (
-            call_gamma.shift(1)
-            + put_gamma.shift(1)
+            call_gamma.shift(1).fillna(0.0)
+            + put_gamma.shift(1).fillna(0.0)
         )
         * spot_chg**2
     )
     vega_pnl = (
-        call_vega.shift(1) * (call_iv - call_iv.shift(1)) * 100
-        + put_vega.shift(1) * (put_iv - put_iv.shift(1)) * 100
+        call_vega.shift(1).fillna(0.0) * (call_iv - call_iv.shift(1)) * 100
+        + put_vega.shift(1).fillna(0.0) * (put_iv - put_iv.shift(1)) * 100
     )
     theta_pnl = (
-        call_theta.shift(1)
-        + put_theta.shift(1)
+        call_theta.shift(1).fillna(0.0)
+        + put_theta.shift(1).fillna(0.0)
     ) * _trading_day_steps(group["日期"], product=product)
     transaction_greeks = _transaction_greeks_pnl_series(
         product,
@@ -3073,10 +3747,10 @@ def _add_summary_greeks_pnl_for_account(
         trade_rows,
     )
 
-    group["期权单日DeltaPnL"] = option_delta_pnl.where(option_explainable, 0.0).fillna(0.0)
-    group["期权单日GammaPnL"] = gamma_pnl.where(option_explainable, 0.0).fillna(0.0)
-    group["期权单日VegaPnL"] = vega_pnl.where(option_explainable, 0.0).fillna(0.0)
-    group["期权单日ThetaPnL"] = theta_pnl.where(option_explainable, 0.0).fillna(0.0)
+    group["期权单日DeltaPnL"] = option_delta_pnl.where(delta_explainable, 0.0).fillna(0.0)
+    group["期权单日GammaPnL"] = gamma_pnl.where(gamma_explainable, 0.0).fillna(0.0)
+    group["期权单日VegaPnL"] = vega_pnl.where(vega_explainable, 0.0).fillna(0.0)
+    group["期权单日ThetaPnL"] = theta_pnl.where(theta_explainable, 0.0).fillna(0.0)
     group["期权单日GreeksPnL"] = group[
         ["期权单日DeltaPnL", "期权单日GammaPnL", "期权单日VegaPnL", "期权单日ThetaPnL"]
     ].sum(axis=1)
@@ -3480,9 +4154,22 @@ def _segmented_hedge_delta_pnl_series(product, group, spot, hedge_mark, hedge_qt
     return (hedge_qty.shift(1).fillna(0.0) * price.diff()).fillna(0.0)
 
 
-def _previous_close_hedge_pnl_series(raw_daily_pnl, spot, hedge_mark, hedge_qty):
+def _previous_close_hedge_pnl_series(
+    raw_daily_pnl,
+    spot,
+    hedge_mark,
+    hedge_qty,
+    cash_distribution=None,
+):
     price = hedge_mark.where(hedge_mark.notna(), spot)
-    result = (hedge_qty.shift(1).fillna(0.0) * price.diff()).fillna(0.0)
+    distribution = (
+        pd.to_numeric(cash_distribution, errors="coerce").fillna(0.0)
+        if cash_distribution is not None
+        else pd.Series(0.0, index=price.index)
+    )
+    result = (
+        hedge_qty.shift(1).fillna(0.0) * (price.diff() + distribution)
+    ).fillna(0.0)
     if result.empty:
         return result
     first_raw = raw_daily_pnl.iloc[0] if len(raw_daily_pnl) else np.nan
@@ -3504,7 +4191,7 @@ def _previous_close_option_pnl_series(raw_daily_pnl, group, position_history, pr
     if not required.issubset(position_history.columns):
         return result
 
-    multiplier = _contract_multiplier(product)
+    multiplier_default = _contract_multiplier(product)
     ordered = list(group.index)
     for offset, current_index in enumerate(ordered):
         if offset == 0:
@@ -3530,6 +4217,12 @@ def _previous_close_option_pnl_series(raw_daily_pnl, group, position_history, pr
             current_date,
             account_id,
         )
+        adjustments = _option_contract_adjustments_by_code(
+            product,
+            account_id,
+            current_date,
+            previous_positions=previous_positions,
+        )
 
         daily_pnl = 0.0
         matched_all = True
@@ -3549,6 +4242,16 @@ def _previous_close_option_pnl_series(raw_daily_pnl, group, position_history, pr
                 matched_all = False
                 break
             qty = abs(_number(previous_position.get("总持仓")) or 0.0)
+            adjustment = adjustments.get(code)
+            multiplier = _number(previous_position.get("合约乘数")) or multiplier_default
+            if adjustment is not None:
+                multiplier = (
+                    _number(adjustment.get("new_contract_multiplier"))
+                    or multiplier
+                )
+                ratio = _number(adjustment.get("adjustment_price_ratio"))
+                if ratio is not None and ratio > 0:
+                    previous_price *= ratio
             direction = (
                 -1.0
                 if str(previous_position.get("方向") or "").lower() == "short"
@@ -3685,7 +4388,7 @@ def _security_trade_rows_by_date(product, account_id="default"):
 def _fill_summary_leg_greeks_from_positions(summary_history, position_history, product=None):
     if position_history is None or position_history.empty:
         return summary_history
-    multiplier = _contract_multiplier(product)
+    multiplier_default = _contract_multiplier(product)
     aggregates = {}
     for _, row in position_history.iterrows():
         leg = _position_row_leg(row)
@@ -3700,6 +4403,7 @@ def _fill_summary_leg_greeks_from_positions(summary_history, position_history, p
             },
         )
         qty = abs(_number(row.get("总持仓")) or 0.0)
+        multiplier = _number(row.get("合约乘数")) or multiplier_default
         scale = qty * multiplier
         direction = -1.0 if str(row.get("方向") or "") == "short" else 1.0
         for metric in ["Delta", "Gamma", "Vega", "Theta"]:
@@ -4225,6 +4929,9 @@ def _cumulative_option_realized_pnl_for_report(product, account_id, report_date)
                 )
             positions[side] = fill
             continue
+        if action == "option_contract_adjustment":
+            positions[side] = fill
+            continue
     return realized
 
 
@@ -4432,7 +5139,7 @@ def _repair_zero_iv_position_rows_with_intraday_minutes(position_rows, product):
         qty = abs(_number(row.get("总持仓")) or 0.0)
         if qty <= 0:
             continue
-        multiplier = _contract_multiplier(product)
+        multiplier = _number(row.get("合约乘数")) or _contract_multiplier(product)
         direction = -1.0 if str(row.get("方向") or "").lower() == "short" else 1.0
         scale = direction * qty * multiplier
         result.at[index, "剩余天数"] = quote.get("dte")

@@ -60,7 +60,17 @@ def import_holding_file(
             for row in [*rows, *snapshot_rows]
         }
     )
-    metadata = _load_contract_metadata(config, codes, trade_date=trade_date)
+    adjusted_codes = {
+        row["order_book_id"]
+        for row in [*rows, *snapshot_rows]
+        if _is_adjusted_contract_name(row.get("contract_name"))
+    }
+    metadata = _load_contract_metadata(
+        config,
+        codes,
+        trade_date=trade_date,
+        adjusted_codes=adjusted_codes,
+    )
 
     warnings = []
     candidates = _build_straddle_candidates(
@@ -71,15 +81,30 @@ def import_holding_file(
         str(path),
         warnings,
     )
+    snapshot_warnings = []
     snapshot_candidates = _build_straddle_candidates(
         snapshot_rows,
         metadata,
         config,
         trade_date,
         str(path),
-        [],
+        snapshot_warnings,
     )
+    for warning in snapshot_warnings:
+        if warning not in warnings:
+            warnings.append(warning)
     local = account_store.load_account(product, account_id=account_id)
+    applied = []
+    skipped = []
+    local = _apply_contract_adjustments(
+        product,
+        account_id,
+        local,
+        snapshot_candidates,
+        source_timestamp,
+        dry_run,
+        applied,
+    )
     if not rows and not include_existing and not _local_contains_snapshot_rows(
         local,
         snapshot_rows,
@@ -96,8 +121,6 @@ def import_holding_file(
                     "total_positive_holding_qty": existing_qty,
                 }
             )
-    applied = []
-    skipped = []
     local = _apply_existing_position_rebalances(
         product,
         account_id,
@@ -130,6 +153,21 @@ def import_holding_file(
         fill = candidate["fill"]
         existing = local.positions.get(side)
         if existing is not None:
+            adjustment_fill = _contract_adjustment_fill(
+                existing,
+                fill,
+                source_timestamp,
+            )
+            if adjustment_fill is not None:
+                local = _record_or_preview_fill(
+                    product,
+                    account_id,
+                    local,
+                    adjustment_fill,
+                    dry_run,
+                    applied,
+                )
+                existing = local.positions.get(side)
             if _same_position(existing, fill):
                 skipped.append(
                     {
@@ -182,6 +220,40 @@ def import_holding_file(
         "skipped": skipped,
         "warnings": warnings,
     }
+
+
+def _apply_contract_adjustments(
+    product,
+    account_id,
+    local,
+    snapshot_candidates,
+    source_timestamp,
+    dry_run,
+    applied,
+):
+    for candidate in snapshot_candidates:
+        if candidate.get("kind") != "straddle":
+            continue
+        side = candidate["side"]
+        existing = local.positions.get(side)
+        if existing is None:
+            continue
+        adjustment_fill = _contract_adjustment_fill(
+            existing,
+            candidate["fill"],
+            source_timestamp,
+        )
+        if adjustment_fill is None:
+            continue
+        local = _record_or_preview_fill(
+            product,
+            account_id,
+            local,
+            adjustment_fill,
+            dry_run,
+            applied,
+        )
+    return local
 
 
 def _record_or_preview_fill(product, account_id, local, fill, dry_run, applied):
@@ -628,11 +700,30 @@ def _side_from_row(row):
     return "long"
 
 
-def _load_contract_metadata(config, codes, trade_date=None):
+def _load_contract_metadata(
+    config,
+    codes,
+    trade_date=None,
+    adjusted_codes=None,
+):
     opt_dir = project_path(config.data.opt_dir)
     live_quote_dir = project_path(f"data/live/{config.data.product}/quotes")
     metadata = {}
     remaining = {str(code) for code in codes}
+    adjusted_codes = {str(code) for code in (adjusted_codes or set())}
+    unresolved_adjusted = set(adjusted_codes)
+    if adjusted_codes:
+        try:
+            current = market_data.fetch_current_option_metadata(
+                config.data.product,
+                codes=adjusted_codes,
+            )
+        except Exception:
+            current = {}
+        metadata.update(current)
+        remaining.difference_update(current)
+        unresolved_adjusted.difference_update(current)
+
     paths = {
         *opt_dir.glob("*_chain.parquet"),
         *live_quote_dir.rglob("*_option_chain.parquet"),
@@ -644,7 +735,8 @@ def _load_contract_metadata(config, codes, trade_date=None):
         if "order_book_id" not in df.columns:
             continue
         df["order_book_id"] = df["order_book_id"].astype(str)
-        hit = df[df["order_book_id"].isin(remaining)]
+        eligible = remaining - unresolved_adjusted
+        hit = df[df["order_book_id"].isin(eligible)]
         for _, row in hit.iterrows():
             code = str(row["order_book_id"])
             metadata[code] = {
@@ -659,13 +751,14 @@ def _load_contract_metadata(config, codes, trade_date=None):
                 "metadata_source": "local_option_chain",
             }
             remaining.discard(code)
-    if remaining and trade_date is not None:
+    historical_remaining = remaining - unresolved_adjusted
+    if historical_remaining and trade_date is not None:
         try:
             metadata.update(
                 market_data.fetch_historical_option_metadata(
                     config.data.product,
                     trade_date,
-                    codes=remaining,
+                    codes=historical_remaining,
                 )
             )
         except Exception:
@@ -772,6 +865,8 @@ def _candidate_to_fill(side, strike, expiry, legs, config, trade_date, source_fi
         "date": trade_date,
         "call_code": call["order_book_id"],
         "put_code": put["order_book_id"],
+        "call_contract_symbol": legs["call"]["meta"].get("contract_symbol"),
+        "put_contract_symbol": legs["put"]["meta"].get("contract_symbol"),
         "strike": strike,
         "expiry": expiry,
         "call_qty": call_qty,
@@ -808,6 +903,64 @@ def _same_position(position, fill):
         and int(position.get("call_qty", 0) or 0) == int(fill.get("call_qty", 0) or 0)
         and int(position.get("put_qty", 0) or 0) == int(fill.get("put_qty", 0) or 0)
     )
+
+
+def _is_adjusted_contract_name(value):
+    text = str(value or "").strip().upper()
+    return text.endswith("A") or "\u8c03\u6574" in text
+
+
+def _contract_adjustment_fill(existing, snapshot_fill, source_timestamp):
+    if not _same_position(existing, snapshot_fill):
+        return None
+    old_multiplier = int(_number(existing.get("contract_multiplier"), 0) or 0)
+    new_multiplier = int(_number(snapshot_fill.get("contract_multiplier"), 0) or 0)
+    old_strike = _number(existing.get("strike"))
+    new_strike = _number(snapshot_fill.get("strike"))
+    if old_multiplier <= 0 or new_multiplier <= 0:
+        return None
+    multiplier_changed = old_multiplier != new_multiplier
+    strike_changed = (
+        old_strike is not None
+        and new_strike is not None
+        and abs(old_strike - new_strike) > 1e-9
+    )
+    if not multiplier_changed and not strike_changed:
+        return None
+
+    entry_price_ratio = old_multiplier / new_multiplier
+    adjusted = dict(snapshot_fill)
+    adjusted.update(
+        {
+            "action": "option_contract_adjustment",
+            "entry_date": existing.get("entry_date"),
+            "entry_call_price": float(existing.get("entry_call_price", 0.0) or 0.0)
+            * entry_price_ratio,
+            "entry_put_price": float(existing.get("entry_put_price", 0.0) or 0.0)
+            * entry_price_ratio,
+            "entry_call_volume": existing.get("entry_call_volume"),
+            "entry_put_volume": existing.get("entry_put_volume"),
+            "entry_total_volume": existing.get("entry_total_volume"),
+            "entry_option_value": float(existing.get("entry_option_value", 0.0) or 0.0),
+            "short_entry_regime": existing.get("short_entry_regime"),
+            "underlying_order_book_id": existing.get("underlying_order_book_id"),
+            "old_strike": old_strike,
+            "new_strike": new_strike,
+            "old_contract_multiplier": old_multiplier,
+            "new_contract_multiplier": new_multiplier,
+            "adjustment_price_ratio": entry_price_ratio,
+            "cash_delta": 0.0,
+            "source_timestamp": source_timestamp
+            or snapshot_fill.get("source_timestamp"),
+            "import_source": "broker_holding_contract_adjustment",
+            "source_limitations": [
+                "contract code and position quantity are unchanged",
+                "entry premiums are inversely adjusted to preserve historical cost notional",
+                "corporate action has no trade cash flow or realized pnl",
+            ],
+        }
+    )
+    return adjusted
 
 
 def _local_contains_snapshot_rows(local, rows):

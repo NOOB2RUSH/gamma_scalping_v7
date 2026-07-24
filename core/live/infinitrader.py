@@ -23,6 +23,7 @@ OFFSET_CLOSE = "1"
 ORDER_TYPE_GFD = "0"
 HEDGEFLAG_SPECULATION = "1"
 PENDING_COMMAND_FILE = "pending_command.json"
+PRE_ROLL_HEDGE_CLOSE_ACTION = etf_netting.PRE_ROLL_HEDGE_CLOSE_ACTION
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,11 @@ def _compile_advice_item(
     action = str(item.get("action") or "")
     side = str(item.get("side") or "").lower()
 
+    if action == PRE_ROLL_HEDGE_CLOSE_ACTION:
+        if not include_etf:
+            return []
+        return [_etf_order(start_sequence, action, item)]
+
     if action == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
         return _option_pair_orders(
             item,
@@ -290,6 +296,10 @@ def _fills_from_advice(
 ) -> list[dict[str, Any]]:
     action = str(item.get("action") or "")
     side = str(item.get("side") or "").lower()
+    if action == PRE_ROLL_HEDGE_CLOSE_ACTION:
+        if not include_etf:
+            return []
+        return [_delta_hedge_fill(item, date, source_file)]
     if action in {
         "DELTA_HEDGE",
         "FINAL_DELTA_HEDGE",
@@ -306,7 +316,21 @@ def _fills_from_advice(
         return [_straddle_fill(item, action.lower(), date, source_file, multiplier)]
 
     if action.startswith("CLOSE_"):
-        return [_close_straddle_fill(item, date, source_file, multiplier)]
+        fills = []
+        pre_close_adjustment = item.get("pre_close_contract_adjustment")
+        if isinstance(pre_close_adjustment, dict):
+            fills.append(
+                {
+                    **pre_close_adjustment,
+                    "action": "option_contract_adjustment",
+                    "date": date,
+                    "cash_delta": 0.0,
+                    "source_file": source_file,
+                    "import_source": "infinitrader_pre_close_contract_adjustment",
+                }
+            )
+        fills.append(_close_straddle_fill(item, date, source_file, multiplier))
+        return fills
 
     if action == "REDUCE_SHORT_STRADDLE_FOR_CAPACITY":
         fill = _rebalance_short_core_call_fill(
@@ -405,6 +429,7 @@ def _straddle_fill(item, action, date, source_file, multiplier):
 
 
 def _close_straddle_fill(item, date, source_file, multiplier):
+    contract_multiplier = float(item.get("contract_multiplier", multiplier) or multiplier)
     return {
         "action": str(item.get("action") or "").lower(),
         "date": date,
@@ -415,8 +440,12 @@ def _close_straddle_fill(item, date, source_file, multiplier):
         "put_qty": item.get("put_qty"),
         "call_price": item.get("estimated_call_price"),
         "put_price": item.get("estimated_put_price"),
-        "contract_multiplier": multiplier,
+        "contract_multiplier": contract_multiplier,
         "cash_delta": item.get("estimated_cash_effect", 0.0),
+        "exit_reason": item.get("reason"),
+        "dividend_forced_liquidation": bool(
+            item.get("dividend_forced_liquidation", False)
+        ),
         "source_file": source_file,
         "import_source": "infinitrader_command",
     }
@@ -482,7 +511,10 @@ def _atm_straddle_delta_rebalance_fill(
     multiplier,
     option_fee_per_contract,
 ):
-    position = ((signal.get("account") or {}).get("positions") or {}).get("short")
+    side = str(item.get("side") or "short").lower()
+    if side not in {"long", "short"}:
+        return None
+    position = ((signal.get("account") or {}).get("positions") or {}).get(side)
     if not position:
         return None
     close_call_qty = _int_qty(item.get("close_call_qty"))
@@ -510,13 +542,13 @@ def _atm_straddle_delta_rebalance_fill(
     fee = (
         close_call_qty + close_put_qty + open_call_qty + open_put_qty
     ) * float(option_fee_per_contract)
-    cash_delta = (
+    premium_effect = (
         open_call_qty * open_call_price * multiplier
         + open_put_qty * open_put_price * multiplier
         - close_call_qty * close_call_price * multiplier
         - close_put_qty * close_put_price * multiplier
-        - fee
     )
+    cash_delta = (premium_effect if side == "short" else -premium_effect) - fee
     leg_adjustments = [
         {
             "leg": "call",
@@ -551,7 +583,7 @@ def _atm_straddle_delta_rebalance_fill(
     return {
         "action": "rebalance_straddle_legs",
         "date": date,
-        "side": "short",
+        "side": side,
         "call_code": position.get("call_code"),
         "put_code": position.get("put_code"),
         "call_qty": target_call_qty,
@@ -589,6 +621,9 @@ def _atm_straddle_delta_rebalance_orders(
     action: str,
 ) -> list[InfiniOrder]:
     orders: list[InfiniOrder] = []
+    side = str(item.get("side") or "short").lower()
+    close_direction = BUY if side == "short" else SELL
+    open_direction = SELL if side == "short" else BUY
     close_call_qty = _int_qty(item.get("close_call_qty"))
     if close_call_qty > 0:
         orders.append(
@@ -597,7 +632,7 @@ def _atm_straddle_delta_rebalance_orders(
                 action,
                 "atm_rebalance_close_call",
                 item.get("close_call_code"),
-                BUY,
+                close_direction,
                 OFFSET_CLOSE,
                 close_call_qty,
                 item.get("estimated_close_call_price"),
@@ -611,7 +646,7 @@ def _atm_straddle_delta_rebalance_orders(
                 action,
                 "atm_rebalance_close_put",
                 item.get("close_put_code"),
-                BUY,
+                close_direction,
                 OFFSET_CLOSE,
                 close_put_qty,
                 item.get("estimated_close_put_price"),
@@ -625,7 +660,7 @@ def _atm_straddle_delta_rebalance_orders(
                 action,
                 "atm_rebalance_open_call",
                 item.get("open_call_code"),
-                SELL,
+                open_direction,
                 OFFSET_OPEN,
                 open_call_qty,
                 item.get("estimated_open_call_price"),
@@ -639,7 +674,7 @@ def _atm_straddle_delta_rebalance_orders(
                 action,
                 "atm_rebalance_open_put",
                 item.get("open_put_code"),
-                SELL,
+                open_direction,
                 OFFSET_OPEN,
                 open_put_qty,
                 item.get("estimated_open_put_price"),

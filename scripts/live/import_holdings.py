@@ -59,7 +59,16 @@ def main():
     for item in result["applied"]:
         fill = item["fill"]
         prefix = "DRY_RUN" if item["dry_run"] else "CONFIRMED"
-        if fill["action"] == "option_mark_update":
+        if fill["action"] == "option_contract_adjustment":
+            print(
+                f"{prefix} {fill['action']} side={fill['side']} "
+                f"strike={fill.get('old_strike')}->{fill.get('new_strike')} "
+                f"multiplier={fill.get('old_contract_multiplier')}"
+                f"->{fill.get('new_contract_multiplier')} "
+                f"call={fill.get('call_code')} put={fill.get('put_code')} "
+                f"cash_delta={fill['cash_delta']:.2f}"
+            )
+        elif fill["action"] == "option_mark_update":
             print(
                 f"{prefix} {fill['action']} side={fill['side']} "
                 f"qty={fill.get('call_qty')}/{fill.get('put_qty')} "

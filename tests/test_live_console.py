@@ -53,6 +53,42 @@ class LiveConsoleTest(unittest.TestCase):
         )
         self.assertEqual(self.live_console._snapshot_time_text(None), "不可用")
 
+    def test_akshare_snapshot_action_fetches_all_products(self):
+        session = {
+            "products": ("50etf", "300etf", "500etf", "kc50etf"),
+            "account_id": "default",
+        }
+
+        def snapshot(product, source, date):
+            return {
+                "product": product,
+                "snapshot_stamp": f"20260714_15000{len(product)}",
+                "quote_date": "2026-07-14",
+                "option_rows": 100,
+                "timings_seconds": {
+                    "total": 2.0,
+                    "option_fetch": 1.5,
+                    "write": 0.01,
+                },
+            }
+
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            mock.patch.object(
+                self.live_console.market_data,
+                "fetch_quote_snapshot",
+                side_effect=snapshot,
+            ) as fetch,
+        ):
+            self.live_console._action_fetch_akshare_snapshots(session)
+
+        self.assertEqual(fetch.call_count, 4)
+        for product in session["products"]:
+            fetch.assert_any_call(product, source="akshare", date="latest")
+            self.assertIn(f"== {product} ==", output.getvalue())
+        self.assertIn("整批快照耗时:", output.getvalue())
+
     def test_auto_import_summary_shows_option_and_etf_changes_only(self):
         results = [
             {

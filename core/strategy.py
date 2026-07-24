@@ -55,8 +55,19 @@ def normalized_account_delta(
     return float(account_delta) / capacity, capacity
 
 
-def _iv_observation_mode():
-    mode = getattr(CONFIG.vol, "iv_observation_mode", "legacy")
+def _effective_config(config=None):
+    """Return an explicit strategy config or the process-wide runtime config.
+
+    Live historically uses the synchronized module-level ``CONFIG``.  Backtest
+    plugins pass their immutable effective config explicitly so both callers
+    execute this single implementation without mutating global state.
+    """
+    return CONFIG if config is None else config
+
+
+def _iv_observation_mode(config=None):
+    config = _effective_config(config)
+    mode = getattr(config.vol, "iv_observation_mode", "legacy")
     if mode not in IV_OBSERVATION_MODES:
         raise ValueError(
             "CONFIG.vol.iv_observation_mode 只能是 "
@@ -65,15 +76,16 @@ def _iv_observation_mode():
     return mode
 
 
-def _long_signal_mode():
+def _long_signal_mode(config=None):
     """读取买入跨式主信号口径。"""
-    observation_mode = _iv_observation_mode()
+    config = _effective_config(config)
+    observation_mode = _iv_observation_mode(config)
     if observation_mode == "simple_atm_absolute":
         return "absolute"
     if observation_mode == "surface_percentile":
         return "percentile"
 
-    mode = getattr(CONFIG.strategy, "long_signal_mode", "absolute")
+    mode = getattr(config.strategy, "long_signal_mode", "absolute")
     if mode not in LONG_SIGNAL_MODES:
         raise ValueError(
             "CONFIG.strategy.long_signal_mode 只能是 'absolute' 或 'percentile'"
@@ -81,15 +93,16 @@ def _long_signal_mode():
     return mode
 
 
-def _short_signal_mode():
+def _short_signal_mode(config=None):
     """读取卖出跨式主信号口径。"""
-    observation_mode = _iv_observation_mode()
+    config = _effective_config(config)
+    observation_mode = _iv_observation_mode(config)
     if observation_mode == "simple_atm_absolute":
         return "absolute"
     if observation_mode == "surface_percentile":
         return "percentile"
 
-    mode = CONFIG.strategy.short_signal_mode
+    mode = config.strategy.short_signal_mode
     if mode not in SHORT_SIGNAL_MODES:
         raise ValueError(
             "CONFIG.strategy.short_signal_mode 只能是 "
@@ -98,9 +111,9 @@ def _short_signal_mode():
     return mode
 
 
-def _signal_iv(feature_row):
+def _signal_iv(feature_row, config=None):
     """策略使用的 IV：按观察模式在简单 ATM 和曲面 ATM 之间切换。"""
-    if _iv_observation_mode() == "simple_atm_absolute":
+    if _iv_observation_mode(config) == "simple_atm_absolute":
         return feature_row.get("atm_iv", pd.NA)
 
     value = feature_row.get("signal_iv", pd.NA)
@@ -109,9 +122,9 @@ def _signal_iv(feature_row):
     return value
 
 
-def _signal_iv_percentile(feature_row):
+def _signal_iv_percentile(feature_row, config=None):
     """策略使用 IV 的历史分位数。"""
-    if _iv_observation_mode() == "simple_atm_absolute":
+    if _iv_observation_mode(config) == "simple_atm_absolute":
         return pd.NA
 
     value = feature_row.get("signal_iv_percentile", pd.NA)
@@ -120,57 +133,61 @@ def _signal_iv_percentile(feature_row):
     return value
 
 
-def _calc_long_open_signal(feature_row):
-    mode = _long_signal_mode()
+def _calc_long_open_signal(feature_row, config=None):
+    config = _effective_config(config)
+    mode = _long_signal_mode(config)
     if mode == "percentile":
-        iv_percentile = _signal_iv_percentile(feature_row)
+        iv_percentile = _signal_iv_percentile(feature_row, config)
         return (
             pd.notna(iv_percentile)
-            and iv_percentile <= CONFIG.strategy.long_open_iv_percentile_threshold
+            and iv_percentile <= config.strategy.long_open_iv_percentile_threshold
         )
 
-    iv = _signal_iv(feature_row)
-    return pd.notna(iv) and iv <= CONFIG.strategy.long_open_iv_threshold
+    iv = _signal_iv(feature_row, config)
+    return pd.notna(iv) and iv <= config.strategy.long_open_iv_threshold
 
 
-def _get_long_close_reason_by_signal(feature_row):
-    mode = _long_signal_mode()
+def _get_long_close_reason_by_signal(feature_row, config=None):
+    config = _effective_config(config)
+    mode = _long_signal_mode(config)
     if mode == "percentile":
-        iv_percentile = _signal_iv_percentile(feature_row)
+        iv_percentile = _signal_iv_percentile(feature_row, config)
         if (
             pd.notna(iv_percentile)
-            and iv_percentile >= CONFIG.strategy.long_close_iv_percentile_threshold
+            and iv_percentile >= config.strategy.long_close_iv_percentile_threshold
         ):
             return "iv_percentile_high"
         return None
 
-    iv = _signal_iv(feature_row)
-    if pd.notna(iv) and iv >= CONFIG.strategy.long_close_iv_threshold:
+    iv = _signal_iv(feature_row, config)
+    if pd.notna(iv) and iv >= config.strategy.long_close_iv_threshold:
         return "iv_high"
     return None
 
 
-def _calc_low_iv_hv_spread_open_signal(feature_row):
+def _calc_low_iv_hv_spread_open_signal(feature_row, config=None):
     """低 IV 收租：IV 处于低位，但仍高于 HV 一定安全垫时开仓。"""
-    atm_iv = _signal_iv(feature_row)
-    hv = feature_row.get(CONFIG.strategy.short_low_iv_hv_col, pd.NA)
+    config = _effective_config(config)
+    atm_iv = _signal_iv(feature_row, config)
+    hv = feature_row.get(config.strategy.short_low_iv_hv_col, pd.NA)
     if pd.isna(atm_iv) or pd.isna(hv):
         return False
 
-    iv_is_low = atm_iv <= CONFIG.strategy.short_low_iv_open_threshold
+    iv_is_low = atm_iv <= config.strategy.short_low_iv_open_threshold
     spread_is_positive = (
-        atm_iv - hv >= CONFIG.strategy.short_low_iv_hv_spread_threshold
+        atm_iv - hv >= config.strategy.short_low_iv_hv_spread_threshold
     )
     return iv_is_low and spread_is_positive
 
 
-def _calc_absolute_short_open_signal(feature_row):
+def _calc_absolute_short_open_signal(feature_row, config=None):
     """高 IV 卖波动：达到普通阈值即可开仓，极端高位需先确认 IV 回落。"""
-    atm_iv = _signal_iv(feature_row)
-    if pd.isna(atm_iv) or atm_iv < CONFIG.strategy.short_open_iv_threshold:
+    config = _effective_config(config)
+    atm_iv = _signal_iv(feature_row, config)
+    if pd.isna(atm_iv) or atm_iv < config.strategy.short_open_iv_threshold:
         return False
 
-    pullback_threshold = CONFIG.strategy.short_open_pullback_iv_threshold
+    pullback_threshold = config.strategy.short_open_pullback_iv_threshold
     if pullback_threshold is not None and atm_iv >= pullback_threshold:
         prev_atm_iv = feature_row.get("prev_signal_iv", pd.NA)
         if pd.isna(prev_atm_iv):
@@ -180,91 +197,94 @@ def _calc_absolute_short_open_signal(feature_row):
     return True
 
 
-def _short_open_regime(feature_row):
+def _short_open_regime(feature_row, config=None):
     """返回卖方开仓信号来源；没有信号时返回 None。"""
-    mode = _short_signal_mode()
+    config = _effective_config(config)
+    mode = _short_signal_mode(config)
 
     if mode == "percentile":
-        atm_iv_percentile = _signal_iv_percentile(feature_row)
+        atm_iv_percentile = _signal_iv_percentile(feature_row, config)
         if (
             pd.notna(atm_iv_percentile)
-            and atm_iv_percentile >= CONFIG.strategy.short_open_iv_percentile_threshold
+            and atm_iv_percentile >= config.strategy.short_open_iv_percentile_threshold
         ):
             return "percentile"
         return None
 
     if mode == "low_iv_hv_spread":
-        if _calc_low_iv_hv_spread_open_signal(feature_row):
+        if _calc_low_iv_hv_spread_open_signal(feature_row, config):
             return "low_iv_hv_spread"
         return None
 
-    if _calc_absolute_short_open_signal(feature_row):
+    if _calc_absolute_short_open_signal(feature_row, config):
         return "absolute"
     if (
-        CONFIG.strategy.short_low_iv_overlay_enabled
-        and _calc_low_iv_hv_spread_open_signal(feature_row)
+        config.strategy.short_low_iv_overlay_enabled
+        and _calc_low_iv_hv_spread_open_signal(feature_row, config)
     ):
         return "low_iv_hv_spread"
     return None
 
 
-def _calc_short_open_signal(feature_row):
+def _calc_short_open_signal(feature_row, config=None):
     """按配置选择卖出跨式开仓口径。"""
-    return _short_open_regime(feature_row) is not None
+    return _short_open_regime(feature_row, config) is not None
 
 
-def _get_short_close_reason_by_signal(feature_row, mode=None):
+def _get_short_close_reason_by_signal(feature_row, mode=None, config=None):
     """按信号口径选择卖出跨式平仓原因。"""
-    mode = mode or _short_signal_mode()
+    config = _effective_config(config)
+    mode = mode or _short_signal_mode(config)
 
     if mode == "percentile":
-        atm_iv_percentile = _signal_iv_percentile(feature_row)
+        atm_iv_percentile = _signal_iv_percentile(feature_row, config)
         if (
             pd.notna(atm_iv_percentile)
-            and atm_iv_percentile <= CONFIG.strategy.short_close_iv_percentile_threshold
+            and atm_iv_percentile <= config.strategy.short_close_iv_percentile_threshold
         ):
             return "short_iv_percentile_low"
         return None
 
     if mode == "low_iv_hv_spread":
-        atm_iv = _signal_iv(feature_row)
-        hv = feature_row.get(CONFIG.strategy.short_low_iv_hv_col, pd.NA)
+        atm_iv = _signal_iv(feature_row, config)
+        hv = feature_row.get(config.strategy.short_low_iv_hv_col, pd.NA)
         if pd.isna(atm_iv) or pd.isna(hv):
             return None
 
-        if atm_iv >= CONFIG.strategy.short_low_iv_close_threshold:
+        if atm_iv >= config.strategy.short_low_iv_close_threshold:
             return "short_low_iv_high"
-        if atm_iv - hv <= CONFIG.strategy.short_low_iv_close_spread_threshold:
+        if atm_iv - hv <= config.strategy.short_low_iv_close_spread_threshold:
             return "short_low_iv_spread_gone"
         return None
 
-    atm_iv = _signal_iv(feature_row)
-    if pd.notna(atm_iv) and atm_iv <= CONFIG.strategy.short_close_iv_threshold:
+    atm_iv = _signal_iv(feature_row, config)
+    if pd.notna(atm_iv) and atm_iv <= config.strategy.short_close_iv_threshold:
         return "short_iv_low"
     return None
 
 
-def calc_entry_target_qty(feature_row, max_qty):
+def calc_entry_target_qty(feature_row, max_qty, config=None):
     """买入跨式：按配置选择绝对 IV 或历史分位数信号。"""
-    if not _calc_long_open_signal(feature_row):
+    if not _calc_long_open_signal(feature_row, config):
         return 0
     return max_qty
 
 
-def calc_short_entry_target_qty(feature_row, max_qty):
+def calc_short_entry_target_qty(feature_row, max_qty, config=None):
     """卖出跨式：按配置选择 ATM IV 绝对值、百分位或低 IV 收租信号。"""
-    if not _calc_short_open_signal(feature_row):
+    if not _calc_short_open_signal(feature_row, config):
         return 0
     return max_qty
 
 
-def get_short_open_regime(feature_row):
+def get_short_open_regime(feature_row, config=None):
     """给回测引擎记录本次 short 仓位的信号来源。"""
-    return _short_open_regime(feature_row)
+    return _short_open_regime(feature_row, config)
 
 
-def build_signals(features_df):
+def build_signals(features_df, config=None):
     """生成交易信号；short 信号口径由 short_signal_mode 决定。"""
+    config = _effective_config(config)
     signals_df = features_df.copy()
     if "atm_iv" not in signals_df.columns:
         signals_df["atm_iv"] = pd.NA
@@ -274,7 +294,7 @@ def build_signals(features_df):
         signals_df["signal_iv"] = signals_df["atm_iv"]
     else:
         signals_df["signal_iv"] = signals_df["signal_iv"].fillna(signals_df["atm_iv"])
-    if _iv_observation_mode() == "simple_atm_absolute":
+    if _iv_observation_mode(config) == "simple_atm_absolute":
         signals_df["signal_iv"] = signals_df["atm_iv"]
         signals_df["signal_iv_percentile"] = pd.NA
     elif "signal_iv_percentile" not in signals_df.columns:
@@ -286,53 +306,62 @@ def build_signals(features_df):
     signals_df["prev_atm_iv"] = signals_df["atm_iv"].shift(1)
     signals_df["prev_signal_iv"] = signals_df["signal_iv"].shift(1)
 
-    long_open = signals_df.apply(_calc_long_open_signal, axis=1)
-    short_regime = signals_df.apply(_short_open_regime, axis=1)
+    long_open = signals_df.apply(
+        lambda row: _calc_long_open_signal(row, config), axis=1
+    )
+    short_regime = signals_df.apply(
+        lambda row: _short_open_regime(row, config), axis=1
+    )
 
     signals_df["long_open_signal"] = (
-        CONFIG.strategy.enable_long_straddle & long_open
+        config.strategy.enable_long_straddle & long_open
     )
     signals_df["short_open_regime"] = short_regime
     signals_df["short_open_signal"] = (
-        CONFIG.strategy.enable_short_straddle & short_regime.notna()
+        config.strategy.enable_short_straddle & short_regime.notna()
     )
     return signals_df
 
 
-def get_close_reason(feature_row, position_dte):
+def get_close_reason(feature_row, position_dte, config=None):
     """买入跨式在 ATM IV 升高或临近到期时平仓。"""
-    close_reason = _get_long_close_reason_by_signal(feature_row)
+    config = _effective_config(config)
+    close_reason = _get_long_close_reason_by_signal(feature_row, config)
     if close_reason is not None:
         return close_reason
 
-    if position_dte <= CONFIG.strategy.min_exit_dte:
+    if position_dte <= config.strategy.min_exit_dte:
         return "near_expiry"
 
     return None
 
 
-def get_short_close_reason(feature_row, position_dte, position=None):
+def get_short_close_reason(feature_row, position_dte, position=None, config=None):
     """卖出跨式按开仓信号来源平仓，或在临近到期时平仓。"""
     mode = None
     if position is not None:
         mode = position.get("short_entry_regime")
-    close_reason = _get_short_close_reason_by_signal(feature_row, mode=mode)
+    config = _effective_config(config)
+    close_reason = _get_short_close_reason_by_signal(
+        feature_row, mode=mode, config=config
+    )
     if close_reason is not None:
         return close_reason
 
-    if position_dte <= CONFIG.strategy.min_exit_dte:
+    if position_dte <= config.strategy.min_exit_dte:
         return "near_expiry"
 
     return None
 
 
-def is_short_daily_loss_aum_stop(daily_pnl, aum):
+def is_short_daily_loss_aum_stop(daily_pnl, aum, config=None):
     """Return whether today's short-option holding loss breached its AUM limit."""
-    if not CONFIG.strategy.short_stop_loss_enabled:
+    config = _effective_config(config)
+    if not config.strategy.short_stop_loss_enabled:
         return False
     if aum is None or aum <= 0 or daily_pnl is None:
         return False
-    return daily_pnl / aum < CONFIG.strategy.short_daily_loss_aum_threshold
+    return daily_pnl / aum < config.strategy.short_daily_loss_aum_threshold
 
 
 def calc_position_greeks(call_row, put_row, call_qty=1, put_qty=1, side="long"):
