@@ -3,6 +3,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 import pandas as pd
 
 from .config import CONFIG
@@ -285,16 +286,27 @@ def plot_vol_features(
     fig.suptitle(f"{_product_label()} - Underlying Price, ATM IV and HV")
 
     if backtest_df is not None:
+        initial_cash = float(CONFIG.backtest.initial_cash)
+        if initial_cash <= 0:
+            raise ValueError("initial_cash must be positive to plot cumulative return")
+
+        def cumulative_return(frame):
+            return (
+                pd.to_numeric(frame["nav"], errors="coerce")
+                .div(initial_cash)
+                .sub(1.0)
+            )
+
         if strategy_label is None:
-            strategy_label = "Baseline NAV"
+            strategy_label = "Cumulative Return"
             if (
                 getattr(CONFIG.strategy, "short_signal_mode", None) == "absolute"
                 and not getattr(CONFIG.strategy, "enable_delta_hedge", True)
             ):
-                strategy_label = "Baseline NAV (Absolute Naked)"
+                strategy_label = "Cumulative Return (Absolute Naked)"
         ax_nav.plot(
             backtest_df.index,
-            backtest_df["nav"],
+            cumulative_return(backtest_df),
             label=strategy_label,
             color="black",
             linewidth=1.5,
@@ -302,8 +314,8 @@ def plot_vol_features(
         if absolute_backtest_df is not None and "nav" in absolute_backtest_df.columns:
             ax_nav.plot(
                 absolute_backtest_df.index,
-                absolute_backtest_df["nav"],
-                label="Absolute Signal NAV",
+                cumulative_return(absolute_backtest_df),
+                label="Absolute Signal Cumulative Return",
                 color="tab:orange",
                 linewidth=1.3,
                 linestyle="-.",
@@ -311,9 +323,9 @@ def plot_vol_features(
         if percentile_backtest_df is not None and "nav" in percentile_backtest_df.columns:
             ax_nav.plot(
                 percentile_backtest_df.index,
-                percentile_backtest_df["nav"],
+                cumulative_return(percentile_backtest_df),
                 label=(
-                    "Percentile Signal NAV "
+                    "Percentile Signal Cumulative Return "
                     f"({CONFIG.strategy.short_open_iv_percentile_threshold:.0%}/"
                     f"{CONFIG.strategy.short_close_iv_percentile_threshold:.0%} Naked)"
                 ),
@@ -324,22 +336,23 @@ def plot_vol_features(
         if no_delta_hedge_df is not None and "nav" in no_delta_hedge_df.columns:
             ax_nav.plot(
                 no_delta_hedge_df.index,
-                no_delta_hedge_df["nav"],
-                label="Absolute Naked Vega Short NAV",
+                cumulative_return(no_delta_hedge_df),
+                label="Absolute Naked Vega Short Cumulative Return",
                 color="tab:gray",
                 linewidth=1.3,
                 linestyle=(0, (3, 1, 1, 1)),
             )
 
         ax_nav.axhline(
-            backtest_df["nav"].iloc[0],
+            0.0,
             color="gray",
             linestyle="--",
             linewidth=1,
-            label="Initial NAV",
+            label="Initial Capital (0%)",
         )
 
-        ax_nav.set_ylabel("NAV")
+        ax_nav.set_ylabel("Cumulative Return")
+        ax_nav.yaxis.set_major_formatter(PercentFormatter(1.0))
         if ax_drawdown is None and ax_volume is None:
             ax_nav.set_xlabel("Date")
         ax_nav.grid(True, alpha=0.3)
@@ -418,13 +431,21 @@ def plot_cumulative_greeks_pnl(backtest_df, output_path=None, show=True):
     if missing:
         raise ValueError(f"backtest_df missing columns:{missing}")
 
-    cum_pnl = backtest_df[pnl_cols].cumsum()
+    daily_pnl = backtest_df[pnl_cols].apply(pd.to_numeric, errors="coerce")
+    cum_pnl = daily_pnl.cumsum()
+    cumulative_theta_gamma_pnl = (
+        daily_pnl["theta_pnl"] + daily_pnl["gamma_pnl"]
+    ).cumsum()
     fig, ax = plt.subplots(figsize=(28, 14))
 
     ax.plot(cum_pnl.index, cum_pnl["delta_pnl"], label="Delta PnL", linewidth=1.2)
-    ax.plot(cum_pnl.index, cum_pnl["gamma_pnl"], label="Gamma PnL", linewidth=1.2)
+    ax.plot(
+        cum_pnl.index,
+        cumulative_theta_gamma_pnl,
+        label="Theta + Gamma PnL",
+        linewidth=1.4,
+    )
     ax.plot(cum_pnl.index, cum_pnl["vega_pnl"], label="Vega PnL", linewidth=1.2)
-    ax.plot(cum_pnl.index, cum_pnl["theta_pnl"], label="Theta PnL", linewidth=1.2)
     ax.plot(cum_pnl.index, cum_pnl["greeks_pnl"], label="Total Greeks PnL", color="black", linewidth=1.8)
 
     ax.axhline(0, color="gray", linewidth=1, linestyle="--")
@@ -511,6 +532,27 @@ def plot_cumulative_actual_vs_greeks_pnl(backtest_df, output_path=None, show=Tru
         linewidth=1.2,
         linestyle="--",
     )
+    exact_column = (
+        "full_revaluation_accounted_pnl"
+        if "full_revaluation_accounted_pnl" in backtest_df.columns
+        else "full_revaluation_greeks_pnl"
+    )
+    if exact_column in backtest_df.columns:
+        cum_full_revaluation = (
+            pd.to_numeric(
+                backtest_df[exact_column], errors="coerce"
+            )
+            .fillna(0.0)
+            .cumsum()
+        )
+        ax.plot(
+            cum_full_revaluation.index,
+            cum_full_revaluation,
+            label="Full-Revaluation Attribution (Exact)",
+            color="tab:green",
+            linewidth=1.3,
+            linestyle="-.",
+        )
 
     ax.axhline(0, color="gray", linewidth=1, linestyle="--")
     ax.set_title(

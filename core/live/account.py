@@ -289,6 +289,7 @@ def normalize_fill(fill):
         "close_long_straddle": "close_long_straddle",
         "close_straddle": "close_straddle",
         "rebalance_straddle_legs": "rebalance_straddle_legs",
+        "option_contract_adjustment": "option_contract_adjustment",
         "delta_hedge": "delta_hedge",
         "projected_delta_hedge": "delta_hedge",
         "final_delta_hedge": "delta_hedge",
@@ -470,6 +471,19 @@ def _apply_fill(account, product, fill):
     elif action == "rebalance_straddle_legs":
         if side not in account.positions or account.positions.get(side) is None:
             raise ValueError(f"Cannot rebalance missing straddle side={side}.")
+        account.positions[side] = _position_from_fill(fill, side)
+        account.cash += cash_delta
+    elif action == "option_contract_adjustment":
+        if side not in account.positions or account.positions.get(side) is None:
+            raise ValueError(f"Cannot adjust missing option contract side={side}.")
+        current = account.positions[side]
+        if (
+            str(current.get("call_code")) != str(fill.get("call_code"))
+            or str(current.get("put_code")) != str(fill.get("put_code"))
+        ):
+            raise ValueError(
+                f"Option contract adjustment does not match existing position side={side}."
+            )
         account.positions[side] = _position_from_fill(fill, side)
         account.cash += cash_delta
     elif action in {"delta_hedge", "rebalance_hedge", "close_hedge"}:
@@ -801,6 +815,8 @@ def _position_from_fill(fill, side):
         "entry_date": fill.get("entry_date", fill.get("date")),
         "call_code": fill["call_code"],
         "put_code": fill["put_code"],
+        "call_contract_symbol": fill.get("call_contract_symbol"),
+        "put_contract_symbol": fill.get("put_contract_symbol"),
         "strike": float(fill["strike"]),
         "expiry": fill["expiry"],
         "call_qty": call_qty,

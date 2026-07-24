@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 
+# Kept only so historical signals can be normalized into one final ETF trade.
+PRE_ROLL_HEDGE_CLOSE_ACTION = "CLOSE_HEDGE_BEFORE_ROLL"
 ETF_HEDGE_ACTIONS = {
     "DELTA_HEDGE",
     "FINAL_DELTA_HEDGE",
@@ -8,6 +10,7 @@ ETF_HEDGE_ACTIONS = {
     "FINAL_ATM_STRADDLE_DELTA_REBALANCE",
     "ATM_STRADDLE_SHAPE_REBALANCE",
     "FINAL_ATM_STRADDLE_SHAPE_REBALANCE",
+    PRE_ROLL_HEDGE_CLOSE_ACTION,
 }
 NETTED_ETF_HEDGE_ACTION = "NETTED_ETF_HEDGE"
 
@@ -77,7 +80,6 @@ def netted_etf_advice_items(advice):
         item.pop("_last_index", None)
         result.append(item)
     return result
-
 
 def _float(value):
     return float(value or 0.0)

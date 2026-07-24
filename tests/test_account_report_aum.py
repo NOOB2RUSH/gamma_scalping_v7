@@ -8,6 +8,42 @@ from core.live import account_report
 
 
 class AccountReportAumTest(unittest.TestCase):
+    def test_closing_day_uses_opening_option_aum(self):
+        summary = pd.DataFrame(
+            [
+                {"日期": "2026-07-14", "标的价格": 8.413},
+                {"日期": "2026-07-15", "标的价格": 8.151},
+            ]
+        )
+        positions = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-07-14",
+                    "账户ID": "default",
+                    "方向": "short",
+                    "合约代码": "10011720",
+                    "总持仓": 10,
+                    "行权价": 8.25,
+                    "到期日": "2026-07-22",
+                    "合约乘数": 10000,
+                }
+            ]
+        )
+        payload = {
+            "product": "500etf",
+            "date": "2026-07-15",
+            "spot": 8.151,
+            "summary_history": summary,
+            "position_history": positions,
+            "trade_rows": [
+                {"日期": "2026-07-15", "合约代码": "10011720"}
+            ],
+        }
+
+        aum = account_report._summary_aum_by_date(payload)
+
+        self.assertAlmostEqual(aum["2026-07-15"], 10 * 10000 * 8.413)
+
     def test_summary_reports_gross_daily_pnl_as_aum_ratio(self):
         summary = pd.DataFrame(
             [

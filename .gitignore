@@ -9,9 +9,12 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+release/
+release_all_contracts/
 
 data/
 live_hold/
 output/
+策略留档/
 state/
 期权模拟信息导出/

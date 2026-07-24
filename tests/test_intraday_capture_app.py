@@ -66,6 +66,26 @@ class IntradayCaptureAppHelpersTest(TestCase):
 
         self.assertEqual(summary, "dates=1/2")
 
+    def test_capture_progress_summary_reads_latest_worker_event(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = root / "output" / "live" / "50etf" / "intraday_capture.log"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "[capture_mode] product=50etf mode=once\n"
+                "capture_progress product=50etf phase=option_done completed=2 total=3 code=10000001 rows=240\n"
+                "capture_progress product=50etf phase=completed completed=3 total=3 errors=0\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(intraday_capture_app.storage, "PROJECT_ROOT", root):
+                result = intraday_capture_app.capture_progress_summary("50etf")
+
+        self.assertEqual(result["mode"], "once")
+        self.assertEqual(result["phase"], "completed")
+        self.assertEqual(result["completed"], 3)
+        self.assertEqual(result["total"], 3)
+        self.assertEqual(result["detail"], "errors=0")
+
     def test_capture_command_uses_python_script_when_not_frozen(self):
         command = intraday_capture_app.capture_command(
             "50etf",
@@ -117,3 +137,10 @@ class IntradayCaptureAppHelpersTest(TestCase):
         )
 
         self.assertIn("--save-option-greeks-snapshot", command)
+
+    def test_capture_command_supports_all_option_contracts(self):
+        command = intraday_capture_app.capture_command(
+            "500etf", "default", 60, Path("capture.pid"), all_option_contracts=True
+        )
+
+        self.assertIn("--all-option-contracts", command)

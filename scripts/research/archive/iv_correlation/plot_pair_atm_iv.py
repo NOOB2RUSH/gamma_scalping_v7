@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_INPUT = PROJECT_ROOT / "output" / "research" / "20260706_104713_atm_iv_log_changes.csv"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output" / "research"
 DEFAULT_CORR_INPUT = PROJECT_ROOT / "output" / "research" / "20260706_104713_300etf_vs_50etf_atm_iv_log_change_corr_60d.csv"

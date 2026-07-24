@@ -71,6 +71,27 @@ def test_fund_reconciliation_excludes_option_margin_change(tmp_path):
     )
 
 
+def test_fund_reconciliation_removes_unpaid_dividend_internally():
+    frame = pd.DataFrame(
+        [
+            {
+                "日期": "2026-07-14",
+                "净单日盈亏": 0.0,
+                "对冲持仓": 34000,
+            },
+            {
+                "日期": "2026-07-15",
+                "净单日盈亏": -1120.5648,
+                "对冲持仓": 0,
+            }
+        ]
+    )
+
+    result = reconciler._product_net_daily_pnl_by_date(frame, product="500etf")
+
+    assert result["2026-07-15"] == -6186.5648
+
+
 def test_reconcile_builds_account_closure_checks(tmp_path):
     summary_path = tmp_path / "summary.csv"
     rows = [

@@ -76,7 +76,10 @@ When adding a product, add one row to every equivalent mapping in code. The `pro
 
 6. Add historical or live quote download support if needed.
 
-   If the product needs canonical historical research data, add a downloader under `scripts/download/<product>/build_data.py` or generalize one of the existing ETF downloaders.
+   If the product needs canonical historical research data, extend the product
+   specifications in `scripts/download/build_data.py` when it follows the SSE ETF
+   option workflow. Add a product-specific downloader only when the exchange or
+   source protocol is materially different, as with `zz1000`.
 
    Minimum requirement for live import/reporting:
 

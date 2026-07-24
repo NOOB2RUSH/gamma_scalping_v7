@@ -94,6 +94,25 @@ def spot_exceeds_one_strike_step(
         return False
 
 
+def strike_differs_by_at_least_one_step(
+    position_strike,
+    atm_strike,
+    chain_df,
+):
+    """Return whether held and current ATM strikes differ by one full grid step."""
+    try:
+        position_strike = float(position_strike)
+        atm_strike = float(atm_strike)
+    except (TypeError, ValueError):
+        return False
+
+    deviation = abs(atm_strike - position_strike)
+    step = strike_step_from_chain(chain_df, position_strike)
+    if step is not None and step > 0:
+        return deviation > step or np.isclose(deviation, step)
+    return not np.isclose(position_strike, atm_strike)
+
+
 def _iv_observation_mode():
     mode = getattr(CONFIG.vol, "iv_observation_mode", "legacy")
     if mode not in IV_OBSERVATION_MODES:
@@ -689,6 +708,28 @@ def select_atm_from_chain(
         atm_moneyness_tol=atm_moneyness_tol,
         preferred_expiry=preferred_expiry,
         preferred_underlying_order_book_id=preferred_underlying_order_book_id,
+    )
+
+
+def select_atm_from_chain_for_expiry(chain_df, spot, expiry):
+    """Select the current ATM pair while preserving one exact maturity."""
+    if chain_df is None or chain_df.empty or expiry is None:
+        return None
+    expiry = pd.Timestamp(expiry).normalize()
+    maturities = pd.to_datetime(chain_df["maturity_date"], errors="coerce").dt.normalize()
+    expiry_chain = chain_df.loc[maturities.eq(expiry)].copy()
+    if expiry_chain.empty:
+        return None
+    dtes = pd.to_numeric(expiry_chain.get("dte"), errors="coerce").dropna()
+    if dtes.empty:
+        return None
+    return select_atm_from_chain(
+        expiry_chain,
+        spot,
+        target_dte=float(dtes.iloc[0]),
+        target_dte_min=float(dtes.min()),
+        target_dte_max=float(dtes.max()),
+        preferred_expiry=expiry,
     )
 
 

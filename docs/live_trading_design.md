@@ -85,7 +85,9 @@ repeatable tests.
 option board through AKShare and writes immutable live snapshots without
 modifying the canonical research/backtest parquet files.
 
-All new straddle entries use 10 call contracts and 10 put contracts. Existing
+New straddle entries use `backtest.long_qty` / `backtest.short_qty` from the
+active product configuration; all four current live products default to 10
+call contracts and 10 put contracts. Existing
 positions retain their actual imported quantities for close, roll, reduction,
 and hedge calculations.
 
@@ -214,12 +216,58 @@ viewing positions, importing holdings, reporting, rebuilding, or reconciling.
 ## Planned Hedge Advice
 
 Live signals only mutate cash and positions after manual fill confirmation.
-When open, close, or roll advice is generated, live mode treats those option
-actions as an execution plan first. It then simulates the plan in order and
-emits one final `FINAL_DELTA_HEDGE` only if the post-plan account delta would
-remain outside tolerance. This final hedge is an execution hint for the
-operator; it is not written into the shadow account until the hedge fill is
-confirmed.
+When open, close, roll, or option-leg rebalance advice is generated, live mode
+treats all actions as one ordered execution plan. Signal generation follows
+this fixed flow:
+
+1. Capture the current option positions, ETF hedge, and account Greeks.
+2. Generate option lifecycle actions such as open, close, roll, and leg
+   rebalance.
+3. Keep the existing ETF hedge in place while option actions execute. A normal
+   roll does not require the ETF position to be reset to zero.
+4. Project option positions from the generic `position_target` carried by each
+   action. A new option action must not require registration in another
+   action-name whitelist to participate in state projection.
+5. Project every ETF `target_hedge_qty`, then combine all ETF adjustments for
+   the same underlying into one trade from the current quantity to the final
+   target. The net ETF trade executes after the option plan.
+6. Evaluate the post-plan account delta. Option legs are preferred for a
+   material structural imbalance, and ETF is then used for the remaining
+   fine-tuning that the product constraints permit.
+7. Render the same ordered plan to signal JSON, Markdown, terminal output, and
+   InfiniTrader orders. Account state changes only after confirmed fills are
+   imported.
+
+The following fields define the two states unambiguously:
+
+- `current_account_delta` is the delta before any generated action.
+- `planned_hedge_qty` is the ETF position after all generated actions.
+- `planned_account_delta` is the final projected option delta plus
+  `planned_hedge_qty`.
+- `account_delta_after_hedge` is retained as a compatibility alias for
+  `planned_account_delta`; it must not contain the pre-plan delta.
+
+The default absolute Delta trigger is 5,000. It is an entry condition, not the
+post-hedge target band. If neither the current account nor the projected option
+plan breaches `[-5,000, +5,000]`, no option-leg rebalance or ETF hedge is
+generated, even when a small ETF trade could move Delta closer to zero.
+
+Once either state breaches the trigger, Delta control remains active for the
+whole execution plan: first complete the required roll or option-leg balance,
+then set the final ETF target against the projected option Delta with a target
+account Delta of zero. A roll that reduces Delta back below 5,000 must not
+cancel this final ETF step. The final achievable residual may still be non-zero
+because of ETF board-lot rounding, option-contract granularity, the short-ETF
+restriction, liquidity, cash reserve, or capacity constraints; those are
+execution constraints rather than a tolerance target.
+
+`core.live.etf_netting` is the single registry and extraction layer for ETF
+actions. Reports and execution adapters must consume it instead of maintaining
+their own ETF action-name sets. Historical `CLOSE_HEDGE_BEFORE_ROLL` advice is
+also treated as nettable, so an old signal cannot generate an unnecessary ETF
+sell-and-buy round trip. Any new executable action must add regression coverage
+for final-state projection, displayed order and quantities, generated broker
+orders, and fill import.
 
 ## First Version Limitations
 
@@ -227,3 +275,20 @@ confirmed.
 - Intraday quotes are treated as reference data. The optimized strategies are
   daily/EOD strategies, so live reports mark advice as EOD-style unless a
   product-specific intraday source is later added.
+
+## Historical Mirror And Immutable Snapshot Replay
+
+The registered backtest plugin `live_straddle` is the historical mirror of the
+current live policy. It delegates signal predicates to the same `core.strategy`
+implementation and uses the live target-state contracts for roll, adjusted
+contract liquidation, option-leg balancing and final ETF delta control. The
+historical executor calls the same live delta-plan builder and the same ETF
+netting layer, then fills only the final ETF target in simulated state.
+
+Snapshot replay calls `generate_signal_from_context()` with a detached in-memory
+account and explicit immutable market context. It does not load or write the
+real shadow account and does not update live feature history. Actual comparison
+opens the broker-derived SQLite account in read-only mode.
+
+Commands, output columns, attribution limits and parity gates are documented in
+[`live_straddle_replay.md`](live_straddle_replay.md).

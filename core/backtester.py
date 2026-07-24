@@ -578,6 +578,254 @@ def add_greeks_pnl(daily_df):
     )
     return df
 
+
+def _option_code_identity(value):
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    try:
+        return str(int(float(text)))
+    except (TypeError, ValueError):
+        return text
+
+
+def _black_scholes_price(flag, spot, strike, ttm, rate, sigma):
+    values = (spot, strike, ttm, sigma)
+    try:
+        spot, strike, ttm, sigma = (float(value) for value in values)
+        rate = float(rate)
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (spot, strike, ttm, sigma, rate)):
+        return None
+    if spot <= 0 or strike <= 0 or sigma <= 0:
+        return None
+    if ttm <= 0:
+        return max(spot - strike, 0.0) if flag == "c" else max(strike - spot, 0.0)
+    root_t = math.sqrt(ttm)
+    d1 = (math.log(spot / strike) + (rate + 0.5 * sigma * sigma) * ttm) / (
+        sigma * root_t
+    )
+    d2 = d1 - sigma * root_t
+    normal_cdf = lambda value: 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+    discount = math.exp(-rate * ttm)
+    if flag == "c":
+        return spot * normal_cdf(d1) - strike * discount * normal_cdf(d2)
+    if flag == "p":
+        return strike * discount * normal_cdf(-d2) - spot * normal_cdf(-d1)
+    return None
+
+
+def add_full_revaluation_pnl(
+    daily_df,
+    enriched_opt_by_date,
+    annual_days=None,
+    risk_free_rate=None,
+):
+    """Add an endpoint-revaluation attribution that exactly reconciles option MTM.
+
+    The ordering is spot, time, then IV.  ``spot_nonlinear`` contains gamma and
+    all higher-order spot terms after subtracting prior-close delta.  Unlike the
+    legacy Taylor approximation, the four revaluation buckets sum to observed
+    option mid-price PnL by construction. Days whose held contracts are absent
+    from the source chain are reported separately as ``data_gap_pnl`` instead
+    of being mislabeled as a model/Greeks residual.
+    """
+    df = daily_df.copy()
+    annual_days = float(annual_days or CONFIG.vol.annual_days)
+    risk_free_rate = float(
+        CONFIG.vol.risk_free_rate if risk_free_rate is None else risk_free_rate
+    )
+    columns = (
+        "full_revaluation_option_delta_pnl",
+        "full_revaluation_hedge_delta_pnl",
+        "full_revaluation_delta_pnl",
+        "full_revaluation_spot_nonlinear_pnl",
+        "full_revaluation_theta_pnl",
+        "full_revaluation_vega_pnl",
+        "full_revaluation_greeks_pnl",
+        "full_revaluation_data_gap_pnl",
+        "full_revaluation_accounted_pnl",
+        "full_revaluation_unexplained_pnl_before_fee",
+    )
+    for column in columns:
+        df[column] = 0.0
+    df["full_revaluation_explainable_day"] = False
+    df["full_revaluation_data_gap_day"] = False
+    df["full_revaluation_data_gap_reason"] = ""
+
+    if not enriched_opt_by_date or len(df) < 2:
+        df["full_revaluation_unexplained_pnl_before_fee"] = df[
+            "daily_nav_pnl_before_fee"
+        ]
+        return df
+
+    chains_by_date = {
+        pd.Timestamp(date): chain for date, chain in enriched_opt_by_date.items()
+    }
+    chain_lookup_cache = {}
+
+    def chain_lookup(date):
+        if date in chain_lookup_cache:
+            return chain_lookup_cache[date]
+        chain = chains_by_date.get(date)
+        if chain is None or chain.empty or "order_book_id" not in chain.columns:
+            chain_lookup_cache[date] = None
+            return None
+        lookup = {}
+        for _, row in chain.iterrows():
+            code = _option_code_identity(row.get("order_book_id"))
+            if code is not None and code not in lookup:
+                lookup[code] = row
+        chain_lookup_cache[date] = lookup
+        return lookup
+
+    for row_number in range(1, len(df)):
+        date = pd.Timestamp(df.index[row_number])
+        index = df.index[row_number]
+        previous_date = pd.Timestamp(df.index[row_number - 1])
+        previous = df.iloc[row_number - 1]
+        local = {
+            "option_delta": 0.0,
+            "spot_nonlinear": 0.0,
+            "theta": 0.0,
+            "vega": 0.0,
+        }
+        has_previous_option = False
+        complete = True
+        failure_reason = ""
+        current_chain = None
+        previous_chain = None
+        for side in POSITION_SIDES:
+            direction = 1.0 if side == "long" else -1.0
+            for leg, flag in (("call", "c"), ("put", "p")):
+                qty = float(previous.get(f"{side}_position_{leg}_qty", 0.0) or 0.0)
+                code = _option_code_identity(
+                    previous.get(f"{side}_position_{leg}_code")
+                )
+                if qty == 0 or code is None:
+                    continue
+                has_previous_option = True
+                if current_chain is None:
+                    current_chain = chain_lookup(date)
+                    previous_chain = chain_lookup(previous_date)
+                if current_chain is None or previous_chain is None:
+                    complete = False
+                    failure_reason = "missing_revaluation_chain"
+                    break
+                if code not in previous_chain or code not in current_chain:
+                    complete = False
+                    failure_reason = "missing_revaluation_contract"
+                    break
+                start_row = previous_chain[code]
+                end_row = current_chain[code]
+                try:
+                    start_spot = float(
+                        start_row.get("pricing_spot", previous.get("spot"))
+                    )
+                    end_spot = float(end_row.get("pricing_spot", df.iloc[row_number]["spot"]))
+                    strike = float(start_row["strike_price"])
+                    start_ttm = float(start_row["dte"]) / annual_days
+                    end_ttm = float(end_row["dte"]) / annual_days
+                    start_iv = float(start_row["iv"])
+                    start_price = float(start_row["mid"])
+                    end_price = float(end_row["mid"])
+                    multiplier = float(start_row["contract_multiplier"])
+                    scaled_delta = float(
+                        previous.get(f"{side}_eod_{leg}_delta", 0.0) or 0.0
+                    )
+                except (KeyError, TypeError, ValueError):
+                    complete = False
+                    failure_reason = "invalid_revaluation_endpoint"
+                    break
+                spot_price = _black_scholes_price(
+                    flag,
+                    end_spot,
+                    strike,
+                    start_ttm,
+                    risk_free_rate,
+                    start_iv,
+                )
+                time_price = _black_scholes_price(
+                    flag,
+                    end_spot,
+                    strike,
+                    end_ttm,
+                    risk_free_rate,
+                    start_iv,
+                )
+                if spot_price is None or time_price is None:
+                    complete = False
+                    failure_reason = "invalid_revaluation_model_input"
+                    break
+                scale = direction * qty * multiplier
+                delta_pnl = scaled_delta * (end_spot - start_spot)
+                local["option_delta"] += delta_pnl
+                local["spot_nonlinear"] += scale * (spot_price - start_price) - delta_pnl
+                local["theta"] += scale * (time_price - spot_price)
+                # The final endpoint uses observed mid, so the attribution remains
+                # exact even when numerical IV inversion has a small model error.
+                local["vega"] += scale * (end_price - time_price)
+            if not complete:
+                break
+
+        if not complete:
+            df.at[index, "full_revaluation_data_gap_day"] = True
+            df.at[index, "full_revaluation_data_gap_reason"] = failure_reason
+            continue
+        hedge_delta = float(df.iloc[row_number].get("hedge_delta_pnl", 0.0) or 0.0)
+        total_delta = local["option_delta"] + hedge_delta
+        total = (
+            total_delta
+            + local["spot_nonlinear"]
+            + local["theta"]
+            + local["vega"]
+        )
+        df.at[index, "full_revaluation_option_delta_pnl"] = local["option_delta"]
+        df.at[index, "full_revaluation_hedge_delta_pnl"] = hedge_delta
+        df.at[index, "full_revaluation_delta_pnl"] = total_delta
+        df.at[index, "full_revaluation_spot_nonlinear_pnl"] = local[
+            "spot_nonlinear"
+        ]
+        df.at[index, "full_revaluation_theta_pnl"] = local["theta"]
+        df.at[index, "full_revaluation_vega_pnl"] = local["vega"]
+        df.at[index, "full_revaluation_greeks_pnl"] = total
+        df.at[index, "full_revaluation_explainable_day"] = bool(
+            has_previous_option or abs(hedge_delta) > 0
+        )
+
+    df["full_revaluation_unexplained_pnl_before_fee"] = (
+        df["daily_nav_pnl_before_fee"] - df["full_revaluation_greeks_pnl"]
+    )
+    if "data_warning_reasons" in df.columns:
+        missing_contract_mask = (
+            df["data_warning_reasons"]
+            .astype("string")
+            .str.contains("missing_position_contracts", na=False)
+        )
+        df.loc[missing_contract_mask, "full_revaluation_data_gap_reason"] = (
+            df.loc[missing_contract_mask, "data_warning_reasons"].astype("string")
+        )
+        df.loc[missing_contract_mask, "full_revaluation_data_gap_day"] = True
+    else:
+        missing_contract_mask = pd.Series(False, index=df.index)
+    data_gap_mask = missing_contract_mask | df["full_revaluation_data_gap_day"]
+    if data_gap_mask.any():
+        gap_values = pd.to_numeric(
+            df["full_revaluation_unexplained_pnl_before_fee"], errors="coerce"
+        ).fillna(0.0)
+        df.loc[data_gap_mask, "full_revaluation_data_gap_pnl"] = (
+            gap_values.loc[data_gap_mask]
+        )
+    df["full_revaluation_accounted_pnl"] = (
+        df["full_revaluation_greeks_pnl"]
+        + df["full_revaluation_data_gap_pnl"]
+    )
+    df["full_revaluation_unexplained_pnl_before_fee"] = (
+        df["daily_nav_pnl_before_fee"] - df["full_revaluation_accounted_pnl"]
+    )
+    return df
+
 class BacktestEngine:
     """按交易日推进回测；long/short 独立持仓，现金和 ETF 对冲为账户级。"""
 
@@ -587,20 +835,39 @@ class BacktestEngine:
         opt_by_date,
         signals_df,
         config,
+        strategy_plugin=None,
         trading_calendar=None,
         enriched_opt_by_date=None,
         hedge_by_date=None,
+        compute_full_revaluation=True,
     ):
         self.etf_by_date = etf_by_date
         self.opt_by_date = opt_by_date
         self.enriched_opt_by_date = enriched_opt_by_date
         self.hedge_by_date = hedge_by_date
+        self.compute_full_revaluation = bool(compute_full_revaluation)
         self.signals_df = signals_df
         self.config = config
+        self.strategy_plugin = strategy_plugin
         self.daily_ohlc = vol_engine.build_daily_ohlc_df(etf_by_date)
         if trading_calendar is None:
             trading_calendar = self.daily_ohlc.index
         self.trading_calendar = pd.DatetimeIndex(trading_calendar)
+
+    @property
+    def strategy_plugin(self):
+        """Lazily provide the default plugin for direct engine users."""
+        plugin = getattr(self, "_strategy_plugin", None)
+        if plugin is None:
+            from .backtest_strategies import create_strategy
+
+            plugin = create_strategy("iv_straddle_v1", CONFIG)
+            self._strategy_plugin = plugin
+        return plugin
+
+    @strategy_plugin.setter
+    def strategy_plugin(self, plugin):
+        self._strategy_plugin = plugin
 
     def run(self):
         state = BacktestState(cash=self.config["initial_cash"])
@@ -635,8 +902,14 @@ class BacktestEngine:
             if pd.isna(feature_row["atm_iv"]) and not self._has_any_position(state):
                 continue
 
+            if self._handle_adjusted_option_liquidation(day, state):
+                self._tick_short_entry_cooldown(day, state)
+                self._record_day(day, state)
+                continue
+
             if self._has_any_position(state):
                 self._mark_current_positions_for_capacity(day, state)
+                self._remember_live_delta_trigger_before_option_actions(day, state)
                 if day["defer_delta_hedge"] or self._enforce_margin_limit(day, state):
                     self._record_day(day, state)
                     continue
@@ -671,6 +944,13 @@ class BacktestEngine:
 
         daily_df = pd.DataFrame(state.daily_records).set_index("date")
         daily_df = add_greeks_pnl(daily_df)
+        if self.compute_full_revaluation:
+            daily_df = add_full_revaluation_pnl(
+                daily_df,
+                self.enriched_opt_by_date,
+                annual_days=self.strategy_plugin.config.vol.annual_days,
+                risk_free_rate=self.strategy_plugin.config.vol.risk_free_rate,
+            )
         trades_df = pd.DataFrame(state.trades)
         return daily_df, trades_df
 
@@ -693,6 +973,7 @@ class BacktestEngine:
             "daily_option_fee": 0.0,
             "skip_new_entry_by_side": set(),
             "short_entry_cooldown_started": False,
+            "delta_hedge_triggered_before_option_actions": False,
             "defer_delta_hedge": False,
             "data_warnings": [],
         }
@@ -790,7 +1071,7 @@ class BacktestEngine:
             day["defer_delta_hedge"] = True
             return
 
-        if side == "short" and opt_position.has_short_volume_spike(
+        if side == "short" and self.strategy_plugin.has_short_volume_spike(
             position,
             call_row,
             put_row,
@@ -823,20 +1104,22 @@ class BacktestEngine:
                 )
                 * float(
                     position.get("contract_multiplier")
-                    or CONFIG.vol.contract_multiplier
+                    or self.strategy_plugin.config.vol.contract_multiplier
                 )
                 * float(spot)
             )
-            if strategy.is_short_daily_loss_aum_stop(daily_pnl, aum):
+            if self.strategy_plugin.is_short_daily_loss_stop(daily_pnl, aum):
                 close_reason = "short_daily_loss_aum_stop"
             else:
-                close_reason = strategy.get_short_close_reason(
+                close_reason = self.strategy_plugin.get_short_close_reason(
                     feature_row,
                     position_dte,
                     position,
                 )
         else:
-            close_reason = strategy.get_close_reason(feature_row, position_dte)
+            close_reason = self.strategy_plugin.get_close_reason(
+                feature_row, position_dte
+            )
 
         self._update_roll_buffer(feature_row, state, side)
         roll_signal = self._should_roll_position(day, state, side, position_dte)
@@ -857,7 +1140,7 @@ class BacktestEngine:
             day["skip_new_entry_by_side"].add(side)
             if side == "long" and close_reason == "iv_high":
                 short_cooldown_days = (
-                    CONFIG.strategy.short_cooldown_after_long_iv_high_exit_days
+                    self.strategy_plugin.short_cooldown_after_long_iv_high_exit_days
                 )
                 self._start_short_entry_cooldown(
                     day,
@@ -872,6 +1155,21 @@ class BacktestEngine:
             self._roll_position(day, state, side, call_row, put_row, pnl_greeks)
             return
 
+        target_qty = self.strategy_plugin.existing_position_target_qty(
+            feature_row,
+            side,
+        )
+        if target_qty is not None and self._resize_existing_position(
+            day,
+            state,
+            side,
+            call_row,
+            put_row,
+            int(target_qty),
+            position_dte,
+        ):
+            return
+
         self._set_existing_position_eod(
             day,
             state,
@@ -882,6 +1180,90 @@ class BacktestEngine:
             position_dte,
         )
         position["last_option_value"] = day["side_records"][side]["option_value"]
+
+    def _handle_adjusted_option_liquidation(self, day, state):
+        """Apply the live policy's all-or-nothing adjusted-contract exit."""
+        if not self.strategy_plugin.force_liquidate_adjusted_options:
+            return False
+        if not self._has_any_position(state):
+            return False
+
+        # The detector and contract-term conversion are the production live
+        # source of truth. This path mutates only BacktestState.
+        from .live import signal_engine
+
+        adjustments = signal_engine._dividend_adjustments_for_positions(
+            state.positions,
+            day["chain_df"],
+            default_multiplier=self.strategy_plugin.config.vol.contract_multiplier,
+        )
+        if not adjustments:
+            return False
+
+        for side in POSITION_SIDES:
+            position = state.positions.get(side)
+            if position is None:
+                continue
+            try:
+                call_row, put_row = self._get_position_rows(day, state, side)
+            except IndexError:
+                self._record_data_warning(
+                    day,
+                    state,
+                    side,
+                    "dividend_position_price_missing",
+                )
+                day["defer_delta_hedge"] = True
+                return True
+
+            pricing_position, _ = signal_engine._position_with_current_contract_terms(
+                position,
+                call_row,
+                put_row,
+                day["date"],
+            )
+            state.positions[side] = pricing_position
+            pnl_greeks = strategy.calc_position_greeks(
+                call_row,
+                put_row,
+                pricing_position["call_qty"],
+                pricing_position["put_qty"],
+                side=side,
+            )
+            day["side_records"][side]["pnl_greeks"] = pnl_greeks.copy()
+            trade_count = len(state.trades)
+            state.cash, _ = opt_position.close_trade(
+                day["date"],
+                state.cash,
+                pricing_position,
+                call_row,
+                put_row,
+                state.trades,
+                exit_reason="dividend_adjusted_contract_forced_liquidation",
+            )
+            self._add_new_option_fees(day, state, trade_count)
+            state.positions[side] = None
+            day["skip_new_entry_by_side"].add(side)
+
+        self._execute_etf_target(
+            day["date"],
+            day["spot"],
+            state,
+            day,
+            empty_greeks(),
+            0.0,
+            "dividend_adjusted_contract_forced_liquidation",
+        )
+        day["skip_new_entry_by_side"].update(POSITION_SIDES)
+        day["defer_delta_hedge"] = True
+        state.trades.append(
+            {
+                "date": day["date"],
+                "type": "dividend_adjusted_contract_forced_liquidation",
+                "adjustments": adjustments,
+            }
+        )
+        return True
 
     def _mark_current_positions_for_capacity(self, day, state):
         for side in POSITION_SIDES:
@@ -935,6 +1317,23 @@ class BacktestEngine:
                 int(call_row["dte"]),
             )
         self._update_day_aggregates(day, state)
+
+    def _remember_live_delta_trigger_before_option_actions(self, day, state):
+        """Keep a live-policy delta trigger active through later option actions."""
+        if not self.strategy_plugin.use_live_delta_execution_plan:
+            return
+        from .live import signal_engine
+
+        account_delta = float(day["greeks"]["delta"]) + float(
+            state.hedge_etf_qty
+        )
+        day["delta_hedge_triggered_before_option_actions"] = (
+            signal_engine._delta_hedge_triggered(
+                self.strategy_plugin.config,
+                account_delta,
+                state.positions,
+            )
+        )
 
     def _close_expired_missing_position(self, day, state, side):
         position = state.positions.get(side)
@@ -996,9 +1395,28 @@ class BacktestEngine:
         position["option_margin"] = new_margin
 
     def _entry_target_qty(self, feature_row, max_qty, side):
-        if side == "short":
-            return strategy.calc_short_entry_target_qty(feature_row, max_qty)
-        return strategy.calc_entry_target_qty(feature_row, max_qty)
+        return self.strategy_plugin.entry_target_qty(feature_row, max_qty, side)
+
+    def _roll_target_qty(self, feature_row, max_qty, side, position):
+        current_qty = int(
+            position.get(
+                "strategy_pair_qty",
+                math.floor(
+                    (
+                        int(position.get("call_qty", 0) or 0)
+                        + int(position.get("put_qty", 0) or 0)
+                    )
+                    / 2
+                ),
+            )
+            or 0
+        )
+        return self.strategy_plugin.roll_target_qty(
+            feature_row,
+            max_qty,
+            side,
+            current_qty,
+        )
 
     def _side_max_qty(self, side):
         """按方向读取每腿张数；跨式组合默认 call/put 等量。"""
@@ -1065,38 +1483,73 @@ class BacktestEngine:
         return 0
 
     def _should_roll_position(self, day, state, side, position_dte):
-        if pd.isna(day["feature_row"]["atm_strike"]):
-            return False
+        return self._roll_trigger(day, state, side, position_dte) is not None
+
+    def _roll_trigger(self, day, state, side, position_dte):
+        if not self.strategy_plugin.enable_roll:
+            return None
 
         position = state.positions[side]
-        dte_too_low = position_dte <= CONFIG.strategy.roll_dte_threshold
-        strike_roll_ready = vol_engine.spot_exceeds_one_strike_step(
-            position["strike"],
-            day["spot"],
-            day.get("chain_df"),
-            fallback_atm_strike=day["feature_row"]["atm_strike"],
-        )
-        if not (dte_too_low or strike_roll_ready):
-            return False
+        dte_too_low = position_dte <= self.strategy_plugin.roll_dte_threshold
+        atm_strike = day["feature_row"].get("atm_strike", pd.NA)
+        strike_roll_ready = False
+        if self.strategy_plugin.enable_strike_roll and pd.notna(atm_strike):
+            strike_roll_ready = vol_engine.strike_differs_by_at_least_one_step(
+                position["strike"],
+                atm_strike,
+                day.get("chain_df"),
+            )
+        if dte_too_low:
+            return "dte"
+        if not strike_roll_ready:
+            return None
 
-        target_qty = self._entry_target_qty(
+        if self.strategy_plugin.attempt_roll_without_current_entry_signal:
+            return "strike"
+
+        target_qty = self._roll_target_qty(
             day["feature_row"],
             self._proportional_side_max_qty(day, state, side),
             side,
+            position,
         )
-        return target_qty > 0
+        return "strike" if target_qty > 0 else None
 
     def _roll_position(self, day, state, side, call_row, put_row, pnl_greeks):
         date = day["date"]
         spot = day["spot"]
         position = state.positions[side]
-        atm = vol_engine.select_atm_from_chain(
-            day["chain_df"],
-            spot,
-            target_dte_min=CONFIG.strategy.roll_dte_threshold + 1,
+        roll_trigger = self._roll_trigger(
+            day,
+            state,
+            side,
+            int(call_row["dte"]),
         )
+        if roll_trigger == "strike":
+            atm = vol_engine.select_atm_from_chain_for_expiry(
+                day["chain_df"],
+                spot,
+                position.get("expiry"),
+            )
+        else:
+            atm = vol_engine.select_atm_from_chain(
+                day["chain_df"],
+                spot,
+                target_dte_min=self.strategy_plugin.roll_dte_threshold + 1,
+            )
 
         if atm is None:
+            if self.strategy_plugin.close_if_roll_candidate_unavailable:
+                self._close_hedge_before_roll(day, state, roll_trigger)
+                self._close_position_after_failed_roll(
+                    day,
+                    state,
+                    side,
+                    call_row,
+                    put_row,
+                    "roll_no_eligible_contract",
+                )
+                return
             self._set_existing_position_eod(
                 day,
                 state,
@@ -1108,16 +1561,55 @@ class BacktestEngine:
             )
             return
 
-        call_qty = self._entry_target_qty(
-            day["feature_row"],
-            self._proportional_side_max_qty(day, state, side),
+        roll_feature_row = day["feature_row"]
+        if (
+            roll_trigger != "strike"
+            and self.strategy_plugin.evaluate_roll_entry_on_candidate
+        ):
+            roll_feature_row = roll_feature_row.copy()
+            roll_feature_row["atm_iv"] = atm.get("atm_iv", pd.NA)
+            roll_feature_row["atm_strike"] = atm.get("strike", pd.NA)
+            roll_feature_row["atm_dte"] = atm.get("dte", pd.NA)
+
+        max_qty = self._proportional_side_max_qty(day, state, side)
+        candidate_target_qty = self.strategy_plugin.roll_candidate_target_qty(
+            atm.get("call"),
+            atm.get("put"),
+            max_qty,
             side,
         )
-        put_qty = self._entry_target_qty(
-            day["feature_row"],
-            self._proportional_side_max_qty(day, state, side),
-            side,
-        )
+        if candidate_target_qty is None:
+            target_qty = (
+                self._roll_target_qty(
+                    roll_feature_row,
+                    max_qty,
+                    side,
+                    position,
+                )
+                if (
+                    roll_trigger != "strike"
+                    or self.strategy_plugin.preserve_position_qty_during_roll
+                )
+                else max_qty
+            )
+        else:
+            target_qty = int(candidate_target_qty)
+        if (
+            target_qty <= 0
+            and self.strategy_plugin.close_if_roll_candidate_unavailable
+        ):
+            self._close_hedge_before_roll(day, state, roll_trigger)
+            self._close_position_after_failed_roll(
+                day,
+                state,
+                side,
+                call_row,
+                put_row,
+                "roll_entry_threshold_not_met",
+            )
+            return
+        call_qty = target_qty
+        put_qty = target_qty
         call_qty = put_qty = self._dynamic_target_qty(
             day,
             state,
@@ -1138,8 +1630,22 @@ class BacktestEngine:
             )
             return
 
+        if self.strategy_plugin.use_live_delta_execution_plan:
+            # The live target-state plan keeps the existing ETF position until
+            # the final post-option target is known, so no temporary ETF sale is
+            # available to fund the roll.
+            projected_cash = state.cash
+        else:
+            projected_cash = self._project_cash_after_hedge(
+                state.cash,
+                state,
+                date,
+                spot,
+                0.0,
+                state.hedge_underlying_order_book_id,
+            )
         projected_cash = self._project_cash_after_option_close(
-            state.cash,
+            projected_cash,
             position,
             call_row,
             put_row,
@@ -1161,24 +1667,18 @@ class BacktestEngine:
         )
         cash_would_decrease = projected_cash < state.cash
         if cash_would_decrease and not self._has_cash_reserve(projected_cash):
-            self._record_cash_reserve_skip(
-                date,
-                state,
-                "skip_roll_cash_reserve",
-                projected_cash,
-                side,
-            )
-            self._set_existing_position_eod(
+            self._close_hedge_before_roll(day, state, roll_trigger)
+            self._close_position_after_failed_roll(
                 day,
                 state,
                 side,
                 call_row,
                 put_row,
-                pnl_greeks,
-                int(call_row["dte"]),
+                "roll_cash_reserve",
             )
             return
 
+        self._close_hedge_before_roll(day, state, roll_trigger)
         trade_count = len(state.trades)
         state.cash, _ = opt_position.close_trade(
             date,
@@ -1200,14 +1700,60 @@ class BacktestEngine:
             side=side,
             spot=self._atm_underlying_price(atm, spot),
             short_entry_regime=(
-                position.get("short_entry_regime", CONFIG.strategy.short_signal_mode)
+                position.get(
+                    "short_entry_regime",
+                    self.strategy_plugin.default_short_entry_regime,
+                )
                 if side == "short"
                 else None
             ),
         )
         state.positions[side] = new_position
+        self._apply_entry_state_contract(new_position)
+        new_position["strategy_pair_qty"] = call_qty
         self._add_new_option_fees(day, state, trade_count)
         self._set_side_eod(day, state, side, option_value, projected_greeks, atm["dte"])
+
+    def _close_hedge_before_roll(self, day, state, roll_trigger):
+        if self.strategy_plugin.use_live_delta_execution_plan:
+            # Keep the current ETF holding until the final plan is available;
+            # `_execute_live_delta_plan` applies one net target after the roll.
+            return
+        self._execute_etf_target(
+            day["date"],
+            day["spot"],
+            state,
+            day,
+            day.get("greeks", empty_greeks()),
+            0.0,
+            f"close_hedge_before_{roll_trigger or 'dte'}_roll",
+        )
+        self._update_day_aggregates(day, state)
+
+    def _close_position_after_failed_roll(
+        self,
+        day,
+        state,
+        side,
+        call_row,
+        put_row,
+        exit_reason,
+    ):
+        position = state.positions[side]
+        trade_count = len(state.trades)
+        state.cash, _ = opt_position.close_trade(
+            day["date"],
+            state.cash,
+            position,
+            call_row,
+            put_row,
+            state.trades,
+            exit_reason=exit_reason,
+        )
+        self._add_new_option_fees(day, state, trade_count)
+        state.positions[side] = None
+        day["skip_new_entry_by_side"].add(side)
+        self._reset_roll_state(state, side)
 
     def _open_new_position(self, day, state, trade_type, side="long"):
         date = day["date"]
@@ -1264,7 +1810,9 @@ class BacktestEngine:
         trade_count = len(state.trades)
         short_entry_regime = None
         if side == "short":
-            short_entry_regime = strategy.get_short_open_regime(day["feature_row"])
+            short_entry_regime = self.strategy_plugin.short_entry_regime(
+                day["feature_row"]
+            )
         state.cash, new_position, option_value = opt_position.open_trade(
             date,
             state.cash,
@@ -1278,9 +1826,154 @@ class BacktestEngine:
             short_entry_regime=short_entry_regime,
         )
         state.positions[side] = new_position
+        self._apply_entry_state_contract(new_position)
+        new_position["strategy_pair_qty"] = call_qty
         self._add_new_option_fees(day, state, trade_count)
         self._set_side_eod(day, state, side, option_value, projected_greeks, atm["dte"])
         self._reset_roll_state(state, side)
+
+    def _apply_entry_state_contract(self, position):
+        if self.strategy_plugin.persist_model_entry_volume_baseline:
+            return
+        position["entry_call_volume"] = None
+        position["entry_put_volume"] = None
+        position["entry_total_volume"] = None
+
+    def _resize_existing_position(
+        self,
+        day,
+        state,
+        side,
+        call_row,
+        put_row,
+        target_pair_qty,
+        position_dte,
+        strategy_signal_iv=None,
+    ):
+        """Resize the current contracts by equal call/put amounts at daily mids."""
+        position = state.positions.get(side)
+        if position is None:
+            return False
+
+        current_call_qty = int(position.get("call_qty", 0) or 0)
+        current_put_qty = int(position.get("put_qty", 0) or 0)
+        current_pair_qty = int(
+            position.get(
+                "strategy_pair_qty",
+                math.floor((current_call_qty + current_put_qty) / 2),
+            )
+            or 0
+        )
+        target_pair_qty = int(target_pair_qty)
+        pair_change = target_pair_qty - current_pair_qty
+        if pair_change == 0:
+            position["strategy_pair_qty"] = target_pair_qty
+            return False
+
+        target_call_qty = current_call_qty + pair_change
+        target_put_qty = current_put_qty + pair_change
+        if target_call_qty <= 0 or target_put_qty <= 0:
+            self._record_data_warning(
+                day,
+                state,
+                side,
+                "dynamic_position_target_would_remove_leg",
+            )
+            return False
+
+        traded_qty = abs(pair_change)
+        fee = opt_position.calc_option_fee(traded_qty, traded_qty)
+        multiplier = float(position["contract_multiplier"])
+        premium_effect = pair_change * (
+            float(call_row["mid"]) + float(put_row["mid"])
+        ) * multiplier
+        current_margin = float(position.get("option_margin", 0.0) or 0.0)
+        if side == "short":
+            target_margin = opt_position.calc_short_margin(
+                call_row,
+                put_row,
+                target_call_qty,
+                target_put_qty,
+                self._position_underlying_price(day, position, day["spot"]),
+            )
+            margin_change = target_margin - current_margin
+            projected_cash = state.cash + premium_effect - fee - margin_change
+        else:
+            target_margin = 0.0
+            margin_change = -current_margin
+            projected_cash = state.cash - premium_effect - fee
+
+        if projected_cash < state.cash and not self._has_cash_reserve(projected_cash):
+            self._record_cash_reserve_skip(
+                day["date"],
+                state,
+                "skip_dynamic_position_resize_cash_reserve",
+                projected_cash,
+                side,
+            )
+            return False
+
+        state.cash = projected_cash
+        position["call_qty"] = target_call_qty
+        position["put_qty"] = target_put_qty
+        position["strategy_pair_qty"] = target_pair_qty
+        position["option_margin"] = target_margin
+        position["last_option_value"] = opt_position.signed_value(
+            position,
+            call_row,
+            put_row,
+        )
+        greeks = strategy.calc_position_greeks(
+            call_row,
+            put_row,
+            target_call_qty,
+            target_put_qty,
+            side=side,
+        )
+        self._set_existing_position_eod(
+            day,
+            state,
+            side,
+            call_row,
+            put_row,
+            greeks,
+            position_dte,
+        )
+        trade_type = (
+            "dynamic_position_increase_straddle"
+            if pair_change > 0
+            else "dynamic_position_decrease_straddle"
+        )
+        state.trades.append(
+            {
+                "date": day["date"],
+                "type": trade_type,
+                "cash": state.cash,
+                "fee": fee,
+                "option_margin": target_margin,
+                "margin_change": margin_change,
+                "trade_call_qty": pair_change,
+                "trade_put_qty": pair_change,
+                "position_call_qty": target_call_qty,
+                "position_put_qty": target_put_qty,
+                "strategy_pair_qty_before": current_pair_qty,
+                "strategy_pair_qty_after": target_pair_qty,
+                "strategy_signal_iv": (
+                    day["feature_row"].get("atm_iv")
+                    if strategy_signal_iv is None
+                    else strategy_signal_iv
+                ),
+                **opt_position._build_liquidity_fields(
+                    call_row,
+                    put_row,
+                    traded_qty,
+                    traded_qty,
+                ),
+                **opt_position.trade_fields(position),
+            }
+        )
+        day["daily_option_fee"] += fee
+        return True
 
     def _set_side_eod(self, day, state, side, option_value, greeks, dte):
         record = day["side_records"][side]
@@ -1699,6 +2392,7 @@ class BacktestEngine:
 
         position["call_qty"] = target_qty
         position["put_qty"] = target_qty
+        position["strategy_pair_qty"] = target_qty
         position["option_margin"] = new_margin
         position["last_option_value"] = opt_position.signed_value(
             position,
@@ -1888,7 +2582,7 @@ class BacktestEngine:
         from .live import account as live_account_store
 
         return live_account_store.AccountState(
-            product=CONFIG.data.product,
+            product=self.strategy_plugin.config.data.product,
             cash=float(state.cash),
             positions=state.positions,
             hedge=live_account_store.HedgeState(qty=float(state.hedge_etf_qty)),
@@ -1913,7 +2607,7 @@ class BacktestEngine:
         underlying_order_book_id = atm.get("underlying_order_book_id")
         if shape_only:
             return signal_engine._atm_straddle_shape_rebalance_item(
-                CONFIG,
+                self.strategy_plugin.config,
                 live_account,
                 day["chain_df"],
                 day["spot"],
@@ -1923,7 +2617,7 @@ class BacktestEngine:
                 account_delta=account_delta,
             )
         return signal_engine._atm_straddle_delta_rebalance_item(
-            CONFIG,
+            self.strategy_plugin.config,
             live_account,
             day["chain_df"],
             account_delta,
@@ -1936,11 +2630,14 @@ class BacktestEngine:
 
     def _execute_atm_straddle_rebalance(self, date, state, day, item):
         """Fill a live-planner leg-rebalance item at the backtest day's mid prices."""
-        position = state.positions.get("short")
+        side = str(item.get("side") or "short").lower()
+        if side not in POSITION_SIDES:
+            return False
+        position = state.positions.get(side)
         if position is None:
             return False
         try:
-            call_row, put_row = self._get_position_rows(day, state, "short")
+            call_row, put_row = self._get_position_rows(day, state, side)
         except IndexError:
             return False
 
@@ -1962,12 +2659,16 @@ class BacktestEngine:
             raise ValueError("ATM straddle rebalance item has inconsistent leg quantities.")
 
         current_margin = float(position.get("option_margin", 0.0) or 0.0)
-        target_margin = opt_position.calc_short_margin(
-            call_row,
-            put_row,
-            target_call_qty,
-            target_put_qty,
-            self._position_underlying_price(day, position, day["spot"]),
+        target_margin = (
+            opt_position.calc_short_margin(
+                call_row,
+                put_row,
+                target_call_qty,
+                target_put_qty,
+                self._position_underlying_price(day, position, day["spot"]),
+            )
+            if side == "short"
+            else 0.0
         )
         fee = opt_position.calc_option_fee(
             open_call_qty + close_call_qty,
@@ -1981,14 +2682,17 @@ class BacktestEngine:
             - close_put_qty * float(put_row["mid"])
         ) * multiplier
         margin_change = target_margin - current_margin
-        projected_cash = state.cash + premium_effect - fee - margin_change
+        if side == "short":
+            projected_cash = state.cash + premium_effect - fee - margin_change
+        else:
+            projected_cash = state.cash - premium_effect - fee
         if not self._has_cash_reserve(projected_cash):
             self._record_cash_reserve_skip(
                 date,
                 state,
                 "skip_atm_straddle_rebalance_cash_reserve",
                 projected_cash,
-                side="short",
+                side=side,
             )
             return False
 
@@ -2012,9 +2716,16 @@ class BacktestEngine:
             put_row,
             target_call_qty,
             target_put_qty,
-            side="short",
+            side=side,
         )
-        self._set_side_eod(day, state, "short", position["last_option_value"], greeks, int(call_row["dte"]))
+        self._set_side_eod(
+            day,
+            state,
+            side,
+            position["last_option_value"],
+            greeks,
+            int(call_row["dte"]),
+        )
         self._update_day_aggregates(day, state)
         trade_type = (
             "atm_straddle_shape_rebalance"
@@ -2033,6 +2744,7 @@ class BacktestEngine:
                 "trade_put_qty": target_put_qty - current_put_qty,
                 "position_call_qty": target_call_qty,
                 "position_put_qty": target_put_qty,
+                "side": side,
                 "estimated_delta_effect": item.get("estimated_delta_effect"),
                 "target_hedge_qty": item.get("target_hedge_qty"),
                 "projected_account_delta_after_combined_hedge": item.get(
@@ -2061,7 +2773,9 @@ class BacktestEngine:
         target_qty=None,
         trade_type="delta_hedge",
     ):
-        if not self.config.get("enable_delta_hedge", CONFIG.strategy.enable_delta_hedge):
+        if not self.config.get(
+            "enable_delta_hedge", self.strategy_plugin.enable_delta_hedge
+        ):
             return
 
         if greeks is None:
@@ -2077,21 +2791,40 @@ class BacktestEngine:
                 "close_hedge",
             )
             return
+        if (
+            target_qty is None
+            and day is not None
+            and self.strategy_plugin.use_live_delta_execution_plan
+        ):
+            self._execute_live_delta_plan(date, spot, state, day, greeks)
+            return
         option_delta = float(greeks["delta"])
         account_delta = option_delta + float(state.hedge_etf_qty)
         normalized_delta, delta_capacity = strategy.normalized_account_delta(
             account_delta,
             state.positions,
-            default_multiplier=CONFIG.vol.contract_multiplier,
+            default_multiplier=self.strategy_plugin.config.vol.contract_multiplier,
         )
         tolerance_ratio = float(
             self.config.get("delta_hedge_tolerance_ratio", 0.05)
         )
         tolerance = delta_capacity * tolerance_ratio
+        absolute_tolerance = float(
+            getattr(
+                self.strategy_plugin,
+                "delta_residual_abs_tolerance",
+                0.0,
+            )
+        )
         if (
             target_qty is None
-            and delta_capacity > 0
-            and abs(normalized_delta) <= tolerance_ratio
+            and (
+                abs(account_delta) <= absolute_tolerance + 1e-9
+                or (
+                    delta_capacity > 0
+                    and abs(normalized_delta) <= tolerance_ratio
+                )
+            )
         ):
             return
 
@@ -2101,7 +2834,7 @@ class BacktestEngine:
 
         if (
             target_qty is None
-            and getattr(CONFIG.strategy, "enable_atm_straddle_rebalance", False)
+            and self.strategy_plugin.enable_atm_straddle_shape_rebalance
         ):
             shape_item = self._atm_straddle_rebalance_item(
                 state,
@@ -2153,11 +2886,11 @@ class BacktestEngine:
         )
         self._update_day_aggregates(day, state)
         residual_delta = float(day["greeks"]["delta"]) + float(state.hedge_etf_qty)
-        if abs(residual_delta) <= tolerance:
+        if abs(residual_delta) <= max(tolerance, absolute_tolerance):
             return
         if (
             residual_delta > 0
-            and getattr(CONFIG.strategy, "enable_atm_straddle_rebalance", False)
+            and self.strategy_plugin.enable_atm_straddle_rebalance
         ):
             rebalance_item = self._atm_straddle_rebalance_item(
                 state,
@@ -2188,6 +2921,81 @@ class BacktestEngine:
             }
         )
         return
+
+    def _execute_live_delta_plan(self, date, spot, state, day, greeks):
+        """Project with the live planner, then fill one final ETF target.
+
+        The plan may contain intermediate ETF instructions around an option-leg
+        adjustment.  They are target-state evidence, not separate fills: the
+        same netting contract used by live execution collapses them before the
+        historical fill is applied.
+        """
+        from .live import etf_netting, signal_engine
+
+        atm = vol_engine.select_atm_from_chain(day["chain_df"], spot)
+        if atm is None:
+            return
+        live_account = self._live_rebalance_account(state)
+        items = signal_engine._delta_hedge_plan(
+            self.strategy_plugin.config,
+            live_account,
+            greeks,
+            spot,
+            day["chain_df"],
+            atm,
+            "FINAL_DELTA_HEDGE",
+            "Historical fill of the current live delta target-state plan.",
+            underlying_order_book_id=atm.get("underlying_order_book_id"),
+            force_to_zero=bool(
+                day.get("delta_hedge_triggered_before_option_actions", False)
+            ),
+        )
+
+        for item in items:
+            if item.get("priority") != "action":
+                continue
+            if not signal_engine._has_position_target(item):
+                continue
+            target = item.get(signal_engine.POSITION_TARGET_KEY)
+            side = str(item.get("side") or "short")
+            current = state.positions.get(side)
+            if current is None:
+                continue
+            if target is None:
+                self._reduce_position_for_margin(day, state, side, 0)
+                continue
+            same_contracts = (
+                str(target.get("call_code")) == str(current.get("call_code"))
+                and str(target.get("put_code")) == str(current.get("put_code"))
+            )
+            target_call_qty = int(target.get("call_qty", 0) or 0)
+            target_put_qty = int(target.get("put_qty", 0) or 0)
+            if same_contracts and target_call_qty == target_put_qty:
+                current_pair_qty = min(
+                    int(current.get("call_qty", 0) or 0),
+                    int(current.get("put_qty", 0) or 0),
+                )
+                if target_call_qty < current_pair_qty:
+                    self._reduce_position_for_margin(
+                        day,
+                        state,
+                        side,
+                        target_call_qty,
+                    )
+                continue
+            self._execute_atm_straddle_rebalance(date, state, day, item)
+
+        self._update_day_aggregates(day, state)
+        for item in etf_netting.netted_etf_advice_items(items):
+            self._execute_etf_target(
+                date,
+                spot,
+                state,
+                day,
+                day["greeks"],
+                float(item["target_hedge_qty"]),
+                "netted_live_delta_hedge",
+            )
 
     def _add_new_option_fees(self, day, state, trade_count):
         for trade in state.trades[trade_count:]:
@@ -2286,6 +3094,8 @@ def _backtest_config(
     short_qty=None,
     etf_fee_rate=None,
     enable_delta_hedge=None,
+    delta_hedge_tolerance_ratio=None,
+    allow_etf_short_hedge=None,
 ):
     return {
         "initial_cash": (
@@ -2306,8 +3116,16 @@ def _backtest_config(
             if enable_delta_hedge is None
             else enable_delta_hedge
         ),
-        "delta_hedge_tolerance_ratio": CONFIG.strategy.delta_hedge_tolerance_ratio,
-        "allow_etf_short_hedge": CONFIG.strategy.allow_etf_short_hedge,
+        "delta_hedge_tolerance_ratio": (
+            CONFIG.strategy.delta_hedge_tolerance_ratio
+            if delta_hedge_tolerance_ratio is None
+            else delta_hedge_tolerance_ratio
+        ),
+        "allow_etf_short_hedge": (
+            CONFIG.strategy.allow_etf_short_hedge
+            if allow_etf_short_hedge is None
+            else allow_etf_short_hedge
+        ),
         "dynamic_position_control_enabled": (
             CONFIG.backtest.dynamic_position_control_enabled
         ),
@@ -2329,10 +3147,21 @@ def run_backtest(
     short_qty=None,
     etf_fee_rate=None,
     enable_delta_hedge=None,
+    strategy_plugin=None,
     trading_calendar=None,
     enriched_opt_by_date=None,
     hedge_by_date=None,
+    compute_full_revaluation=True,
 ):
+    if strategy_plugin is None:
+        from .backtest_strategies import create_strategy
+
+        strategy_plugin = create_strategy("iv_straddle_v1", CONFIG)
+    runtime_delta_hedge = (
+        strategy_plugin.enable_delta_hedge
+        if enable_delta_hedge is None
+        else enable_delta_hedge
+    )
     engine = BacktestEngine(
         etf_by_date,
         opt_by_date,
@@ -2343,10 +3172,16 @@ def run_backtest(
             long_qty=long_qty,
             short_qty=short_qty,
             etf_fee_rate=etf_fee_rate,
-            enable_delta_hedge=enable_delta_hedge,
+            enable_delta_hedge=runtime_delta_hedge,
+            delta_hedge_tolerance_ratio=(
+                strategy_plugin.delta_hedge_tolerance_ratio
+            ),
+            allow_etf_short_hedge=strategy_plugin.allow_etf_short_hedge,
         ),
+        strategy_plugin=strategy_plugin,
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
         hedge_by_date=hedge_by_date,
+        compute_full_revaluation=compute_full_revaluation,
     )
     return engine.run()

@@ -7,6 +7,11 @@ import numpy as np
 import pandas as pd
 
 import core
+from core.backtest_strategies import (
+    available_strategy_ids,
+    create_strategy,
+    resolve_strategy_config,
+)
 
 CONFIG = core.config.CONFIG
 
@@ -46,6 +51,18 @@ def parse_args():
         default=None,
     )
     parser.add_argument("--max-margin-to-nav-ratio", type=float, default=None)
+    parser.add_argument("--long-open-iv-threshold", type=float, default=None)
+    parser.add_argument("--long-close-iv-threshold", type=float, default=None)
+    parser.add_argument("--short-open-iv-threshold", type=float, default=None)
+    parser.add_argument("--short-close-iv-threshold", type=float, default=None)
+    parser.add_argument("--atm-target-dte", type=int, default=None)
+    parser.add_argument("--roll-dte-threshold", type=int, default=None)
+    parser.add_argument(
+        "--strategy",
+        choices=available_strategy_ids(),
+        default="iv_straddle_v1",
+        help="回测使用的单个策略插件。",
+    )
     return parser.parse_args()
 
 
@@ -63,8 +80,9 @@ def sync_config(config):
 
 
 def select_runtime_config(args):
-    """读取品种配置，并应用命令行日期覆盖。"""
+    """Resolve public product config, plugin profile, then CLI overrides."""
     selected_config = core.config.load_config(args.product)
+    selected_config = resolve_strategy_config(selected_config, args.strategy)
     backtest_updates = {
         key: value
         for key, value in {
@@ -82,6 +100,28 @@ def select_runtime_config(args):
         selected_config = replace(
             selected_config,
             backtest=replace(selected_config.backtest, **backtest_updates),
+        )
+    strategy_updates = {
+        key: value
+        for key, value in {
+            "long_open_iv_threshold": getattr(args, "long_open_iv_threshold", None),
+            "long_close_iv_threshold": getattr(args, "long_close_iv_threshold", None),
+            "short_open_iv_threshold": getattr(args, "short_open_iv_threshold", None),
+            "short_close_iv_threshold": getattr(args, "short_close_iv_threshold", None),
+            "roll_dte_threshold": getattr(args, "roll_dte_threshold", None),
+        }.items()
+        if value is not None
+    }
+    if strategy_updates:
+        selected_config = replace(
+            selected_config,
+            strategy=replace(selected_config.strategy, **strategy_updates),
+        )
+    atm_target_dte = getattr(args, "atm_target_dte", None)
+    if atm_target_dte is not None:
+        selected_config = replace(
+            selected_config,
+            vol=replace(selected_config.vol, atm_target_dte=atm_target_dte),
         )
     return selected_config
 
@@ -126,6 +166,8 @@ def build_daily_report(features, daily_pnl):
 
 
 def format_money(value):
+    if pd.isna(value):
+        return "NA"
     return f"{value:,.2f}"
 
 
@@ -182,6 +224,21 @@ def calc_return_stats(daily_pnl):
     }
 
 
+def option_trade_mask(trades):
+    """Identify option-leg trades without matching ETF rows by name substring."""
+    if trades.empty:
+        return pd.Series(False, index=trades.index, dtype=bool)
+    call_qty = pd.to_numeric(
+        trades.get("trade_call_qty", pd.Series(0.0, index=trades.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    put_qty = pd.to_numeric(
+        trades.get("trade_put_qty", pd.Series(0.0, index=trades.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    return call_qty.ne(0.0) | put_qty.ne(0.0)
+
+
 def calc_summary_breakdown(daily_pnl, trades):
     """汇总 Greeks 和手续费解释项；未解释项只作为差额展示，不当作校验依据。"""
     total_pnl = daily_pnl["nav"].iloc[-1] - CONFIG.backtest.initial_cash
@@ -189,20 +246,11 @@ def calc_summary_breakdown(daily_pnl, trades):
     option_fee = 0.0
     option_fee_by_side = {"long": 0.0, "short": 0.0}
     if not trades.empty and "fee" in trades.columns:
-        option_trade_mask = (
-            trades["type"].str.contains("straddle", na=False)
-            | trades["type"].isin(
-                [
-                    "option_delta_hedge_combination",
-                    "gamma_neutral_option_delta_hedge",
-                    "close_option_delta_hedge",
-                ]
-            )
-        )
-        option_fee = trades.loc[option_trade_mask, "fee"].sum()
+        option_mask = option_trade_mask(trades)
+        option_fee = trades.loc[option_mask, "fee"].sum()
         if "side" in trades.columns:
             for side in option_fee_by_side:
-                side_mask = option_trade_mask & trades["side"].eq(side)
+                side_mask = option_mask & trades["side"].eq(side)
                 option_fee_by_side[side] = trades.loc[side_mask, "fee"].sum()
     liquidity_warnings = {
         "warning_trades": 0,
@@ -210,20 +258,20 @@ def calc_summary_breakdown(daily_pnl, trades):
         "missing_volume_trades": 0,
     }
     if not trades.empty and "liquidity_warning" in trades.columns:
-        option_trade_mask = trades["type"].str.contains("straddle", na=False)
+        option_mask = option_trade_mask(trades)
         warning_mask = trades["liquidity_warning"].eq(True)
         liquidity_warnings["warning_trades"] = int(
-            (option_trade_mask & warning_mask).sum()
+            (option_mask & warning_mask).sum()
         )
         for leg_col in ["call_liquidity_warning", "put_liquidity_warning"]:
             if leg_col in trades.columns:
                 liquidity_warnings["warning_legs"] += int(
-                    trades.loc[option_trade_mask, leg_col].eq(True).sum()
+                    trades.loc[option_mask, leg_col].eq(True).sum()
                 )
         if "liquidity_volume_missing_legs" in trades.columns:
             missing_mask = trades["liquidity_volume_missing_legs"].fillna("").ne("")
             liquidity_warnings["missing_volume_trades"] = int(
-                (option_trade_mask & missing_mask).sum()
+                (option_mask & missing_mask).sum()
             )
 
     etf_fee = daily_pnl["etf_fee"].sum()
@@ -273,6 +321,21 @@ def calc_summary_breakdown(daily_pnl, trades):
             ),
             "option_fee": -option_fee_by_side[side],
             "days": int(daily_pnl[f"{prefix}greeks_explainable_day"].sum()),
+        }
+    exact_columns = {
+        "delta": "full_revaluation_delta_pnl",
+        "spot_nonlinear": "full_revaluation_spot_nonlinear_pnl",
+        "vega": "full_revaluation_vega_pnl",
+        "theta": "full_revaluation_theta_pnl",
+        "total": "full_revaluation_greeks_pnl",
+        "data_gap": "full_revaluation_data_gap_pnl",
+        "accounted": "full_revaluation_accounted_pnl",
+        "unexplained": "full_revaluation_unexplained_pnl_before_fee",
+    }
+    if set(exact_columns.values()).issubset(daily_pnl.columns):
+        components["full_revaluation"] = {
+            key: float(daily_pnl[column].sum(skipna=True))
+            for key, column in exact_columns.items()
         }
     components["liquidity_warnings"] = liquidity_warnings
     components["explained_subtotal"] = sum(
@@ -377,6 +440,34 @@ def print_summary(daily_pnl, trades):
     print_side_breakdown("Long", breakdown["by_side"]["long"])
     print_side_breakdown("Short", breakdown["by_side"]["short"])
 
+    full_revaluation = breakdown.get("full_revaluation")
+    if full_revaluation is not None:
+        print("\n=== 完整重估归因（逐日精确对账，手续费前） ===")
+        print_breakdown_item("Delta PnL", full_revaluation["delta"], total_before_fee)
+        print_breakdown_item(
+            "Spot非线性PnL（Gamma及高阶项）",
+            full_revaluation["spot_nonlinear"],
+            total_before_fee,
+        )
+        print_breakdown_item("Vega/IV重估PnL", full_revaluation["vega"], total_before_fee)
+        print_breakdown_item("Theta/时间重估PnL", full_revaluation["theta"], total_before_fee)
+        print_breakdown_item("模型完整重估PnL", full_revaluation["total"], total_before_fee)
+        print_breakdown_item(
+            "数据缺口/到期结算PnL",
+            full_revaluation["data_gap"],
+            total_before_fee,
+        )
+        print_breakdown_item(
+            "完整归因PnL",
+            full_revaluation["accounted"],
+            total_before_fee,
+        )
+        print_breakdown_item(
+            "完整重估对账差额",
+            full_revaluation["unexplained"],
+            total_before_fee,
+        )
+
     print("\n=== 手续费 ===")
     print_breakdown_item("期权手续费", breakdown["option_fee"], total_pnl)
     print_breakdown_item("ETF 手续费", breakdown["etf_fee"], total_pnl)
@@ -401,11 +492,11 @@ def calc_liquidity_warning_stats(trades):
     if trades.empty or "liquidity_warning" not in trades.columns:
         return stats
 
-    option_trade_mask = trades["type"].str.contains("straddle", na=False)
+    option_mask = option_trade_mask(trades)
     warning_mask = trades["liquidity_warning"].eq(True)
-    stats["warning_trades"] = int((option_trade_mask & warning_mask).sum())
+    stats["warning_trades"] = int((option_mask & warning_mask).sum())
     warning_legs = []
-    option_trades = trades.loc[option_trade_mask]
+    option_trades = trades.loc[option_mask]
     for leg in ["call", "put"]:
         leg_col = f"{leg}_liquidity_warning"
         if leg_col in trades.columns:
@@ -435,7 +526,7 @@ def calc_liquidity_warning_stats(trades):
         stats["worst_warning"] = max(warning_legs, key=lambda item: item["ratio"])
     if "liquidity_volume_missing_legs" in trades.columns:
         missing_mask = trades["liquidity_volume_missing_legs"].fillna("").ne("")
-        stats["missing_volume_trades"] = int((option_trade_mask & missing_mask).sum())
+        stats["missing_volume_trades"] = int((option_mask & missing_mask).sum())
     return stats
 
 
@@ -561,6 +652,40 @@ def save_summary_files(output_dir, daily_pnl, trades):
         f"Theta PnL: {format_money(breakdown['by_side']['short']['theta'])}",
         f"Greeks PnL: {format_money(breakdown['by_side']['short']['greeks_trading'])}",
         "",
+        "=== 完整重估归因（逐日精确对账，手续费前） ===",
+        (
+            "Delta PnL: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('delta', pd.NA))}"
+        ),
+        (
+            "Spot非线性PnL（Gamma及高阶项）: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('spot_nonlinear', pd.NA))}"
+        ),
+        (
+            "Vega/IV重估PnL: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('vega', pd.NA))}"
+        ),
+        (
+            "Theta/时间重估PnL: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('theta', pd.NA))}"
+        ),
+        (
+            "模型完整重估PnL: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('total', pd.NA))}"
+        ),
+        (
+            "数据缺口/到期结算PnL: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('data_gap', pd.NA))}"
+        ),
+        (
+            "完整归因PnL: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('accounted', pd.NA))}"
+        ),
+        (
+            "完整重估对账差额: "
+            f"{format_money(breakdown.get('full_revaluation', {}).get('unexplained', pd.NA))}"
+        ),
+        "",
         "=== 手续费 ===",
         f"期权手续费: {format_money(breakdown['option_fee'])}",
         f"ETF 手续费: {format_money(breakdown['etf_fee'])}",
@@ -628,6 +753,38 @@ def save_summary_files(output_dir, daily_pnl, trades):
             "unexplained_pnl_before_fee",
             breakdown["unexplained_trading_before_fee"],
         ),
+        (
+            "full_revaluation_delta_pnl",
+            breakdown.get("full_revaluation", {}).get("delta", pd.NA),
+        ),
+        (
+            "full_revaluation_spot_nonlinear_pnl",
+            breakdown.get("full_revaluation", {}).get("spot_nonlinear", pd.NA),
+        ),
+        (
+            "full_revaluation_vega_pnl",
+            breakdown.get("full_revaluation", {}).get("vega", pd.NA),
+        ),
+        (
+            "full_revaluation_theta_pnl",
+            breakdown.get("full_revaluation", {}).get("theta", pd.NA),
+        ),
+        (
+            "full_revaluation_total_pnl",
+            breakdown.get("full_revaluation", {}).get("total", pd.NA),
+        ),
+        (
+            "full_revaluation_data_gap_pnl",
+            breakdown.get("full_revaluation", {}).get("data_gap", pd.NA),
+        ),
+        (
+            "full_revaluation_accounted_pnl",
+            breakdown.get("full_revaluation", {}).get("accounted", pd.NA),
+        ),
+        (
+            "full_revaluation_unexplained_pnl_before_fee",
+            breakdown.get("full_revaluation", {}).get("unexplained", pd.NA),
+        ),
         ("option_fee", breakdown["option_fee"]),
         ("etf_fee", breakdown["etf_fee"]),
         ("actual_pnl_before_fee", total_before_fee),
@@ -651,10 +808,19 @@ def make_output_dir():
     return output_dir
 
 
-def save_runtime_config(output_dir):
+def save_runtime_config(output_dir, runtime_config=None):
     """保存本次运行实际使用的配置，方便回看结果时确认参数是否生效。"""
+    effective_config = CONFIG if runtime_config is None else runtime_config
     (output_dir / "runtime_config.json").write_text(
-        json.dumps(asdict(CONFIG), ensure_ascii=False, indent=2),
+        json.dumps(asdict(effective_config), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def save_strategy_metadata(output_dir, strategy_plugin):
+    """Persist the selected backtest strategy alongside the runtime config."""
+    (output_dir / "strategy_metadata.json").write_text(
+        json.dumps(strategy_plugin.metadata(), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -829,7 +995,8 @@ def main():
         CONFIG.backtest.start,
         CONFIG.backtest.end,
     )
-    signals = core.strategy.build_signals(features)
+    strategy_plugin = create_strategy(args.strategy, CONFIG)
+    signals = strategy_plugin.build_signals(features)
     daily_pnl, trades = core.backtester.run_backtest(
         etf_by_date,
         opt_by_date,
@@ -837,9 +1004,11 @@ def main():
         trading_calendar=trading_calendar,
         enriched_opt_by_date=enriched_opt_by_date,
         hedge_by_date=hedge_by_date,
+        strategy_plugin=strategy_plugin,
     )
     output_dir = make_output_dir()
-    save_runtime_config(output_dir)
+    save_runtime_config(output_dir, strategy_plugin.config)
+    save_strategy_metadata(output_dir, strategy_plugin)
 
     daily_report = build_daily_report(features, daily_pnl)
     daily_report.to_csv(output_dir / "daily_feature_position.csv", encoding="utf-8-sig")

@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 import core
-from . import account_report, market_data, portfolio_account, storage
+from . import account_report, corporate_actions, market_data, portfolio_account, storage
 
 
 TEMPLATE_REPORT_PATH = (
@@ -248,6 +248,10 @@ def _combined_daily_frames(payloads, errors):
         frames_by_sheet[SUMMARY_TEMPLATE_SHEET],
         frames_by_sheet["持仓记录"],
     )
+    frames_by_sheet[SUMMARY_TEMPLATE_SHEET] = _backfill_summary_pnl_from_positions(
+        frames_by_sheet[SUMMARY_TEMPLATE_SHEET],
+        frames_by_sheet["持仓记录"],
+    )
     return frames_by_sheet
 
 
@@ -262,6 +266,13 @@ def _product_summary_frame(product, payload, frames):
     )
     if "备注" not in frame.columns:
         frame["备注"] = None
+    dividend_note = account_report._dividend_report_note(payload)
+    if dividend_note:
+        current_date = str(payload.get("date"))
+        current_mask = pd.to_datetime(frame["日期"], errors="coerce").dt.strftime(
+            "%Y-%m-%d"
+        ).eq(current_date)
+        frame.loc[current_mask, "备注"] = dividend_note
     return frame.reindex(columns=SUMMARY_REPORT_COLUMNS)
 
 
@@ -662,14 +673,19 @@ def _backfill_summary_pnl_from_positions(summary_frame, position_frame):
     positions["_summary_pnl_strategy"] = positions[STRATEGY_NAME_COLUMN].map(
         _canonical_strategy_name
     )
-    positions["_summary_pnl_holding"] = pd.to_numeric(
+    holding_values = pd.to_numeric(
         positions["持仓盈亏"],
         errors="coerce",
-    ).fillna(0.0)
-    positions["_summary_pnl_trade"] = pd.to_numeric(
+    )
+    trade_values = pd.to_numeric(
         positions["交易盈亏"],
         errors="coerce",
-    ).fillna(0.0)
+    )
+    positions = positions.loc[holding_values.notna() | trade_values.notna()].copy()
+    if positions.empty:
+        return summary_frame
+    positions["_summary_pnl_holding"] = holding_values.loc[positions.index].fillna(0.0)
+    positions["_summary_pnl_trade"] = trade_values.loc[positions.index].fillna(0.0)
     positions["_summary_pnl_total"] = (
         positions["_summary_pnl_holding"] + positions["_summary_pnl_trade"]
     )
@@ -842,6 +858,12 @@ def _backfill_position_holding_pnl(frame, payloads=None, trade_frame=None):
             multiplier = 1.0
             if not pd.isna(row.get("到期日")):
                 multiplier = _contract_multiplier(product)
+            cash_distribution = 0.0
+            if pd.isna(row.get("到期日")) and product is not None:
+                cash_distribution = corporate_actions.cash_distribution_per_share(
+                    product,
+                    row.get("日期"),
+                )
             pnl = account_report._daily_position_pnl_breakdown(
                 current_qty=qty,
                 current_side=(
@@ -862,6 +884,7 @@ def _backfill_position_holding_pnl(frame, payloads=None, trade_frame=None):
                 ),
                 trade_rows=trade_rows,
                 multiplier=multiplier,
+                cash_distribution_per_unit=cash_distribution,
             )
             result.at[index, "持仓盈亏"] = pnl["holding_pnl"]
             if "交易盈亏" in result.columns:

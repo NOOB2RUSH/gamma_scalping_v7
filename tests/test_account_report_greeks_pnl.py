@@ -9,6 +9,140 @@ from core.live import account_report
 
 
 class AccountReportGreeksPnlTest(unittest.TestCase):
+    def test_unapproved_dividend_fields_are_not_report_columns(self):
+        forbidden = {"应收股利", "资金口径净单日盈亏"}
+
+        self.assertTrue(forbidden.isdisjoint(account_report.SUMMARY_COLUMNS))
+        self.assertTrue(
+            forbidden.isdisjoint(account_report.DEFAULT_SUMMARY_REPORT_COLUMNS)
+        )
+        self.assertTrue(
+            forbidden.isdisjoint(account_report.DIAGNOSE_SUMMARY_REPORT_COLUMNS)
+        )
+
+    def test_corporate_action_full_revaluation_matches_option_price_change(self):
+        config = account_report.load_product_config("500etf")
+        previous_spot = 8.413
+        current_spot = 8.151
+        distribution = 0.149
+        new_strike = 8.104
+        old_multiplier = 10000
+        new_multiplier = 10180
+        start_iv = 0.25
+        end_iv = 0.30
+        start_dte = 6.0
+        end_dte = 5.0
+        adjusted_start_price = account_report._black_scholes_price(
+            "c",
+            previous_spot - distribution,
+            new_strike,
+            start_dte / config.vol.annual_days,
+            config.vol.risk_free_rate,
+            start_iv,
+        )
+        current_price = account_report._black_scholes_price(
+            "c",
+            current_spot,
+            new_strike,
+            end_dte / config.vol.annual_days,
+            config.vol.risk_free_rate,
+            end_iv,
+        )
+        previous_positions = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-07-14",
+                    "方向": "short",
+                    "合约代码": "10011720",
+                    "合约名称": "500ETF购7月8250",
+                    "总持仓": 10,
+                    "最新价": adjusted_start_price * new_multiplier / old_multiplier,
+                    "行权价": 8.25,
+                    "到期日": "2026-07-22",
+                    "合约乘数": old_multiplier,
+                    "IV": start_iv,
+                }
+            ]
+        )
+        adjustments = {
+            "10011720": {
+                "new_strike": new_strike,
+                "new_contract_multiplier": new_multiplier,
+            }
+        }
+
+        with (
+            mock.patch.object(
+                account_report,
+                "_option_close_price_from_quote_snapshot",
+                return_value=current_price,
+            ),
+            mock.patch.object(
+                account_report,
+                "_option_close_dte",
+                side_effect=[start_dte, end_dte],
+            ),
+        ):
+            parts = account_report._corporate_action_option_revaluation_parts(
+                "500etf",
+                "2026-07-15",
+                previous_spot,
+                current_spot,
+                distribution,
+                previous_positions,
+                adjustments,
+            )
+
+        expected = -10 * new_multiplier * (
+            current_price - adjusted_start_price
+        )
+        self.assertAlmostEqual(sum(parts.values()), expected, places=6)
+
+    def test_ex_dividend_close_day_uses_total_return_and_previous_greeks(self):
+        history = pd.DataFrame(
+            [
+                {
+                    "\u65e5\u671f": "2026-07-14",
+                    "\u8d26\u6237ID": "default",
+                    "\u6807\u7684\u4ef7\u683c": 8.413,
+                    "\u5bf9\u51b2\u6700\u65b0\u4ef7": 8.413,
+                    "\u5bf9\u51b2\u6301\u4ed3": 34000,
+                    "Call IV": 0.25,
+                    "Put IV": 0.30,
+                    "Call Delta": 1.0,
+                    "Put Delta": 0.0,
+                    "Call Gamma": 2.0,
+                    "Put Gamma": 0.0,
+                    "Call Vega": 0.0,
+                    "Put Vega": 0.0,
+                    "Call Theta": 4.0,
+                    "Put Theta": 0.0,
+                },
+                {
+                    "\u65e5\u671f": "2026-07-15",
+                    "\u8d26\u6237ID": "default",
+                    "\u6807\u7684\u4ef7\u683c": 8.151,
+                    "\u5bf9\u51b2\u6700\u65b0\u4ef7": 8.151,
+                    "\u5bf9\u51b2\u6301\u4ed3": 0,
+                },
+            ]
+        )
+
+        result = account_report._add_summary_greeks_pnl_for_account(
+            history,
+            product="500etf",
+        )
+        row = result.iloc[-1]
+        total_return_change = 8.151 + 0.149 - 8.413
+
+        self.assertAlmostEqual(row["ETF\u5355\u65e5\u76c8\u4e8f"], 34000 * total_return_change)
+        self.assertAlmostEqual(row["\u671f\u6743\u5355\u65e5DeltaPnL"], total_return_change)
+        self.assertAlmostEqual(
+            row["\u671f\u6743\u5355\u65e5GammaPnL"],
+            0.5 * 2.0 * total_return_change**2,
+        )
+        self.assertEqual(row["\u671f\u6743\u5355\u65e5ThetaPnL"], 4.0)
+
     def test_transaction_greeks_columns_are_internal_only(self):
         internal_columns = {
             "\u4ea4\u6613DeltaPnL",

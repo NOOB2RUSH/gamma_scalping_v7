@@ -58,6 +58,7 @@ class StrategyConfig:
     short_daily_loss_aum_threshold: float = -0.015
     enable_delta_hedge: bool = False
     delta_hedge_tolerance_ratio: float = 0.05
+    delta_residual_abs_tolerance: float = 5_000.0
     allow_etf_short_hedge: bool = True
     enable_atm_straddle_rebalance: bool = False
     atm_rebalance_target_pair_qty: int | None = None

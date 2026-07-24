@@ -176,7 +176,7 @@ class LiveMultiProductSupportTest(unittest.TestCase):
                 self.assertEqual(config.backtest.long_qty, 10)
                 self.assertEqual(config.backtest.short_qty, 10)
 
-    def test_live_entry_advice_uses_ten_contracts_per_leg(self):
+    def test_live_entry_advice_uses_effective_product_config_quantities(self):
         config = SimpleNamespace(backtest=SimpleNamespace(long_qty=99, short_qty=88))
         feature = {
             "long_open_signal": True,
@@ -207,7 +207,7 @@ class LiveMultiProductSupportTest(unittest.TestCase):
 
         self.assertEqual(
             [(item["call_qty"], item["put_qty"]) for item in advice],
-            [(10, 10), (10, 10)],
+            [(99, 99), (88, 88)],
         )
 
     def test_historical_option_metadata_uses_exact_date_and_cache(self):

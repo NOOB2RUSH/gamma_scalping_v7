@@ -3,18 +3,62 @@ from __future__ import annotations
 import argparse
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import akshare as ak
 import pandas as pd
 
 
-ETF_SYMBOL = "588000"
-ETF_FILE_PREFIX = "588000.XSHG"
-OPTION_FILE_PREFIX = "KC50ETF_OPTION"
 CONTRACT_MULTIPLIER = 10000
 CALL_TEXT = "\u770b\u6da8\u671f\u6743"
 PUT_TEXT = "\u770b\u8dcc\u671f\u6743"
+
+
+@dataclass(frozen=True)
+class ProductSpec:
+    product: str
+    display_name: str
+    etf_symbol: str
+    etf_file_prefix: str
+    option_file_prefix: str
+    option_list_symbol: str
+
+
+PRODUCT_SPECS = {
+    "300etf": ProductSpec(
+        product="300etf",
+        display_name="沪深300ETF",
+        etf_symbol="510300",
+        etf_file_prefix="510300.XSHG",
+        option_file_prefix="300ETF_OPTION",
+        option_list_symbol="300ETF",
+    ),
+    "500etf": ProductSpec(
+        product="500etf",
+        display_name="中证500ETF",
+        etf_symbol="510500",
+        etf_file_prefix="510500.XSHG",
+        option_file_prefix="500ETF_OPTION",
+        option_list_symbol="500ETF",
+    ),
+    "kc50etf": ProductSpec(
+        product="kc50etf",
+        display_name="科创50ETF",
+        etf_symbol="588000",
+        etf_file_prefix="588000.XSHG",
+        option_file_prefix="KC50ETF_OPTION",
+        option_list_symbol="588000",
+    ),
+}
+
+ACTIVE_SPEC = PRODUCT_SPECS["300etf"]
+
+
+def configure_product(product: str) -> ProductSpec:
+    global ACTIVE_SPEC
+    ACTIVE_SPEC = PRODUCT_SPECS[product]
+    return ACTIVE_SPEC
 
 
 def ak_call(func, *args, retries=3, sleep=1.0, **kwargs):
@@ -28,7 +72,7 @@ def ak_call(func, *args, retries=3, sleep=1.0, **kwargs):
             if attempt == retries:
                 break
             print(
-                f"[kc50etf] retry {func.__name__} {attempt}/{retries}: "
+                f"[{ACTIVE_SPEC.product}] retry {func.__name__} {attempt}/{retries}: "
                 f"{type(exc).__name__}",
                 flush=True,
             )
@@ -41,7 +85,7 @@ def fetch_etf_history(start, end):
     try:
         df = ak_call(
             ak.fund_etf_hist_em,
-            symbol=ETF_SYMBOL,
+            symbol=ACTIVE_SPEC.etf_symbol,
             period="daily",
             start_date=start,
             end_date=end,
@@ -50,10 +94,10 @@ def fetch_etf_history(start, end):
         source = "em"
     except Exception as exc:
         print(
-            f"[kc50etf] fund_etf_hist_em failed, fallback to sina: {type(exc).__name__}",
+            f"[{ACTIVE_SPEC.product}] fund_etf_hist_em failed, fallback to sina: {type(exc).__name__}",
             flush=True,
         )
-        df = ak_call(ak.fund_etf_hist_sina, symbol=f"sh{ETF_SYMBOL}")
+        df = ak_call(ak.fund_etf_hist_sina, symbol=f"sh{ACTIVE_SPEC.etf_symbol}")
         source = "sina"
 
     if df.empty:
@@ -84,16 +128,22 @@ def fetch_etf_history(start, end):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "下载华夏科创50ETF(588000)与对应 ETF 期权数据。"
+            "下载指定上交所 ETF 与对应 ETF 期权数据。"
             "期权历史日线没有历史 bid/ask，因此统一使用 close 近似 bid=ask=mid。"
         )
+    )
+    parser.add_argument(
+        "--product",
+        choices=tuple(PRODUCT_SPECS),
+        required=True,
+        help="下载品种。",
     )
     parser.add_argument("--start", required=True, help="开始日期，例如 20260520")
     parser.add_argument("--end", required=True, help="结束日期，例如 20260521")
     parser.add_argument(
         "--output-root",
-        default="data/kc50etf",
-        help="输出根目录，默认 data/kc50etf。",
+        default=None,
+        help="输出根目录，默认 data/<product>。",
     )
     parser.add_argument(
         "--request-sleep",
@@ -139,7 +189,7 @@ def download_etf(start, end, output_dir):
         payload = row.drop(columns=["date"]).reset_index(drop=True)
         file_path = (
             output_dir
-            / f"{ETF_FILE_PREFIX}_{date.strftime('%Y-%m-%d')}_price.parquet"
+            / f"{ACTIVE_SPEC.etf_file_prefix}_{date.strftime('%Y-%m-%d')}_price.parquet"
         )
         payload.to_parquet(file_path, index=False)
 
@@ -168,9 +218,12 @@ def adjust_to_trading_day(date, trading_calendar):
 
 
 def parse_contract_id(contract_id):
-    match = re.fullmatch(r"588000([CP])(\d{2})(\d{2})([A-Z]?)(\d+)", contract_id)
+    pattern = rf"{re.escape(ACTIVE_SPEC.etf_symbol)}([CP])(\d{{2}})(\d{{2}})([A-Z]?)(\d+)"
+    match = re.fullmatch(pattern, contract_id)
     if match is None:
-        raise ValueError(f"无法解析科创50ETF期权合约交易代码: {contract_id}")
+        raise ValueError(
+            f"无法解析 {ACTIVE_SPEC.display_name} 期权合约交易代码: {contract_id}"
+        )
     option_type = match.group(1)
     year = 2000 + int(match.group(2))
     month = int(match.group(3))
@@ -212,7 +265,9 @@ def discover_contracts_from_risk(start, end, trading_calendar, request_sleep):
         date_text = date.strftime("%Y%m%d")
         try:
             risk_df = ak_call(ak.option_risk_indicator_sse, date=date_text)
-            risk_df = risk_df[risk_df["CONTRACT_ID"].astype(str).str.startswith("588000")]
+            risk_df = risk_df[
+                risk_df["CONTRACT_ID"].astype(str).str.startswith(ACTIVE_SPEC.etf_symbol)
+            ]
             for _, row in risk_df.iterrows():
                 code = str(row["SECURITY_ID"])
                 metadata.setdefault(
@@ -220,13 +275,16 @@ def discover_contracts_from_risk(start, end, trading_calendar, request_sleep):
                     metadata_from_risk_row(row, trading_calendar),
                 )
             print(
-                f"[kc50etf] risk {idx}/{len(dates)} {date_text}: "
+                f"[{ACTIVE_SPEC.product}] risk {idx}/{len(dates)} {date_text}: "
                 f"active={len(risk_df)}, unique={len(metadata)}",
                 flush=True,
             )
         except Exception as exc:
             errors.append({"date": date_text, "code": "", "error": repr(exc)})
-            print(f"[kc50etf] risk {date_text} failed: {type(exc).__name__}", flush=True)
+            print(
+                f"[{ACTIVE_SPEC.product}] risk {date_text} failed: {type(exc).__name__}",
+                flush=True,
+            )
         time.sleep(request_sleep)
     return metadata, errors
 
@@ -234,7 +292,7 @@ def discover_contracts_from_risk(start, end, trading_calendar, request_sleep):
 def discover_current_contracts(trading_calendar, request_sleep):
     metadata = {}
     errors = []
-    months = ak_call(ak.option_sse_list_sina, symbol=ETF_SYMBOL)
+    months = ak_call(ak.option_sse_list_sina, symbol=ACTIVE_SPEC.option_list_symbol)
     for month in months:
         for symbol, option_type in [(CALL_TEXT, "C"), (PUT_TEXT, "P")]:
             try:
@@ -242,7 +300,7 @@ def discover_current_contracts(trading_calendar, request_sleep):
                     ak.option_sse_codes_sina,
                     symbol=symbol,
                     trade_date=month,
-                    underlying=ETF_SYMBOL,
+                    underlying=ACTIVE_SPEC.etf_symbol,
                 )
                 code_col = codes.columns[1]
                 for code in codes[code_col].astype(str):
@@ -253,7 +311,7 @@ def discover_current_contracts(trading_calendar, request_sleep):
                         field_map = dict(zip(spot_df[field_col], spot_df[value_col]))
                         contract_symbol = field_map.get("期权合约简称", "")
                         contract_id = (
-                            f"588000{option_type}{month[2:]}M"
+                            f"{ACTIVE_SPEC.etf_symbol}{option_type}{month[2:]}M"
                             f"{int(float(field_map.get('行权价')) * 1000):05d}"
                         )
                         year = int(month[:4])
@@ -326,7 +384,7 @@ def build_contract_history(code, metadata, start, end):
 
 def fetch_official_side_volume(date):
     stats = ak_call(ak.option_daily_stats_sse, date=date.strftime("%Y%m%d"))
-    row = stats[stats.iloc[:, 0].astype(str) == ETF_SYMBOL]
+    row = stats[stats.iloc[:, 0].astype(str) == ACTIVE_SPEC.etf_symbol]
     if row.empty:
         return None
     row = row.iloc[0]
@@ -382,12 +440,14 @@ def download_options(start, end, metadata, output_dir, request_sleep, skip_exist
             errors.append({"date": "", "code": code, "error": repr(exc)})
         time.sleep(request_sleep)
         if idx % 25 == 0 or idx == len(items):
-            print(f"[kc50etf] contracts {idx}/{len(items)}", flush=True)
+            print(f"[{ACTIVE_SPEC.product}] contracts {idx}/{len(items)}", flush=True)
 
     option_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not option_df.empty:
         for date, chain in option_df.groupby("date"):
-            file_path = output_dir / f"{OPTION_FILE_PREFIX}_{date.strftime('%Y-%m-%d')}_chain.parquet"
+            file_path = output_dir / (
+                f"{ACTIVE_SPEC.option_file_prefix}_{date.strftime('%Y-%m-%d')}_chain.parquet"
+            )
             if skip_existing and file_path.exists():
                 continue
             chain = scale_volume_to_official_total(chain, date)
@@ -400,9 +460,10 @@ def download_options(start, end, metadata, output_dir, request_sleep, skip_exist
 
 def main():
     args = parse_args()
+    configure_product(args.product)
     start = normalize_date(args.start)
     end = normalize_date(args.end)
-    output_root = Path(args.output_root)
+    output_root = Path(args.output_root or f"data/{ACTIVE_SPEC.product}")
     etf_dir = output_root / "etf"
     option_dir = output_root / "option"
 
@@ -447,13 +508,13 @@ def main():
         )
 
     print(
-        f"[kc50etf] etf days={etf_df['date'].nunique() if not etf_df.empty else 0}, "
+        f"[{ACTIVE_SPEC.product}] etf days={etf_df['date'].nunique() if not etf_df.empty else 0}, "
         f"contracts={len(metadata)}, "
         f"option days={option_df['date'].nunique() if not option_df.empty else 0}, "
         f"option rows={len(option_df)}, errors={len(errors)}",
         flush=True,
     )
-    print(f"[kc50etf] output: {output_root}", flush=True)
+    print(f"[{ACTIVE_SPEC.product}] output: {output_root}", flush=True)
 
 
 if __name__ == "__main__":

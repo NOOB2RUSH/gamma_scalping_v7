@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -50,6 +51,20 @@ def parse_args():
         action="append",
         default=[],
         help="Option contract code to capture. Can be specified multiple times.",
+    )
+    parser.add_argument(
+        "--all-option-contracts",
+        action="store_true",
+        help=(
+            "Fetch 1-minute data for every currently available contract of the "
+            "selected ETF and write one daily Parquet file."
+        ),
+    )
+    parser.add_argument(
+        "--option-workers",
+        type=int,
+        default=4,
+        help="Concurrent requests for --all-option-contracts. Default: 4.",
     )
     parser.add_argument(
         "--no-account-positions",
@@ -104,6 +119,8 @@ def main():
         raise ValueError("--interval-seconds must be positive")
     if args.backfill_days is not None and args.backfill_days <= 0:
         raise ValueError("--backfill-days must be positive")
+    if args.option_workers <= 0:
+        raise ValueError("--option-workers must be positive")
 
     pid_file = _pid_file(args)
     _write_pid(pid_file)
@@ -157,13 +174,22 @@ def capture_once(args):
             f"{', '.join(sorted(market_data.SSE_ETF_OPTION_SPECS))}"
         )
 
-    option_codes = _option_codes(args)
+    all_option_contracts = bool(getattr(args, "all_option_contracts", False))
+    option_codes = (
+        _current_option_contract_codes(ak, spec)
+        if all_option_contracts
+        else _option_codes(args)
+    )
     result = {
         "captured_at": captured_at.isoformat(),
         "target_date": str(target_date),
         "output_dir": str(output_dir),
         "etf_symbol": spec.etf_symbol,
         "option_codes": option_codes,
+        "all_option_contracts": all_option_contracts,
+        "all_option_contract_count": len(option_codes) if all_option_contracts else 0,
+        "all_option_minute_rows": 0,
+        "all_option_minute_path": None,
         "quote_snapshot": None,
         "quote_promotion": None,
         "etf_rows": 0,
@@ -172,6 +198,15 @@ def capture_once(args):
         "option_greeks_rows": {},
         "errors": [],
     }
+    total_steps = 1 + len(option_codes)  # ETF plus each requested option contract.
+    completed_steps = 0
+    _print_capture_progress(
+        args.product,
+        phase="started",
+        completed=completed_steps,
+        total=total_steps,
+        detail=f"etf={spec.etf_symbol} options={','.join(option_codes) or '-'}",
+    )
 
     if target_date == captured_at.date():
         try:
@@ -201,10 +236,56 @@ def capture_once(args):
             ["symbol", "timestamp"],
             timestamp_date=target_date,
         )
+        completed_steps += 1
+        _print_capture_progress(
+            args.product,
+            phase="etf_done",
+            completed=completed_steps,
+            total=total_steps,
+            detail=f"code={spec.etf_symbol} rows={result['etf_rows']}",
+        )
     except Exception as exc:
         result["errors"].append(f"etf:{type(exc).__name__}:{exc}")
+        completed_steps += 1
+        _print_capture_progress(
+            args.product,
+            phase="etf_failed",
+            completed=completed_steps,
+            total=total_steps,
+            detail=f"code={spec.etf_symbol} error={type(exc).__name__}",
+        )
 
-    for code in option_codes:
+    if all_option_contracts:
+        frames, option_errors = _fetch_all_option_minutes(
+            ak,
+            args.product,
+            option_codes,
+            captured_at,
+            target_date,
+            completed_steps,
+            total_steps,
+            workers=getattr(args, "option_workers", 4),
+        )
+        result["errors"].extend(option_errors)
+        completed_steps = total_steps
+        if frames:
+            path, rows = _write_all_option_minutes_parquet(
+                output_dir / "option_all_1m.parquet",
+                frames,
+                target_date,
+            )
+            result["all_option_minute_path"] = str(path)
+            result["all_option_minute_rows"] = rows
+        else:
+            result["errors"].append("option_all:NoData:all contract minute requests failed")
+    for code in ([] if all_option_contracts else option_codes):
+        _print_capture_progress(
+            args.product,
+            phase="option_started",
+            completed=completed_steps,
+            total=total_steps,
+            detail=f"code={code}",
+        )
         try:
             minute_frame = _fetch_option_minute(
                 ak,
@@ -218,8 +299,21 @@ def capture_once(args):
                 ["symbol", "timestamp"],
                 timestamp_date=target_date,
             )
+            option_phase = "option_done"
+            option_detail = f"code={code} rows={result['option_minute_rows'][code]}"
         except Exception as exc:
             result["errors"].append(f"option_minute:{code}:{type(exc).__name__}:{exc}")
+            option_phase = "option_failed"
+            option_detail = f"code={code} error={type(exc).__name__}"
+
+        completed_steps += 1
+        _print_capture_progress(
+            args.product,
+            phase=option_phase,
+            completed=completed_steps,
+            total=total_steps,
+            detail=option_detail,
+        )
 
         if target_date != captured_at.date():
             continue
@@ -259,7 +353,90 @@ def capture_once(args):
 
     if not getattr(args, "output_dir", None):
         refresh_intraday_status(args.product, option_codes=option_codes)
+    _print_capture_progress(
+        args.product,
+        phase="completed",
+        completed=completed_steps,
+        total=total_steps,
+        detail=f"errors={len(result['errors'])}",
+    )
     return result
+
+
+def _current_option_contract_codes(ak, spec):
+    """Return all currently listed option codes for one ETF underlying."""
+    tasks = market_data._sse_option_tasks_from_current_day_sse(ak, spec)
+    codes = sorted(dict.fromkeys(str(code) for code, _, _ in tasks))
+    if not codes:
+        raise ValueError(f"no current option contracts for ETF {spec.etf_symbol}")
+    return codes
+
+
+def _fetch_all_option_minutes(
+    ak, product, option_codes, captured_at, target_date, completed_steps, total_steps, workers
+):
+    """Fetch full-chain minutes with bounded concurrency and progress logging."""
+    frames = []
+    errors = []
+    worker_count = min(max(int(workers), 1), len(option_codes))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(_fetch_option_minute, ak, code, captured_at, target_date): code
+            for code in option_codes
+        }
+        for future in as_completed(futures):
+            code = futures[future]
+            completed_steps += 1
+            try:
+                frame = future.result()
+                frames.append(frame)
+                _print_capture_progress(
+                    product,
+                    phase="option_done",
+                    completed=completed_steps,
+                    total=total_steps,
+                    detail=f"code={code} rows={len(frame)}",
+                )
+            except Exception as exc:
+                errors.append(f"option_minute:{code}:{type(exc).__name__}:{exc}")
+                _print_capture_progress(
+                    product,
+                    phase="option_failed",
+                    completed=completed_steps,
+                    total=total_steps,
+                    detail=f"code={code} error={type(exc).__name__}",
+                )
+    return frames, errors
+
+
+def _write_all_option_minutes_parquet(path, frames, target_date):
+    """Merge a capture into one date-level Parquet file, retaining the latest tick."""
+    path = Path(path)
+    frame = pd.concat(frames, ignore_index=True)
+    if path.exists():
+        try:
+            previous = pd.read_parquet(path)
+            frame = pd.concat([previous, frame], ignore_index=True)
+        except Exception:
+            pass
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+    frame = frame.loc[frame["timestamp"].dt.date == pd.Timestamp(target_date).date()]
+    frame = frame.dropna(subset=["symbol", "timestamp"])
+    frame = frame.drop_duplicates(["symbol", "timestamp"], keep="last")
+    frame = frame.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    temporary = path.with_suffix(".tmp.parquet")
+    frame.to_parquet(temporary, index=False)
+    temporary.replace(path)
+    return path, len(frame)
+
+
+def _print_capture_progress(product, phase, completed, total, detail=""):
+    """Emit compact, machine-readable progress lines for the desktop manager."""
+    print(
+        "capture_progress "
+        f"product={product} phase={phase} completed={completed} total={total} {detail}",
+        flush=True,
+    )
 
 
 def _option_codes(args):
@@ -527,11 +704,19 @@ def _remove_pid(path):
 
 
 def _format_result(result):
+    if result.get("all_option_contracts"):
+        option_text = (
+            f"all_contracts={result['all_option_contract_count']} "
+            f"all_option_rows={result['all_option_minute_rows']} "
+            f"all_option_parquet={result['all_option_minute_path'] or '-'}"
+        )
+    else:
+        option_text = f"options={','.join(result['option_codes']) or '-'} "
     return (
         f"captured_at={result['captured_at']} "
         f"output_dir={result['output_dir']} "
         f"etf={result['etf_symbol']} etf_rows={result['etf_rows']} "
-        f"options={','.join(result['option_codes']) or '-'} "
+        f"{option_text} "
         f"quote_snapshot={bool(result['quote_snapshot'])} "
         f"quote_promotion={bool(result['quote_promotion'])} "
         f"option_minute_rows={result['option_minute_rows']} "
@@ -1030,9 +1215,12 @@ def scan_intraday_date(product, date_text, option_codes=None, etf_symbol=None):
     etf_rows = 0
     if etf_symbol:
         etf_rows = _csv_rows(day_dir / f"etf_{etf_symbol}_1m.csv")
+    all_option_path = day_dir / "option_all_1m.parquet"
+    all_option_rows, all_option_code_rows = _all_option_parquet_rows(all_option_path)
     option_rows = {}
     for code in option_codes or []:
-        option_rows[str(code)] = _csv_rows(day_dir / f"option_{code}_1m.csv")
+        csv_rows = _csv_rows(day_dir / f"option_{code}_1m.csv")
+        option_rows[str(code)] = max(csv_rows, all_option_code_rows.get(str(code), 0))
     missing_options = [code for code, rows in option_rows.items() if rows <= 0]
     complete = etf_rows > 0 and not missing_options
     if not option_rows and option_codes:
@@ -1041,6 +1229,8 @@ def scan_intraday_date(product, date_text, option_codes=None, etf_symbol=None):
         "date": str(pd.Timestamp(date_text).date()),
         "dir": str(day_dir),
         "etf_rows": etf_rows,
+        "all_option_minute_rows": all_option_rows,
+        "all_option_minute_path": str(all_option_path) if all_option_rows else None,
         "option_rows": option_rows,
         "missing_option_codes": missing_options,
         "complete": complete,
@@ -1064,13 +1254,33 @@ def _csv_rows(path):
         return 0
 
 
+def _all_option_parquet_rows(path):
+    path = Path(path)
+    if not path.exists():
+        return 0, {}
+    try:
+        frame = pd.read_parquet(path, columns=["symbol"])
+    except Exception:
+        return 0, {}
+    symbols = frame["symbol"].astype(str)
+    return len(frame), {str(code): int(rows) for code, rows in symbols.value_counts().items()}
+
+
 def _format_result(result):
+    if result.get("all_option_contracts"):
+        option_text = (
+            f"all_contracts={result['all_option_contract_count']} "
+            f"all_option_rows={result['all_option_minute_rows']} "
+            f"all_option_parquet={result['all_option_minute_path'] or '-'}"
+        )
+    else:
+        option_text = f"options={','.join(result['option_codes']) or '-'}"
     return (
         f"captured_at={result['captured_at']} "
         f"target_date={result.get('target_date', '-')} "
         f"output_dir={result['output_dir']} "
         f"etf={result['etf_symbol']} etf_rows={result['etf_rows']} "
-        f"options={','.join(result['option_codes']) or '-'} "
+        f"{option_text} "
         f"quote_snapshot={bool(result['quote_snapshot'])} "
         f"quote_promotion={bool(result['quote_promotion'])} "
         f"option_minute_rows={result['option_minute_rows']} "

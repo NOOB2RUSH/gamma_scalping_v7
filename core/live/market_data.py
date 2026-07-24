@@ -7,8 +7,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 
 import pandas as pd
+import requests
 
 from . import storage
 from .runtime import load_product_config, project_path
@@ -17,6 +19,24 @@ from .runtime import load_product_config, project_path
 CALL_TEXT = "\u770b\u6da8\u671f\u6743"
 PUT_TEXT = "\u770b\u8dcc\u671f\u6743"
 AKSHARE_OPTION_WORKERS = 8
+AKSHARE_OPTION_BATCH_SIZE = 50
+AKSHARE_OPTION_BATCH_WORKERS = 4
+AKSHARE_CONTRACT_CACHE_SECONDS = 60.0
+SINA_OPTION_QUOTE_URL = "https://hq.sinajs.cn/list="
+SINA_OPTION_QUOTE_HEADERS = {
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Host": "hq.sinajs.cn",
+    "Pragma": "no-cache",
+    "Referer": "https://stock.finance.sina.com.cn/",
+    "User-Agent": "Mozilla/5.0",
+}
+_CURRENT_SSE_OPTION_CONTRACTS = None
+_CURRENT_SSE_OPTION_CONTRACTS_FETCHED_AT = 0.0
+_CURRENT_SSE_OPTION_CONTRACTS_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -129,6 +149,21 @@ def fetch_historical_option_metadata(product, date, codes=None):
         updated.to_csv(cache_path, index=False)
         cached_metadata.update(_historical_option_metadata_rows_to_dict(fetched))
     return cached_metadata
+
+
+def fetch_current_option_metadata(product, codes=None):
+    """Return current SSE contract terms, including dividend adjustments."""
+    spec = require_live_product(product)
+    wanted = None if codes is None else {str(code) for code in codes}
+    try:
+        import akshare as ak
+    except ImportError as exc:
+        raise RuntimeError("akshare is required for current option metadata.") from exc
+
+    metadata = _current_sse_option_contract_metadata(ak, spec)
+    if wanted is None:
+        return metadata
+    return {code: item for code, item in metadata.items() if code in wanted}
 
 
 def _read_historical_option_metadata_cache(path):
@@ -547,11 +582,18 @@ def _fetch_akshare_sse_snapshot(product):
     except ImportError as exc:
         raise RuntimeError("akshare is required for source='akshare'.") from exc
 
-    config = load_product_config(product)
     spec = SSE_ETF_OPTION_SPECS[product]
+    started_at = time.perf_counter()
     etf_df, quote_date = _fetch_latest_etf_bar(ak, spec.etf_symbol)
-    trading_calendar = _refresh_akshare_trading_calendar(ak)
+    etf_seconds = time.perf_counter() - started_at
+
+    calendar_started_at = time.perf_counter()
+    trading_calendar = _trading_calendar_for_quote(ak, quote_date)
+    calendar_seconds = time.perf_counter() - calendar_started_at
+
+    option_started_at = time.perf_counter()
     chain_df = _fetch_sse_option_chain(ak, spec, trading_calendar, quote_date)
+    option_seconds = time.perf_counter() - option_started_at
     chain_df = attach_live_underlying_id(product, chain_df)
     chain_df = chain_df.sort_values(
         ["maturity_date", "strike_price", "option_type", "order_book_id"]
@@ -561,8 +603,10 @@ def _fetch_akshare_sse_snapshot(product):
     out_dir, time_part, stamp = storage.quote_snapshot_dir(product)
     etf_out = out_dir / f"{time_part}_etf.parquet"
     opt_out = out_dir / f"{time_part}_option_chain.parquet"
+    write_started_at = time.perf_counter()
     etf_df.to_parquet(etf_out, index=False)
     chain_df.to_parquet(opt_out, index=False)
+    write_seconds = time.perf_counter() - write_started_at
 
     quote_times = [
         value
@@ -581,6 +625,13 @@ def _fetch_akshare_sse_snapshot(product):
         "option_snapshot": str(opt_out),
         "option_rows": len(chain_df),
         "option_quote_times": [str(value) for value in sorted(quote_times)],
+        "timings_seconds": {
+            "etf_fetch": round(etf_seconds, 3),
+            "calendar": round(calendar_seconds, 3),
+            "option_fetch": round(option_seconds, 3),
+            "write": round(write_seconds, 3),
+            "total": round(time.perf_counter() - started_at, 3),
+        },
     }
     storage.write_json(out_dir / f"{time_part}_metadata.json", metadata)
     return metadata
@@ -652,20 +703,86 @@ def _fetch_latest_etf_bar(ak, etf_symbol):
 
 
 def _fetch_sse_option_chain(ak, spec, trading_calendar, quote_date=None):
+    current_contract_metadata = {}
     try:
-        tasks = _sse_option_tasks_from_list_sina(ak, spec, trading_calendar)
+        tasks = _sse_option_tasks_from_current_day_sse(ak, spec)
     except Exception:
-        if quote_date is None:
-            raise
-        tasks = _sse_option_tasks_from_risk_indicator(
-            ak,
-            spec,
-            trading_calendar,
-            quote_date,
-        )
+        try:
+            tasks = _sse_option_tasks_from_list_sina(ak, spec, trading_calendar)
+        except Exception:
+            if quote_date is None:
+                raise
+            tasks = _sse_option_tasks_from_risk_indicator(
+                ak,
+                spec,
+                trading_calendar,
+                quote_date,
+            )
+    else:
+        try:
+            current_contract_metadata = _current_sse_option_contract_metadata(ak, spec)
+        except Exception:
+            current_contract_metadata = {}
     if not tasks:
         raise ValueError(f"AKShare returned no SSE option codes for {spec.etf_symbol}.")
 
+    codes = [str(code) for code, _, _ in tasks]
+    chunks = [
+        codes[start : start + AKSHARE_OPTION_BATCH_SIZE]
+        for start in range(0, len(codes), AKSHARE_OPTION_BATCH_SIZE)
+    ]
+    rows_by_code = {}
+    with ThreadPoolExecutor(
+        max_workers=min(AKSHARE_OPTION_BATCH_WORKERS, len(chunks))
+    ) as executor:
+        futures = {
+            executor.submit(_fetch_sina_option_quote_batch, chunk): chunk
+            for chunk in chunks
+        }
+        for future in as_completed(futures):
+            try:
+                rows_by_code.update(future.result())
+            except Exception:
+                # A failed batch is retried one contract at a time below. This
+                # keeps the fast path compact without sacrificing fault isolation.
+                continue
+
+    task_by_code = {
+        str(code): (pd.Timestamp(maturity), option_type)
+        for code, maturity, option_type in tasks
+    }
+    rows = []
+    missing_tasks = []
+    for code in codes:
+        row = rows_by_code.get(code)
+        if row is None:
+            maturity, option_type = task_by_code[code]
+            missing_tasks.append((code, maturity, option_type))
+            continue
+        maturity, option_type = task_by_code[code]
+        row["maturity_date"] = maturity
+        row["option_type"] = option_type
+        rows.append(row)
+
+    rows.extend(_fetch_sse_option_rows_individually(ak, missing_tasks))
+    for row in rows:
+        metadata = current_contract_metadata.get(str(row.get("order_book_id")))
+        if metadata is None:
+            continue
+        row["strike_price"] = metadata["strike"]
+        row["contract_multiplier"] = metadata["contract_multiplier"]
+        row["contract_symbol"] = metadata["contract_symbol"]
+        row["maturity_date"] = pd.Timestamp(metadata["expiry"])
+        row["option_type"] = metadata["option_type"]
+    chain = pd.DataFrame(rows)
+    if chain.empty:
+        raise ValueError("AKShare returned empty SSE option chain.")
+    return chain
+
+
+def _fetch_sse_option_rows_individually(ak, tasks):
+    if not tasks:
+        return []
     rows = []
     with ThreadPoolExecutor(max_workers=AKSHARE_OPTION_WORKERS) as executor:
         futures = {
@@ -698,10 +815,174 @@ def _fetch_sse_option_chain(ak, spec, trading_calendar, quote_date=None):
                         "quote_error": repr(exc),
                     }
                 )
-    chain = pd.DataFrame(rows)
-    if chain.empty:
-        raise ValueError("AKShare returned empty SSE option chain.")
-    return chain
+    return rows
+
+
+def _sse_option_tasks_from_current_day_sse(ak, spec):
+    contracts = _current_sse_option_contracts(ak)
+    required = {
+        "\u5408\u7ea6\u7f16\u7801",
+        "\u5408\u7ea6\u4ea4\u6613\u4ee3\u7801",
+        "\u5230\u671f\u65e5",
+    }
+    missing = required - set(contracts.columns)
+    if missing:
+        raise ValueError(
+            f"AKShare current SSE option contracts are missing columns: {sorted(missing)}"
+        )
+    rows = contracts.loc[
+        contracts["\u5408\u7ea6\u4ea4\u6613\u4ee3\u7801"]
+        .astype(str)
+        .str.startswith(spec.etf_symbol)
+    ]
+    tasks = []
+    for _, row in rows.iterrows():
+        contract_id = str(row["\u5408\u7ea6\u4ea4\u6613\u4ee3\u7801"])
+        parsed = _parse_sse_option_contract(contract_id, spec.etf_symbol)
+        if parsed is None:
+            continue
+        option_type, _, _ = parsed
+        maturity = pd.to_datetime(
+            row["\u5230\u671f\u65e5"],
+            format="%Y%m%d",
+            errors="coerce",
+        )
+        if pd.isna(maturity):
+            continue
+        tasks.append(
+            (
+                str(row["\u5408\u7ea6\u7f16\u7801"]),
+                pd.Timestamp(maturity).normalize(),
+                option_type,
+            )
+        )
+    return tasks
+
+
+def _current_sse_option_contract_metadata(ak, spec):
+    contracts = _current_sse_option_contracts(ak)
+    required = {
+        "\u5408\u7ea6\u7f16\u7801",
+        "\u5408\u7ea6\u4ea4\u6613\u4ee3\u7801",
+        "\u5408\u7ea6\u7b80\u79f0",
+        "\u884c\u6743\u4ef7",
+        "\u5408\u7ea6\u5355\u4f4d",
+        "\u5230\u671f\u65e5",
+    }
+    missing = required - set(contracts.columns)
+    if missing:
+        raise ValueError(
+            f"AKShare current SSE option contracts are missing columns: {sorted(missing)}"
+        )
+    rows = contracts.loc[
+        contracts["\u5408\u7ea6\u4ea4\u6613\u4ee3\u7801"]
+        .astype(str)
+        .str.startswith(spec.etf_symbol)
+    ]
+    metadata = {}
+    for _, row in rows.iterrows():
+        contract_id = str(row["\u5408\u7ea6\u4ea4\u6613\u4ee3\u7801"])
+        parsed = _parse_sse_option_contract(contract_id, spec.etf_symbol)
+        if parsed is None:
+            continue
+        option_type, _, _ = parsed
+        strike = _number(row.get("\u884c\u6743\u4ef7"))
+        multiplier = _number(row.get("\u5408\u7ea6\u5355\u4f4d"))
+        expiry = pd.to_datetime(
+            row.get("\u5230\u671f\u65e5"),
+            format="%Y%m%d",
+            errors="coerce",
+        )
+        if strike is None or multiplier is None or pd.isna(expiry):
+            continue
+        code = str(row["\u5408\u7ea6\u7f16\u7801"])
+        metadata[code] = {
+            "strike": float(strike),
+            "expiry": str(pd.Timestamp(expiry).date()),
+            "option_type": option_type,
+            "contract_multiplier": int(multiplier),
+            "contract_symbol": str(row["\u5408\u7ea6\u7b80\u79f0"]),
+            "underlying_order_book_id": spec.etf_file_prefix,
+            "metadata_source": "akshare_option_current_day_sse",
+        }
+    return metadata
+
+
+def _current_sse_option_contracts(ak):
+    global _CURRENT_SSE_OPTION_CONTRACTS
+    global _CURRENT_SSE_OPTION_CONTRACTS_FETCHED_AT
+
+    now = time.monotonic()
+    if (
+        _CURRENT_SSE_OPTION_CONTRACTS is not None
+        and now - _CURRENT_SSE_OPTION_CONTRACTS_FETCHED_AT
+        <= AKSHARE_CONTRACT_CACHE_SECONDS
+    ):
+        return _CURRENT_SSE_OPTION_CONTRACTS
+    # A full live refresh fetches several products concurrently. Serialize only
+    # the shared contract-list refresh so all workers reuse the same response.
+    with _CURRENT_SSE_OPTION_CONTRACTS_LOCK:
+        now = time.monotonic()
+        if (
+            _CURRENT_SSE_OPTION_CONTRACTS is not None
+            and now - _CURRENT_SSE_OPTION_CONTRACTS_FETCHED_AT
+            <= AKSHARE_CONTRACT_CACHE_SECONDS
+        ):
+            return _CURRENT_SSE_OPTION_CONTRACTS
+        contracts = _ak_call(ak.option_current_day_sse)
+        _CURRENT_SSE_OPTION_CONTRACTS = contracts
+        _CURRENT_SSE_OPTION_CONTRACTS_FETCHED_AT = time.monotonic()
+        return contracts
+
+
+def _fetch_sina_option_quote_batch(codes):
+    codes = [str(code) for code in codes]
+    if not codes:
+        return {}
+    symbols = ",".join(f"CON_OP_{code}" for code in codes)
+
+    def request_batch():
+        response = requests.get(
+            f"{SINA_OPTION_QUOTE_URL}{symbols}",
+            headers=SINA_OPTION_QUOTE_HEADERS,
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.text
+
+    return _parse_sina_option_quote_batch(_ak_call(request_batch))
+
+
+def _parse_sina_option_quote_batch(text):
+    rows = {}
+    pattern = re.compile(r'var hq_str_CON_OP_(\d+)="([^"]*)";')
+    for code, payload in pattern.findall(str(text)):
+        values = payload.split(",")
+        if len(values) < 43:
+            continue
+        bid = _number(values[1], values[2])
+        ask = _number(values[3], values[2])
+        close = _number(values[2], bid, ask)
+        if (bid is None or bid <= 0) and close is not None:
+            bid = close
+        if (ask is None or ask <= 0) and close is not None:
+            ask = close
+        rows[str(code)] = {
+            "order_book_id": str(code),
+            "strike_price": _number(values[7]),
+            "bid": bid,
+            "ask": ask,
+            "raw_sina_volume": _number(values[41], 0),
+            "volume": _number(values[41], 0),
+            "open_interest": _number(values[5], 0),
+            "contract_multiplier": 10000,
+            "close": close,
+            "source": "akshare_sse_spot_price_sina_batch",
+            "quote_time": values[32] or None,
+            "contract_symbol": values[37] or None,
+            "akshare_underlying_symbol": values[36] or None,
+        }
+    return rows
 
 
 def _sse_option_tasks_from_list_sina(ak, spec, trading_calendar):
@@ -868,6 +1149,14 @@ def _refresh_akshare_trading_calendar(ak):
         return calendar
     except Exception:
         return load_live_trading_calendar()
+
+
+def _trading_calendar_for_quote(ak, quote_date):
+    calendar = load_live_trading_calendar()
+    quote_date = pd.Timestamp(quote_date).normalize()
+    if quote_date in calendar:
+        return calendar
+    return _refresh_akshare_trading_calendar(ak)
 
 
 def _fourth_wednesday(year, month):

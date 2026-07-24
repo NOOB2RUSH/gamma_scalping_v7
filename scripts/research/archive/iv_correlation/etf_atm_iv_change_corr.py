@@ -9,11 +9,11 @@ import numpy as np
 import pandas as pd
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.research.etf_atm_iv_ratios import (  # noqa: E402
+from scripts.research.archive.iv_correlation.etf_atm_iv_ratios import (  # noqa: E402
     DEFAULT_OUTPUT_DIR,
     DEFAULT_PAIRS,
     PRODUCT_LABELS,

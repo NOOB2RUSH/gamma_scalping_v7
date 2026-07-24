@@ -244,6 +244,78 @@ class LivePortfolioReportTest(unittest.TestCase):
         self.assertAlmostEqual(kc50_summary.iloc[-1]["ETF单日盈亏"], 11.0)
         self.assertAlmostEqual(kc50_summary.iloc[-1]["净单日盈亏"], 98.0)
 
+    def test_combined_current_summary_uses_same_position_pnl_as_workbook(self):
+        payload = _payload("500etf", "2026-07-21", 779_200.0)
+        summary = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-07-21",
+                    "AUM": 779_200.0,
+                    "当日手续费": 43.19964,
+                    "期权单日盈亏": 170.0,
+                    "ETF单日盈亏": -21_212.4,
+                    "总单日盈亏(手续费前)": -21_042.4,
+                    "净单日盈亏": -21_085.59964,
+                    "单日GreeksPnL": 71.8003,
+                }
+            ],
+            columns=account_report.DEFAULT_SUMMARY_REPORT_COLUMNS,
+        )
+        positions = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-07-21",
+                    "合约代码": "10012055",
+                    "持仓盈亏": 0.0,
+                    "交易盈亏": -60.0,
+                    "到期日": "2026-08-26",
+                },
+                {
+                    "日期": "2026-07-21",
+                    "合约代码": "10012064",
+                    "持仓盈亏": 0.0,
+                    "交易盈亏": 230.0,
+                    "到期日": "2026-08-26",
+                },
+                {
+                    "日期": "2026-07-21",
+                    "合约代码": "510500",
+                    "持仓盈亏": 0.0,
+                    "交易盈亏": -98.4,
+                    "到期日": None,
+                },
+            ],
+            columns=account_report.DEFAULT_POSITION_REPORT_COLUMNS,
+        )
+        daily = {
+            "账户总体情况": summary,
+            "持仓记录": positions,
+            "交易记录": pd.DataFrame(columns=account_report.TRADE_COLUMNS),
+        }
+        with (
+            mock.patch.object(
+                portfolio_report.account_report,
+                "_report_frames",
+                return_value=daily,
+            ),
+            mock.patch.object(
+                portfolio_report.account_report,
+                "_daily_report_frames",
+                return_value=daily,
+            ),
+        ):
+            frames = portfolio_report._combined_daily_frames(
+                {"500etf": payload},
+                {},
+            )
+
+        row = frames["账户总体情况"].iloc[-1]
+        self.assertAlmostEqual(row["期权单日盈亏"], 170.0)
+        self.assertAlmostEqual(row["ETF单日盈亏"], -98.4)
+        self.assertAlmostEqual(row["总单日盈亏(手续费前)"], 71.6)
+        self.assertAlmostEqual(row["净单日盈亏"], 28.40036)
+        self.assertAlmostEqual(row["单日GreeksPnL"], 71.8003)
+
     def test_combined_summary_aum_uses_final_open_position_after_roll(self):
         payload = _payload("300etf", "2026-06-22", 1_000_000.0)
         summary = pd.DataFrame(
@@ -870,6 +942,98 @@ class LivePortfolioReportTest(unittest.TestCase):
         self.assertAlmostEqual(summary["总单日盈亏(手续费前)"], 686.8)
         self.assertAlmostEqual(summary["净单日盈亏"], 686.6)
         self.assertAlmostEqual(summary["单日盈亏/AUM"], 0.0006868)
+
+    def test_backfill_position_pnl_includes_ex_dividend_cash_distribution(self):
+        positions = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-07-14",
+                    "策略名称": "中证500ETF南方",
+                    "合约代码": "510500",
+                    "合约名称": "中证500ETF南方",
+                    "交易方向": "多",
+                    "总持仓张数": 34000,
+                    "今日变化": 0,
+                    "最新价": 8.413,
+                    "持仓均价": 8.413,
+                    "持仓盈亏": 0.0,
+                    "交易盈亏": 0.0,
+                    "到期日": None,
+                },
+                {
+                    "日期": "2026-07-15",
+                    "策略名称": "中证500ETF南方",
+                    "合约代码": "510500",
+                    "合约名称": "中证500ETF南方",
+                    "交易方向": "多",
+                    "总持仓张数": 0,
+                    "今日变化": -34000,
+                    "最新价": 8.151,
+                    "持仓均价": 8.413,
+                    "持仓盈亏": -3842.0,
+                    "交易盈亏": -238.0,
+                    "到期日": None,
+                },
+            ],
+            columns=portfolio_report.POSITION_REPORT_COLUMNS,
+        )
+        trades = pd.DataFrame(
+            [
+                {
+                    "日期": "2026-07-15",
+                    "合约代码": "510500",
+                    "合约名称": "中证500ETF南方",
+                    "买卖": "卖",
+                    "成交价格": 8.144,
+                    "成交数量": 34000,
+                    "类型": "ETF对冲",
+                }
+            ],
+            columns=account_report.TRADE_COLUMNS,
+        )
+
+        result = portfolio_report._backfill_position_holding_pnl(
+            positions,
+            payloads={"500etf": {"trade_rows": []}},
+            trade_frame=trades,
+        )
+        row = result.loc[result["日期"].astype(str).eq("2026-07-15")].iloc[0]
+
+        self.assertAlmostEqual(row["持仓盈亏"], -3842.0)
+        self.assertAlmostEqual(row["交易盈亏"], -238.0)
+
+    def test_product_summary_copies_dividend_note_to_existing_remark_column(self):
+        summary = pd.DataFrame(
+            [{"日期": "2026-07-15"}],
+            columns=account_report.DEFAULT_SUMMARY_REPORT_COLUMNS,
+        )
+        payload = {
+            "product": "500etf",
+            "account_id": "default",
+            "date": "2026-07-15",
+            "position_history": pd.DataFrame(
+                [
+                    {
+                        "日期": "2026-07-14",
+                        "账户ID": "default",
+                        "方向": "hedge",
+                        "总持仓": 34000,
+                    }
+                ]
+            ),
+            "summary_history": summary,
+        }
+
+        result = portfolio_report._product_summary_frame(
+            "500etf",
+            payload,
+            {
+                "账户总体情况": summary,
+                "持仓记录": pd.DataFrame(),
+            },
+        )
+
+        self.assertIn("应收股息5,066.00元", result.iloc[0]["备注"])
 
 
 if __name__ == "__main__":
